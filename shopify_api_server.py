@@ -1,0 +1,14953 @@
+#!/usr/bin/env python3
+"""shopify_api_server.py — Shopify Ultimate v5.0 竞品监控仪表盘 + REST API
+http://127.0.0.1:8001
+
+数据: 817 家店铺快照 · 29 万+ 产品 · 实时价格分析
+"""
+
+import json, html, os, sys, time, glob, statistics, re, threading, concurrent.futures, sqlite3, subprocess, hashlib
+from datetime import datetime, timedelta
+from pathlib import Path
+from collections import defaultdict, Counter
+from typing import Optional
+import urllib.request
+import urllib.parse
+
+# Local-only urllib opener for 127.0.0.1:* — bypasses the macOS system proxy
+# (e.g. ClashX / Surge on 127.0.0.1:6152) which otherwise returns 503 for every
+# localhost call. See auto_intelligence_loop._FB_LOCAL_OPENER for the same fix
+# in the pipeline module.
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, Response
+from pydantic import BaseModel
+import uvicorn
+
+import shopify_ultimate as su
+from auto_intelligence_loop import (
+    AutoIntelConfig,
+    AutoIntelRunLocked,
+    SEVEN_DAY_METHOD_VERSION,
+    build_platform_ai_profit_engine,
+    build_operator_blueprint,
+    build_platform_validation_evidence,
+    build_trend_keywords,
+    empty_trend_signal,
+    enrich_top_products_with_trends,
+    evaluate_profit_test_metrics,
+    get_latest_profit_pipeline,
+    get_latest_run_summary,
+    read_latest_profit_artifact,
+    read_latest_artifact,
+    run_auto_intelligence,
+    run_latest_auto_intel_trends,
+    run_profit_pipeline,
+    run_seven_day_new_product_judgement,
+)
+from social_amazon_auto_launch import latest_auto_launch, run_auto_launch
+from shopify_precision_suite import (
+    audit_scrape_precision,
+    read_cached_scrape_precision,
+)
+
+app = FastAPI(title="Shopify Ultimate API v5.0", version="5.0")
+
+# ─── Mount v3 routes (爆款雷达 + 自动决策 + 一键上架) ───
+try:
+    from v3.api import _attach as _attach_v3
+    _attach_v3(app, mount_page=False)   # /v3 is defined below; we only mount APIs + /v3-radar alias
+    print("[v3] mounted /api/v3/* + /v3-radar routes")
+except Exception as _e:
+    print(f"[v3] mount failed (non-fatal): {_e}")
+MONITOR_DIR = su.DATA_DIR
+STORE_REGISTRY_DB = MONITOR_DIR / "store_registry.db"
+STORE_REGISTRY_TARGET = int(os.getenv("STORE_REGISTRY_TARGET", "1000000"))
+STORE_REGISTRY_SCAN_BATCH_DEFAULT = int(os.getenv("STORE_REGISTRY_SCAN_BATCH_DEFAULT", "5000"))
+STORE_REGISTRY_SCAN_BATCH_MAX = int(os.getenv("STORE_REGISTRY_SCAN_BATCH_MAX", "50000"))
+
+# ── gtrends 验证路由 ──
+try:
+    import sys as _sys
+    _gtrends_dir = "/Users/doi/Desktop/Selection/gtrends"
+    if _gtrends_dir not in _sys.path:
+        _sys.path.insert(0, _gtrends_dir)
+    from gtrends_router import mount_gtrends
+    mount_gtrends(app, source_name="radar-8001")
+except Exception as _gt_err:
+    import sys as _sys
+    print(f"[gtrends] mount failed: {_gt_err}", file=_sys.stderr)
+
+# ═══════════════════════════════════════════════════════════
+#  缓存层
+# ═══════════════════════════════════════════════════════════
+
+_cache = None
+_cache_ts = 0
+_CACHE_TTL = 3600
+_DASHBOARD_CACHE_TTL = 6 * 3600
+_SMART_REFRESH_LIMIT = 180
+_DASHBOARD_CACHE_PATH = MONITOR_DIR / "_dashboard_cache_latest.json"
+_MONITOR_REFRESH_LOCK = threading.Lock()
+_MONITOR_REFRESH_THREAD = None
+_MONITOR_REFRESH_STATUS = {
+    "ok": True,
+    "running": False,
+    "state": "idle",
+    "message": "尚未启动后台刷新",
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_seconds": 0,
+    "total": 0,
+    "completed": 0,
+    "ok_count": 0,
+    "failed_count": 0,
+    "no_data_count": 0,
+    "new_products": 0,
+    "updated_products": 0,
+    "removed_products": 0,
+    "price_changes": 0,
+    "baseline_kept_count": 0,
+    "last_domain": "",
+    "recent_results": [],
+    "report_path": "",
+}
+
+GTRENDS_BULK_DIR = Path(os.getenv("AUTO_INTEL_GTRENDS_BULK_DIR", "/Users/doi/.claude/skills/gtrends-bulk"))
+FB_PIPELINE_DB = Path(os.getenv("FB_PIPELINE_DB", "/Users/doi/.claude/skills/NEW/pipeline.db"))
+FB_PIPELINE_SHARDS_DIR = Path(os.getenv("FB_SHARDS_DIR", str(FB_PIPELINE_DB.parent / "shards")))
+GTRENDS_BG_STATUS_PATH = MONITOR_DIR / "gtrends_background_status.json"
+V2_DAILY_MONITOR_STATUS_PATH = MONITOR_DIR / "v2_daily_monitor_status.json"
+AI_AUTOPILOT_STATUS_PATH = MONITOR_DIR / "ai_autopilot_status.json"
+_GTRENDS_BG_LOCK = threading.Lock()
+_GTRENDS_BG_THREAD = None
+_GTRENDS_BG_STATUS = {
+    "ok": True,
+    "running": False,
+    "state": "idle",
+    "message": "尚未启动 Google Trends 后台验证",
+    "source": "",
+    "geo": "US",
+    "timeframe": "today 12-m",
+    "batch_size": 5,
+    "interval_seconds": 30,
+    "total_keywords": 0,
+    "completed_keywords": 0,
+    "total_batches": 0,
+    "completed_batches": 0,
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_seconds": 0,
+    "current_batch": [],
+    "keywords": [],
+    "results": [],
+    "warnings": [],
+}
+_V2_DAILY_MONITOR_LOCK = threading.Lock()
+_V2_DAILY_MONITOR_STOP = threading.Event()
+_V2_DAILY_MONITOR_THREAD = None
+_V2_DAILY_MONITOR_STATUS = {
+    "ok": True,
+    "enabled": False,
+    "running": False,
+    "active_run": False,
+    "state": "disabled",
+    "message": "每日自动抓取未开启",
+    "schedule_hour": 9,
+    "scan_limit": 0,
+    "workbench_limit": 50,
+    "trend_top_n": 50,
+    "fb_limit": 5000,
+    "fb_exact_verify_limit": 300,
+    "trend_geo": "US",
+    "started_at": None,
+    "stopped_at": None,
+    "last_run_at": None,
+    "last_run_date": None,
+    "last_error": "",
+    "next_run_at": None,
+    "runs_completed": 0,
+    "run_requested": False,
+    "scan_summary": {},
+    "workbench_summary": {},
+}
+_AI_AUTOPILOT_LOCK = threading.Lock()
+_AI_AUTOPILOT_STOP = threading.Event()
+_AI_AUTOPILOT_THREAD = None
+_AI_AUTOPILOT_STATUS = {
+    "ok": True,
+    "enabled": True,
+    "running": False,
+    "active_run": False,
+    "state": "enabled",
+    "message": "AI自动驾驶已开启：自动选品、自动补证、自动输出跟品队列",
+    "mode": "autonomous_follow_selection",
+    "interval_seconds": 60,
+    "smart_refresh_limit": 180,
+    "full_refresh_hours": 24,
+    "workbench_limit": 50,
+    "trend_top_n": 50,
+    "trend_geo": "US",
+    "started_at": None,
+    "stopped_at": None,
+    "last_run_at": None,
+    "last_error": "",
+    "last_assessment": {},
+    "data_quality": {},
+    "evidence_quality": {},
+    "judgement_quality": {},
+    "auto_follow_queue": {},
+    "auto_selection_summary": {},
+    "next_check_at": None,
+    "run_requested": False,
+    "runs_completed": 0,
+    "last_actions": [],
+}
+
+
+def _snapshot_domain_candidates(include_blacklist: bool = False) -> list[str]:
+    """Return local snapshot/watchlist domains without expanding the million-store registry."""
+
+    domains: list[str] = []
+    seen: set[str] = set()
+
+    def add(domain: str):
+        normalized = su.normalize_domain(domain or "")
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            domains.append(normalized)
+
+    for fp in sorted(glob.glob(str(MONITOR_DIR / "*_snapshot.json"))):
+        add(Path(fp).stem.replace("_snapshot", ""))
+
+    watchlist_path = MONITOR_DIR / "competitors_watchlist.json"
+    if watchlist_path.exists():
+        try:
+            data = json.loads(watchlist_path.read_text(encoding="utf-8"))
+            for item in data if isinstance(data, list) else []:
+                if isinstance(item, dict):
+                    add(item.get("domain", ""))
+                else:
+                    add(str(item))
+        except Exception:
+            pass
+
+    if include_blacklist:
+        try:
+            for domain in su.load_blacklist().keys():
+                add(domain)
+        except Exception:
+            pass
+
+    return domains
+
+
+def _read_watchlist_domains() -> set[str]:
+    watchlist_domains: set[str] = set()
+    watchlist_path = MONITOR_DIR / "competitors_watchlist.json"
+    if not watchlist_path.exists():
+        return watchlist_domains
+    try:
+        data = json.loads(watchlist_path.read_text(encoding="utf-8"))
+        for item in data if isinstance(data, list) else []:
+            if isinstance(item, dict):
+                domain = item.get("domain", "")
+            else:
+                domain = str(item)
+            normalized = su.normalize_domain(domain)
+            if normalized:
+                watchlist_domains.add(normalized)
+    except Exception:
+        pass
+    return watchlist_domains
+
+
+def _valid_price(value) -> float | None:
+    """Return a dashboard-safe product price, or None when absent/out of range."""
+
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if 0 < price < 100000:
+        return price
+    return None
+
+
+def _median_sorted(values: list[float]) -> float:
+    n = len(values)
+    if n == 0:
+        return 0
+    mid = n // 2
+    if n % 2:
+        return round(values[mid], 2)
+    return round((values[mid - 1] + values[mid]) / 2, 2)
+
+
+def _quantile_sorted(values: list[float], q: float) -> float:
+    n = len(values)
+    if n == 0:
+        return 0
+    if n == 1:
+        return round(values[0], 2)
+    pos = (n - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return round(values[lo] * (1 - frac) + values[hi] * frac, 2)
+
+
+def _monitor_candidate_priority(store: dict, watchlist_domains: set[str]) -> tuple[float, list[str]]:
+    """Score refresh candidates by practical DTC follow-up value, not raw volume."""
+
+    score = 0.0
+    reasons: list[str] = []
+    domain = su.normalize_domain(store.get("domain", ""))
+    product_count = int(store.get("product_count") or 0)
+    avg_price = float(store.get("p_avg") or 0)
+    median_price = float(store.get("p_med") or 0)
+    last_check = str(store.get("last_check") or "")
+
+    days_stale = 999
+    if last_check:
+        try:
+            checked_at = datetime.fromisoformat(last_check.replace("Z", "+00:00"))
+            days_stale = max(0, (datetime.now() - checked_at.replace(tzinfo=None)).days)
+        except Exception:
+            pass
+
+    if domain in watchlist_domains:
+        score += 30
+        reasons.append("watchlist")
+
+    if days_stale <= 1:
+        score += 20
+        reasons.append("24h活跃")
+    elif days_stale <= 3:
+        score += 16
+        reasons.append("3天内活跃")
+    elif days_stale <= 7:
+        score += 12
+        reasons.append("7天内活跃")
+    elif days_stale >= 14:
+        score += 8
+        reasons.append("过期待补")
+
+    if 20 <= product_count <= 800:
+        score += 18
+        reasons.append("DTC体量健康")
+    elif 801 <= product_count <= 5000:
+        score += 10
+        reasons.append("大店可跟")
+    elif 1 <= product_count < 20:
+        score += 4
+        reasons.append("小店观察")
+
+    price_anchor = median_price or avg_price
+    if 18 <= price_anchor <= 120:
+        score += 20
+        reasons.append("FB易测价格带")
+    elif 121 <= price_anchor <= 250:
+        score += 12
+        reasons.append("高客单可测")
+    elif 8 <= price_anchor < 18:
+        score += 6
+        reasons.append("低价冲动品")
+
+    return score, reasons
+
+
+def _prioritized_monitor_domains(mode: str = "smart", limit: int = 0) -> tuple[list[str], dict]:
+    mode = (mode or "smart").lower()
+    include_blacklist = mode in {"all", "full", "best_effort_all"}
+    all_domains = _snapshot_domain_candidates(include_blacklist=include_blacklist)
+    if mode in {"all", "full", "best_effort_all"}:
+        try:
+            with _store_registry_conn() as conn:
+                _store_registry_seed_from_watchlist(conn=conn)
+                registered_count = int(conn.execute("SELECT COUNT(*) FROM stores").fetchone()[0] or 0)
+                if not registered_count:
+                    _store_registry_seed_from_snapshot_rows(_load_all().get("stores", []), conn=conn)
+                conn.commit()
+        except Exception:
+            pass
+        registry_stats = _store_registry_stats()
+        batch_limit = limit if limit > 0 else STORE_REGISTRY_SCAN_BATCH_DEFAULT
+        selected = _store_registry_pick_scan_batch(batch_limit, include_blacklist=include_blacklist)
+        if not selected:
+            selected = all_domains[:batch_limit]
+        return selected, {
+            "mode": "all",
+            "candidate_count": max(int(registry_stats.get("total_registered_stores") or 0), len(all_domains)),
+            "selected_count": len(selected),
+            "limit": batch_limit,
+            "registry_target": STORE_REGISTRY_TARGET,
+            "registry_total": int(registry_stats.get("total_registered_stores") or 0),
+            "registry_coverage_pct": registry_stats.get("registry_coverage_pct", 0),
+            "strategy": (
+                "百万店铺分批扫：注册表可承载 1,000,000 家；本轮只取下一批高优先级域名。"
+                " Shopify 用 products.json，非 Shopify 走 sitemap/页面结构化数据兜底。"
+            ),
+        }
+
+    target_limit = limit if limit > 0 else _SMART_REFRESH_LIMIT
+    watchlist_domains = _read_watchlist_domains()
+    try:
+        stores = _load_all().get("stores", [])
+    except Exception:
+        stores = []
+
+    # v6.0: 加载健康评分，过滤 dead 域名
+    health = su._load_health()
+    dead_domains = {d for d, h in health.items() if h.get("status") == "dead"}
+
+    scored: list[tuple[float, str, list[str]]] = []
+    seen: set[str] = set()
+    for store in stores:
+        domain = su.normalize_domain(store.get("domain", ""))
+        if not domain or domain in seen or domain in dead_domains:
+            continue
+        score, reasons = _monitor_candidate_priority(store, watchlist_domains)
+        # v6.0: 健康评分加权
+        h = health.get(domain, {})
+        if h.get("status") == "protected":
+            score *= 0.5
+            reasons.append("连续失败，降低优先级")
+        if h.get("consec_fails", 0) == 0 and h.get("success", 0) > 0:
+            score *= 1.3
+            reasons.append("历史成功率高")
+        scored.append((score, domain, reasons))
+        seen.add(domain)
+
+    for domain in all_domains:
+        if domain not in seen and domain not in dead_domains:
+            scored.append((2.0, domain, ["仅有域名"]))
+            seen.add(domain)
+
+    registry_stats = _store_registry_stats()
+    if registry_stats.get("total_registered_stores"):
+        for domain in _store_registry_pick_scan_batch(target_limit * 2, include_blacklist=False):
+            if domain not in seen and domain not in dead_domains:
+                scored.append((10.0, domain, ["百万注册表待扫"]))
+                seen.add(domain)
+
+    if mode == "stale":
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        strategy = "过期补刷：优先补齐近期未更新但仍有商业价值的域名。"
+    else:
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        strategy = (
+            "智能快刷：按 20 年 DTC/FB Ads 选品经验，只刷新最可能产生新品机会的店铺。"
+            "优先级=watchlist + 近7天活跃 + DTC健康体量 + FB易测价格带。"
+        )
+
+    selected_rows = scored[:target_limit]
+    skipped_dead = len(dead_domains)
+    return [domain for _, domain, _ in selected_rows], {
+        "mode": mode if mode in {"smart", "stale"} else "smart",
+        "candidate_count": len(scored),
+        "selected_count": len(selected_rows),
+        "limit": target_limit,
+        "skipped_dead": skipped_dead,
+        "registry_total": int(registry_stats.get("total_registered_stores") or 0),
+        "registry_target": STORE_REGISTRY_TARGET,
+        "strategy": strategy,
+        "top_reasons": [
+            {"domain": domain, "score": round(score, 1), "reasons": reasons[:4]}
+            for score, domain, reasons in selected_rows[:10]
+        ],
+    }
+
+
+def _read_dashboard_disk_cache(max_age_seconds: int = _DASHBOARD_CACHE_TTL) -> dict | None:
+    try:
+        if not _DASHBOARD_CACHE_PATH.exists():
+            return None
+        if max_age_seconds > 0 and (time.time() - _DASHBOARD_CACHE_PATH.stat().st_mtime) > max_age_seconds:
+            return None
+        data = json.loads(_DASHBOARD_CACHE_PATH.read_text(encoding="utf-8"))
+        # Reject older cache files whose product total was actually priced-product count.
+        if isinstance(data, dict) and data.get("stores") is not None and data.get("priced_products") is not None:
+            return data
+    except Exception:
+        return None
+    return None
+
+
+def _write_dashboard_disk_cache(data: dict):
+    try:
+        MONITOR_DIR.mkdir(parents=True, exist_ok=True)
+        _DASHBOARD_CACHE_PATH.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _store_registry_now() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _store_registry_normalize_domain(value) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"^[a-z]+://", "", text)
+    text = text.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    text = text.split("@")[-1].strip().strip(".")
+    domain = su.normalize_domain(text)
+    if not domain or "." not in domain:
+        return ""
+    if domain in {"localhost", "127.0.0.1", "0.0.0.0"}:
+        return ""
+    return domain
+
+
+def _store_registry_conn() -> sqlite3.Connection:
+    MONITOR_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(STORE_REGISTRY_DB), timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    _store_registry_init(conn)
+    return conn
+
+
+def _store_registry_init(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS stores (
+            domain TEXT PRIMARY KEY,
+            source TEXT NOT NULL DEFAULT 'unknown',
+            status TEXT NOT NULL DEFAULT 'queued',
+            platform TEXT NOT NULL DEFAULT '',
+            has_snapshot INTEGER NOT NULL DEFAULT 0,
+            product_count INTEGER NOT NULL DEFAULT 0,
+            priced_product_count INTEGER NOT NULL DEFAULT 0,
+            price_coverage_pct REAL NOT NULL DEFAULT 0,
+            p_min REAL NOT NULL DEFAULT 0,
+            p_max REAL NOT NULL DEFAULT 0,
+            p_avg REAL NOT NULL DEFAULT 0,
+            p_med REAL NOT NULL DEFAULT 0,
+            last_check TEXT NOT NULL DEFAULT '',
+            last_seen TEXT NOT NULL DEFAULT '',
+            last_success_at TEXT NOT NULL DEFAULT '',
+            priority_score REAL NOT NULL DEFAULT 0,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            next_scan_at TEXT NOT NULL DEFAULT '',
+            locked_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_store_registry_priority ON stores(status, priority_score DESC, last_check)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_store_registry_snapshot ON stores(has_snapshot, product_count DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_store_registry_seen ON stores(last_seen DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_store_registry_source ON stores(source)")
+    conn.commit()
+
+
+def _store_registry_calc_priority(
+    *,
+    source: str = "",
+    has_snapshot: bool = False,
+    product_count: int = 0,
+    last_check: str = "",
+    p_med: float = 0,
+    p_avg: float = 0,
+    fail_count: int = 0,
+    extra_score: float = 0,
+) -> float:
+    score = float(extra_score or 0)
+    if source in {"watchlist", "snapshot+watchlist"}:
+        score += 30
+    elif source.startswith("8000"):
+        score += 18
+    elif source == "snapshot":
+        score += 14
+    elif source:
+        score += 6
+    if has_snapshot:
+        score += 12
+    if 20 <= product_count <= 800:
+        score += 20
+    elif 801 <= product_count <= 5000:
+        score += 14
+    elif product_count > 5000:
+        score += 8
+    elif 1 <= product_count < 20:
+        score += 6
+    anchor = float(p_med or p_avg or 0)
+    if 18 <= anchor <= 120:
+        score += 18
+    elif 121 <= anchor <= 250:
+        score += 10
+    elif 8 <= anchor < 18:
+        score += 5
+    if last_check:
+        try:
+            checked_at = datetime.fromisoformat(str(last_check).replace("Z", "+00:00")).replace(tzinfo=None)
+            age_days = max(0, (datetime.now() - checked_at).days)
+            if age_days <= 1:
+                score += 14
+            elif age_days <= 3:
+                score += 10
+            elif age_days <= 7:
+                score += 7
+            elif age_days >= 14:
+                score += 4
+        except Exception:
+            pass
+    score -= min(max(int(fail_count or 0), 0), 10) * 3
+    return round(max(score, 0), 2)
+
+
+def _store_registry_upsert(
+    domain: str,
+    source: str = "unknown",
+    *,
+    status: str | None = None,
+    platform: str | None = None,
+    has_snapshot: bool | None = None,
+    product_count: int | None = None,
+    priced_product_count: int | None = None,
+    price_coverage_pct: float | None = None,
+    p_min: float | None = None,
+    p_max: float | None = None,
+    p_avg: float | None = None,
+    p_med: float | None = None,
+    last_check: str | None = None,
+    last_seen: str | None = None,
+    last_success_at: str | None = None,
+    priority_score: float | None = None,
+    fail_count: int | None = None,
+    last_error: str | None = None,
+    conn: sqlite3.Connection | None = None,
+) -> bool:
+    normalized = _store_registry_normalize_domain(domain)
+    if not normalized:
+        return False
+    close_conn = conn is None
+    conn = conn or _store_registry_conn()
+    now = _store_registry_now()
+    existing = conn.execute("SELECT * FROM stores WHERE domain=?", (normalized,)).fetchone()
+    current = dict(existing) if existing else {}
+    merged_source = source or current.get("source") or "unknown"
+    if current.get("source") and source and source not in str(current.get("source")).split("+"):
+        merged_source = "+".join(sorted(set(str(current.get("source")).split("+") + [source])))
+    merged_status = status or current.get("status") or "queued"
+    merged_platform = platform if platform is not None else current.get("platform", "")
+    merged_has_snapshot = int(has_snapshot if has_snapshot is not None else current.get("has_snapshot", 0) or 0)
+    merged_product_count = int(product_count if product_count is not None else current.get("product_count", 0) or 0)
+    merged_priced_count = int(priced_product_count if priced_product_count is not None else current.get("priced_product_count", 0) or 0)
+    merged_coverage = float(price_coverage_pct if price_coverage_pct is not None else current.get("price_coverage_pct", 0) or 0)
+    merged_p_min = float(p_min if p_min is not None else current.get("p_min", 0) or 0)
+    merged_p_max = float(p_max if p_max is not None else current.get("p_max", 0) or 0)
+    merged_p_avg = float(p_avg if p_avg is not None else current.get("p_avg", 0) or 0)
+    merged_p_med = float(p_med if p_med is not None else current.get("p_med", 0) or 0)
+    merged_last_check = last_check if last_check is not None else current.get("last_check", "")
+    merged_last_seen = last_seen if last_seen is not None else current.get("last_seen", "") or now
+    merged_last_success_at = last_success_at if last_success_at is not None else current.get("last_success_at", "")
+    merged_fail_count = int(fail_count if fail_count is not None else current.get("fail_count", 0) or 0)
+    merged_last_error = last_error if last_error is not None else current.get("last_error", "")
+    merged_priority = priority_score
+    if merged_priority is None:
+        merged_priority = _store_registry_calc_priority(
+            source=merged_source,
+            has_snapshot=bool(merged_has_snapshot),
+            product_count=merged_product_count,
+            last_check=merged_last_check,
+            p_med=merged_p_med,
+            p_avg=merged_p_avg,
+            fail_count=merged_fail_count,
+            extra_score=float(current.get("priority_score", 0) or 0) * 0.15,
+        )
+    conn.execute(
+        """
+        INSERT INTO stores (
+            domain, source, status, platform, has_snapshot, product_count, priced_product_count,
+            price_coverage_pct, p_min, p_max, p_avg, p_med, last_check, last_seen,
+            last_success_at, priority_score, fail_count, last_error, next_scan_at, locked_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)
+        ON CONFLICT(domain) DO UPDATE SET
+            source=excluded.source,
+            status=CASE
+                WHEN stores.status='active' AND excluded.status='queued' THEN stores.status
+                ELSE excluded.status
+            END,
+            platform=COALESCE(NULLIF(excluded.platform, ''), stores.platform),
+            has_snapshot=MAX(stores.has_snapshot, excluded.has_snapshot),
+            product_count=CASE WHEN excluded.product_count > 0 OR excluded.has_snapshot THEN excluded.product_count ELSE stores.product_count END,
+            priced_product_count=CASE WHEN excluded.priced_product_count > 0 OR excluded.has_snapshot THEN excluded.priced_product_count ELSE stores.priced_product_count END,
+            price_coverage_pct=CASE WHEN excluded.price_coverage_pct > 0 OR excluded.has_snapshot THEN excluded.price_coverage_pct ELSE stores.price_coverage_pct END,
+            p_min=CASE WHEN excluded.p_min > 0 OR excluded.has_snapshot THEN excluded.p_min ELSE stores.p_min END,
+            p_max=CASE WHEN excluded.p_max > 0 OR excluded.has_snapshot THEN excluded.p_max ELSE stores.p_max END,
+            p_avg=CASE WHEN excluded.p_avg > 0 OR excluded.has_snapshot THEN excluded.p_avg ELSE stores.p_avg END,
+            p_med=CASE WHEN excluded.p_med > 0 OR excluded.has_snapshot THEN excluded.p_med ELSE stores.p_med END,
+            last_check=COALESCE(NULLIF(excluded.last_check, ''), stores.last_check),
+            last_seen=excluded.last_seen,
+            last_success_at=COALESCE(NULLIF(excluded.last_success_at, ''), stores.last_success_at),
+            priority_score=MAX(stores.priority_score * 0.85, excluded.priority_score),
+            fail_count=excluded.fail_count,
+            last_error=excluded.last_error,
+            updated_at=excluded.updated_at
+        """,
+        (
+            normalized,
+            merged_source,
+            merged_status,
+            merged_platform or "",
+            merged_has_snapshot,
+            merged_product_count,
+            merged_priced_count,
+            merged_coverage,
+            merged_p_min,
+            merged_p_max,
+            merged_p_avg,
+            merged_p_med,
+            merged_last_check or "",
+            merged_last_seen or now,
+            merged_last_success_at or "",
+            float(merged_priority or 0),
+            merged_fail_count,
+            merged_last_error or "",
+            now,
+        ),
+    )
+    if close_conn:
+        conn.commit()
+        conn.close()
+    return True
+
+
+def _store_registry_mark_refresh_result(result: dict) -> None:
+    domain = _store_registry_normalize_domain(result.get("domain", ""))
+    if not domain:
+        return
+    status = str(result.get("status") or "error")
+    now = _store_registry_now()
+    try:
+        with _store_registry_conn() as conn:
+            row = conn.execute("SELECT fail_count, source, priority_score FROM stores WHERE domain=?", (domain,)).fetchone()
+            fail_count = int((row or {}).get("fail_count", 0) if isinstance(row, dict) else row["fail_count"] if row else 0)
+            if status == "ok":
+                product_count = int(result.get("product_count") or 0)
+                _store_registry_upsert(
+                    domain,
+                    "scan",
+                    status="active",
+                    has_snapshot=True,
+                    product_count=product_count,
+                    last_check=now,
+                    last_seen=now,
+                    last_success_at=now,
+                    fail_count=0,
+                    last_error="",
+                    conn=conn,
+                )
+            else:
+                fail_count += 1
+                next_status = "no_data" if status == "no_data" else "error"
+                conn.execute(
+                    """
+                    UPDATE stores
+                    SET status=?, fail_count=?, last_error=?, priority_score=MAX(priority_score - 6, 0),
+                        last_seen=?, updated_at=?
+                    WHERE domain=?
+                    """,
+                    (next_status, fail_count, str(result.get("error") or result.get("reason") or status)[:240], now, now, domain),
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _store_registry_seed_from_watchlist(conn: sqlite3.Connection | None = None) -> int:
+    domains = _read_watchlist_domains()
+    count = 0
+    close_conn = conn is None
+    conn = conn or _store_registry_conn()
+    for domain in domains:
+        if _store_registry_upsert(domain, "watchlist", status="queued", priority_score=60, conn=conn):
+            count += 1
+    if close_conn:
+        conn.commit()
+        conn.close()
+    return count
+
+
+def _store_registry_seed_from_snapshot_rows(stores: list[dict], conn: sqlite3.Connection | None = None) -> int:
+    count = 0
+    close_conn = conn is None
+    conn = conn or _store_registry_conn()
+    for store in stores:
+        if not isinstance(store, dict):
+            continue
+        domain = store.get("domain", "")
+        if _store_registry_upsert(
+            domain,
+            "snapshot",
+            status="active",
+            platform="shopify_or_best_effort",
+            has_snapshot=True,
+            product_count=int(store.get("product_count") or 0),
+            priced_product_count=int(store.get("priced_product_count") or 0),
+            price_coverage_pct=float(store.get("price_coverage_pct") or 0),
+            p_min=float(store.get("p_min") or 0),
+            p_max=float(store.get("p_max") or 0),
+            p_avg=float(store.get("p_avg") or 0),
+            p_med=float(store.get("p_med") or 0),
+            last_check=str(store.get("last_check") or ""),
+            last_success_at=str(store.get("last_check") or ""),
+            conn=conn,
+        ):
+            count += 1
+    if close_conn:
+        conn.commit()
+        conn.close()
+    return count
+
+
+def _store_registry_seed_from_snapshots(limit: int = 0, conn: sqlite3.Connection | None = None) -> int:
+    stores: list[dict] = []
+    scanned = 0
+    for fp in sorted(glob.glob(str(MONITOR_DIR / "*_snapshot.json"))):
+        if limit and scanned >= limit:
+            break
+        scanned += 1
+        try:
+            data = json.loads(Path(fp).read_text(encoding="utf-8"))
+            domain = data.get("domain", Path(fp).stem.replace("_snapshot", ""))
+            prods = data.get("products", {})
+            product_items = list(prods.values()) if isinstance(prods, dict) else (prods if isinstance(prods, list) else [])
+            product_items = [p for p in product_items if isinstance(p, dict)]
+            prices = [_valid_price(p.get("price")) for p in product_items]
+            prices = sorted([p for p in prices if p is not None])
+            pc = int(data.get("product_count", len(product_items)) or 0)
+            pc = max(pc, len(product_items))
+            stores.append({
+                "domain": domain,
+                "product_count": pc,
+                "priced_product_count": len(prices),
+                "price_coverage_pct": round(len(prices) / pc * 100, 1) if pc else 0,
+                "p_min": round(prices[0], 2) if prices else 0,
+                "p_max": round(prices[-1], 2) if prices else 0,
+                "p_avg": round(sum(prices) / len(prices), 2) if prices else 0,
+                "p_med": _median_sorted(prices),
+                "last_check": str(data.get("last_check") or "")[:16],
+            })
+        except Exception:
+            continue
+    return _store_registry_seed_from_snapshot_rows(stores, conn=conn)
+
+
+def _store_registry_fetch_8000_page(limit: int, offset: int) -> list[dict]:
+    url = f"http://127.0.0.1:8000/brands?limit={int(limit)}&offset={int(offset)}"
+    req = urllib.request.Request(url)
+    with _LOCAL_OPENER.open(req, timeout=20) as resp:
+        data = json.loads(resp.read())
+    return data if isinstance(data, list) else []
+
+
+def _store_registry_seed_from_8000(limit: int = STORE_REGISTRY_TARGET, page_size: int = 5000) -> dict:
+    requested = max(1, min(int(limit or STORE_REGISTRY_TARGET), STORE_REGISTRY_TARGET))
+    page_size = max(100, min(int(page_size or 5000), 20000))
+    imported = 0
+    pages = 0
+    errors: list[str] = []
+    with _store_registry_conn() as conn:
+        for offset in range(0, requested, page_size):
+            try:
+                brands = _store_registry_fetch_8000_page(min(page_size, requested - offset), offset)
+            except Exception as exc:
+                errors.append(f"offset {offset}: {exc}")
+                break
+            if not brands:
+                break
+            pages += 1
+            for brand in brands:
+                if not isinstance(brand, dict):
+                    continue
+                domain = brand.get("domain", "")
+                score = float(brand.get("orbit_score") or 0) * 0.18 + min(float(brand.get("appearance_count") or 0), 1000) * 0.04
+                if _store_registry_upsert(
+                    domain,
+                    "8000",
+                    status="queued",
+                    platform="external_brand",
+                    last_seen=_store_registry_now(),
+                    priority_score=round(18 + score, 2),
+                    conn=conn,
+                ):
+                    imported += 1
+            conn.commit()
+            if len(brands) < page_size:
+                break
+    return {
+        "ok": len(errors) == 0,
+        "requested_limit": requested,
+        "page_size": page_size,
+        "pages": pages,
+        "imported_or_updated": imported,
+        "errors": errors[:5],
+    }
+
+
+def _store_registry_import_domains(domains: list[str], source: str = "import") -> dict:
+    count = 0
+    skipped = 0
+    with _store_registry_conn() as conn:
+        for domain in domains:
+            if _store_registry_upsert(domain, source or "import", status="queued", conn=conn):
+                count += 1
+            else:
+                skipped += 1
+        conn.commit()
+    return {"ok": True, "imported_or_updated": count, "skipped": skipped}
+
+
+def _store_registry_stats() -> dict:
+    try:
+        with _store_registry_conn() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN has_snapshot=1 THEN 1 ELSE 0 END) AS with_snapshot,
+                    SUM(CASE WHEN has_snapshot=0 THEN 1 ELSE 0 END) AS without_snapshot,
+                    SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) AS queued,
+                    SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error,
+                    SUM(CASE WHEN status='no_data' THEN 1 ELSE 0 END) AS no_data,
+                    SUM(CASE WHEN last_check >= date('now', '-1 day') THEN 1 ELSE 0 END) AS active_1d,
+                    SUM(CASE WHEN last_check >= date('now', '-3 day') THEN 1 ELSE 0 END) AS active_3d,
+                    SUM(product_count) AS products
+                FROM stores
+                """
+            ).fetchone()
+            sources = [
+                {"source": r["source"] or "unknown", "count": int(r["cnt"] or 0)}
+                for r in conn.execute("SELECT source, COUNT(*) AS cnt FROM stores GROUP BY source ORDER BY cnt DESC LIMIT 8")
+            ]
+        total = int(row["total"] or 0) if row else 0
+        return {
+            "ok": True,
+            "target": STORE_REGISTRY_TARGET,
+            "total_registered_stores": total,
+            "total_snapshot_stores": int(row["with_snapshot"] or 0) if row else 0,
+            "without_snapshot": int(row["without_snapshot"] or 0) if row else 0,
+            "scan_queue_pending": int(row["queued"] or 0) if row else 0,
+            "active_registry_stores": int(row["active"] or 0) if row else 0,
+            "error_stores": int(row["error"] or 0) if row else 0,
+            "no_data_stores": int(row["no_data"] or 0) if row else 0,
+            "registry_products": int(row["products"] or 0) if row else 0,
+            "registry_active_1d": int(row["active_1d"] or 0) if row else 0,
+            "registry_active_3d": int(row["active_3d"] or 0) if row else 0,
+            "registry_coverage_pct": round(total / max(STORE_REGISTRY_TARGET, 1) * 100, 4),
+            "sources": sources,
+            "db_path": str(STORE_REGISTRY_DB),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "target": STORE_REGISTRY_TARGET,
+            "total_registered_stores": 0,
+            "total_snapshot_stores": 0,
+            "scan_queue_pending": 0,
+            "registry_coverage_pct": 0,
+            "error": str(exc),
+        }
+
+
+def _store_registry_sort_expr(sort: str, order: str) -> str:
+    sort_map = {
+        "products": "product_count",
+        "product_count": "product_count",
+        "price-avg": "p_avg",
+        "p_avg": "p_avg",
+        "domain": "domain",
+        "last_check": "last_check",
+        "priority": "priority_score",
+        "status": "status",
+    }
+    col = sort_map.get(str(sort or "products"), "product_count")
+    direction = "ASC" if str(order or "").lower() == "asc" else "DESC"
+    return f"{col} {direction}, priority_score DESC, domain ASC"
+
+
+def _store_registry_page(
+    *,
+    limit: int = 100,
+    offset: int = 0,
+    sort: str = "products",
+    order: str = "desc",
+    search: str = "",
+    snapshot: str = "all",
+) -> dict:
+    limit = max(1, min(int(limit or 100), 1000))
+    offset = max(0, int(offset or 0))
+    where: list[str] = []
+    params: list = []
+    if search:
+        where.append("domain LIKE ?")
+        params.append(f"%{search.strip().lower()}%")
+    if snapshot == "yes":
+        where.append("has_snapshot=1")
+    elif snapshot == "no":
+        where.append("has_snapshot=0")
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    order_sql = _store_registry_sort_expr(sort, order)
+    try:
+        with _store_registry_conn() as conn:
+            total = int(conn.execute(f"SELECT COUNT(*) FROM stores {where_sql}", params).fetchone()[0])
+            rows = conn.execute(
+                f"""
+                SELECT domain, source, status, platform, has_snapshot, product_count, priced_product_count,
+                       price_coverage_pct, p_min, p_max, p_avg, p_med, last_check, last_seen,
+                       last_success_at, priority_score, fail_count, last_error, updated_at
+                FROM stores
+                {where_sql}
+                ORDER BY {order_sql}
+                LIMIT ? OFFSET ?
+                """,
+                params + [limit, offset],
+            ).fetchall()
+        stores = []
+        for row in rows:
+            item = dict(row)
+            item["has_snapshot"] = bool(item.get("has_snapshot"))
+            stores.append(item)
+        return {"ok": True, "total": total, "offset": offset, "limit": limit, "stores": stores}
+    except Exception as exc:
+        return {"ok": False, "total": 0, "offset": offset, "limit": limit, "stores": [], "error": str(exc)}
+
+
+def _store_registry_pick_scan_batch(limit: int, include_blacklist: bool = False) -> list[str]:
+    limit = max(1, min(int(limit or STORE_REGISTRY_SCAN_BATCH_DEFAULT), STORE_REGISTRY_SCAN_BATCH_MAX))
+    dead_domains: set[str] = set()
+    if not include_blacklist:
+        try:
+            health = su._load_health()
+            dead_domains = {d for d, h in health.items() if h.get("status") == "dead"}
+        except Exception:
+            dead_domains = set()
+    try:
+        with _store_registry_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT domain
+                FROM stores
+                WHERE status != 'dead'
+                ORDER BY
+                    CASE WHEN has_snapshot=0 THEN 0 ELSE 1 END,
+                    priority_score DESC,
+                    fail_count ASC,
+                    COALESCE(NULLIF(last_check, ''), '1970-01-01') ASC,
+                    domain ASC
+                LIMIT ?
+                """,
+                (limit + len(dead_domains),),
+            ).fetchall()
+        domains = []
+        for row in rows:
+            domain = row["domain"]
+            if domain in dead_domains:
+                continue
+            domains.append(domain)
+            if len(domains) >= limit:
+                break
+        return domains
+    except Exception:
+        return []
+
+
+def _store_registry_ensure_baseline(stores: list[dict] | None = None) -> dict:
+    stats = _store_registry_stats()
+    if int(stats.get("total_registered_stores") or 0) > 0:
+        return stats
+    try:
+        with _store_registry_conn() as conn:
+            if stores is not None:
+                _store_registry_seed_from_snapshot_rows(stores, conn=conn)
+            else:
+                _store_registry_seed_from_snapshots(conn=conn)
+            _store_registry_seed_from_watchlist(conn=conn)
+            conn.commit()
+    except Exception:
+        pass
+    return _store_registry_stats()
+
+
+def _monitor_refresh_status_copy() -> dict:
+    with _MONITOR_REFRESH_LOCK:
+        status = dict(_MONITOR_REFRESH_STATUS)
+        status["recent_results"] = list(_MONITOR_REFRESH_STATUS.get("recent_results", []))
+    if status.get("started_at"):
+        end_ts = status.get("finished_at") or time.time()
+        status["elapsed_seconds"] = round(float(end_ts) - float(status["started_at"]), 1)
+    status["progress_pct"] = round((status.get("completed", 0) / max(status.get("total", 0), 1)) * 100, 1)
+    return status
+
+
+def _gtrends_status_copy() -> dict:
+    with _GTRENDS_BG_LOCK:
+        status = dict(_GTRENDS_BG_STATUS)
+        status["current_batch"] = list(_GTRENDS_BG_STATUS.get("current_batch", []))
+        status["keywords"] = list(_GTRENDS_BG_STATUS.get("keywords", []))
+        status["results"] = list(_GTRENDS_BG_STATUS.get("results", []))
+        status["warnings"] = list(_GTRENDS_BG_STATUS.get("warnings", []))
+    if status.get("started_at"):
+        end_ts = status.get("finished_at") or time.time()
+        status["elapsed_seconds"] = round(float(end_ts) - float(status["started_at"]), 1)
+    status["progress_pct"] = round((status.get("completed_keywords", 0) / max(status.get("total_keywords", 0), 1)) * 100, 1)
+    return status
+
+
+def _set_gtrends_status(**updates):
+    with _GTRENDS_BG_LOCK:
+        _GTRENDS_BG_STATUS.update(updates)
+        status = dict(_GTRENDS_BG_STATUS)
+    try:
+        MONITOR_DIR.mkdir(parents=True, exist_ok=True)
+        GTRENDS_BG_STATUS_PATH.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _v2_daily_iso(dt: datetime | None = None) -> str:
+    return (dt or datetime.now()).isoformat(timespec="seconds")
+
+
+def _v2_daily_load_status_from_disk() -> None:
+    if not V2_DAILY_MONITOR_STATUS_PATH.exists():
+        return
+    try:
+        data = json.loads(V2_DAILY_MONITOR_STATUS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            safe_updates = {
+                key: data[key]
+                for key in _V2_DAILY_MONITOR_STATUS
+                if key in data and key not in {"running", "active_run", "run_requested"}
+            }
+            with _V2_DAILY_MONITOR_LOCK:
+                _V2_DAILY_MONITOR_STATUS.update(safe_updates)
+                _V2_DAILY_MONITOR_STATUS["running"] = False
+                _V2_DAILY_MONITOR_STATUS["active_run"] = False
+                _V2_DAILY_MONITOR_STATUS["run_requested"] = False
+                if _V2_DAILY_MONITOR_STATUS.get("enabled"):
+                    _V2_DAILY_MONITOR_STATUS["state"] = "enabled"
+                    _V2_DAILY_MONITOR_STATUS["message"] = "每日自动抓取等待恢复"
+    except Exception:
+        pass
+
+
+def _v2_daily_next_run_at(status: dict | None = None) -> str | None:
+    status = status or _v2_daily_status_copy(raw=True)
+    if not status.get("enabled"):
+        return None
+    now = datetime.now()
+    hour = max(0, min(int(status.get("schedule_hour") or 9), 23))
+    today_at = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if status.get("last_run_date") != now.strftime("%Y-%m-%d") and now >= today_at:
+        return _v2_daily_iso(now)
+    target = today_at if now < today_at else today_at + timedelta(days=1)
+    return _v2_daily_iso(target)
+
+
+def _v2_daily_persist_status(status: dict) -> None:
+    try:
+        MONITOR_DIR.mkdir(parents=True, exist_ok=True)
+        V2_DAILY_MONITOR_STATUS_PATH.write_text(
+            json.dumps(status, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _set_v2_daily_status(**updates):
+    with _V2_DAILY_MONITOR_LOCK:
+        _V2_DAILY_MONITOR_STATUS.update(updates)
+        _V2_DAILY_MONITOR_STATUS["next_run_at"] = _v2_daily_next_run_at(_V2_DAILY_MONITOR_STATUS)
+        status = dict(_V2_DAILY_MONITOR_STATUS)
+    _v2_daily_persist_status(status)
+
+
+def _v2_daily_status_copy(raw: bool = False) -> dict:
+    with _V2_DAILY_MONITOR_LOCK:
+        status = dict(_V2_DAILY_MONITOR_STATUS)
+        status["scan_summary"] = dict(_V2_DAILY_MONITOR_STATUS.get("scan_summary") or {})
+        status["workbench_summary"] = dict(_V2_DAILY_MONITOR_STATUS.get("workbench_summary") or {})
+    if not raw:
+        status["next_run_at"] = _v2_daily_next_run_at(status)
+    return status
+
+
+def _ai_autopilot_iso(dt: datetime | None = None) -> str:
+    return (dt or datetime.now()).isoformat(timespec="seconds")
+
+
+def _ai_autopilot_parse_time(value) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value))
+        except Exception:
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _ai_autopilot_age_hours(value) -> float:
+    dt = _ai_autopilot_parse_time(value)
+    if not dt:
+        return 9999.0
+    return round(max(0.0, (datetime.now() - dt).total_seconds() / 3600), 2)
+
+
+def _ai_autopilot_num(value, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        if isinstance(value, str):
+            match = re.search(r"-?\d+(?:\.\d+)?", value.replace(",", ""))
+            return float(match.group(0)) if match else default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _ai_autopilot_int(value, default: int = 0) -> int:
+    return int(round(_ai_autopilot_num(value, default)))
+
+
+def _ai_autopilot_ratio(part, total) -> float:
+    denom = max(_ai_autopilot_num(total), 1.0)
+    return max(0.0, min(_ai_autopilot_num(part) / denom, 1.0))
+
+
+def _ai_autopilot_score(value) -> int:
+    return int(max(0, min(round(_ai_autopilot_num(value)), 100)))
+
+
+def _ai_autopilot_grade(score: float) -> str:
+    score = _ai_autopilot_num(score)
+    if score >= 88:
+        return "A"
+    if score >= 76:
+        return "B"
+    if score >= 62:
+        return "C"
+    if score >= 45:
+        return "D"
+    return "E"
+
+
+def _ai_autopilot_quality_label(score: float) -> str:
+    score = _ai_autopilot_num(score)
+    if score >= 88:
+        return "可自动行动"
+    if score >= 76:
+        return "可信"
+    if score >= 62:
+        return "可用但需补证"
+    if score >= 45:
+        return "证据偏弱"
+    return "需要自动补数据"
+
+
+def _ai_autopilot_load_status_from_disk() -> None:
+    if not AI_AUTOPILOT_STATUS_PATH.exists():
+        return
+    try:
+        data = json.loads(AI_AUTOPILOT_STATUS_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            safe_updates = {
+                key: data[key]
+                for key in _AI_AUTOPILOT_STATUS
+                if key in data and key not in {"running", "active_run", "run_requested"}
+            }
+            with _AI_AUTOPILOT_LOCK:
+                _AI_AUTOPILOT_STATUS.update(safe_updates)
+                _AI_AUTOPILOT_STATUS["running"] = False
+                _AI_AUTOPILOT_STATUS["active_run"] = False
+                _AI_AUTOPILOT_STATUS["run_requested"] = False
+                if _AI_AUTOPILOT_STATUS.get("enabled"):
+                    _AI_AUTOPILOT_STATUS["state"] = "enabled"
+                    _AI_AUTOPILOT_STATUS["message"] = "AI自动驾驶等待恢复"
+                else:
+                    _AI_AUTOPILOT_STATUS["state"] = "disabled"
+                    _AI_AUTOPILOT_STATUS["message"] = "AI自动驾驶已关闭"
+    except Exception:
+        pass
+
+
+def _ai_autopilot_next_check_at(status: dict | None = None) -> str:
+    status = status or _ai_autopilot_status_copy(raw=True)
+    if not status.get("enabled"):
+        return ""
+    if status.get("run_requested") or not status.get("last_run_at"):
+        return _ai_autopilot_iso()
+    last = _ai_autopilot_parse_time(status.get("last_run_at")) or datetime.now()
+    interval = max(60, min(_ai_autopilot_int(status.get("interval_seconds"), 60), 86400))
+    return _ai_autopilot_iso(last + timedelta(seconds=interval))
+
+
+def _ai_autopilot_persist_status(status: dict) -> None:
+    try:
+        MONITOR_DIR.mkdir(parents=True, exist_ok=True)
+        AI_AUTOPILOT_STATUS_PATH.write_text(
+            json.dumps(status, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _set_ai_autopilot_status(**updates):
+    with _AI_AUTOPILOT_LOCK:
+        _AI_AUTOPILOT_STATUS.update(updates)
+        _AI_AUTOPILOT_STATUS["next_check_at"] = _ai_autopilot_next_check_at(_AI_AUTOPILOT_STATUS)
+        status = dict(_AI_AUTOPILOT_STATUS)
+        status["last_actions"] = list(_AI_AUTOPILOT_STATUS.get("last_actions") or [])
+        status["last_assessment"] = dict(_AI_AUTOPILOT_STATUS.get("last_assessment") or {})
+        status["data_quality"] = dict(_AI_AUTOPILOT_STATUS.get("data_quality") or {})
+        status["evidence_quality"] = dict(_AI_AUTOPILOT_STATUS.get("evidence_quality") or {})
+        status["judgement_quality"] = dict(_AI_AUTOPILOT_STATUS.get("judgement_quality") or {})
+        status["auto_follow_queue"] = dict(_AI_AUTOPILOT_STATUS.get("auto_follow_queue") or {})
+        status["auto_selection_summary"] = dict(_AI_AUTOPILOT_STATUS.get("auto_selection_summary") or {})
+    _ai_autopilot_persist_status(status)
+
+
+def _ai_autopilot_status_copy(raw: bool = False) -> dict:
+    with _AI_AUTOPILOT_LOCK:
+        status = dict(_AI_AUTOPILOT_STATUS)
+        status["last_actions"] = list(_AI_AUTOPILOT_STATUS.get("last_actions") or [])
+        status["last_assessment"] = dict(_AI_AUTOPILOT_STATUS.get("last_assessment") or {})
+        status["data_quality"] = dict(_AI_AUTOPILOT_STATUS.get("data_quality") or {})
+        status["evidence_quality"] = dict(_AI_AUTOPILOT_STATUS.get("evidence_quality") or {})
+        status["judgement_quality"] = dict(_AI_AUTOPILOT_STATUS.get("judgement_quality") or {})
+        status["auto_follow_queue"] = dict(_AI_AUTOPILOT_STATUS.get("auto_follow_queue") or {})
+        status["auto_selection_summary"] = dict(_AI_AUTOPILOT_STATUS.get("auto_selection_summary") or {})
+    status["next_check_at"] = _ai_autopilot_next_check_at(status)
+    if raw:
+        return status
+    if not status.get("last_assessment"):
+        assessment = _ai_autopilot_quality_assessment()
+        status["last_assessment"] = assessment
+        status["data_quality"] = assessment["data_quality"]
+        status["evidence_quality"] = assessment["evidence_quality"]
+        status["judgement_quality"] = assessment["judgement_quality"]
+        status["next_auto_actions"] = assessment["next_auto_actions"]
+    if not status.get("auto_follow_queue"):
+        try:
+            queue = _ai_autopilot_build_follow_queue(limit=_ai_autopilot_int(status.get("workbench_limit"), 50))
+            status["auto_follow_queue"] = queue.get("lanes", {})
+            status["auto_selection_summary"] = {k: v for k, v in queue.items() if k != "lanes"}
+        except Exception:
+            status["auto_follow_queue"] = {}
+            status["auto_selection_summary"] = {"ok": False, "decision": "自动队列生成中，下一轮巡航会补齐"}
+    status["safe_gates"] = [
+        "自动选品、自动补证、自动重算跟品队列",
+        "自动给出跟哪些、平台趋势、怎么跟、不能跟原因",
+        "不自动花广告费",
+        "不自动发布商品",
+    ]
+    return status
+
+
+def _ai_autopilot_pick_queue_item(item: dict) -> dict:
+    required_validation = item.get("required_validation") if isinstance(item.get("required_validation"), dict) else {}
+    validation_summary = item.get("validation_summary") if isinstance(item.get("validation_summary"), dict) else required_validation.get("summary") if isinstance(required_validation.get("summary"), dict) else {}
+    scorecard = item.get("decision_scorecard") if isinstance(item.get("decision_scorecard"), list) else []
+    blocking = item.get("validation_blocking") if isinstance(item.get("validation_blocking"), list) else required_validation.get("blocking_missing") if isinstance(required_validation.get("blocking_missing"), list) else []
+    evidence_gaps = item.get("evidence_gaps") if isinstance(item.get("evidence_gaps"), list) else []
+    trend_score = round(_ai_autopilot_num(item.get("trend_score")), 2)
+    trend_status = item.get("trend_status") or "unverified"
+    return {
+        "rank": item.get("rank") or 0,
+        "title": item.get("title") or "",
+        "domain": item.get("domain") or "",
+        "product_url": item.get("product_url") or "",
+        "follow_status": item.get("follow_status") or item.get("status") or "",
+        "original_follow_status": item.get("original_follow_status") or item.get("follow_status") or item.get("status") or "",
+        "follow_level": item.get("follow_level") or "",
+        "trend_priority": round(_ai_autopilot_num(item.get("trend_priority"), trend_score), 2),
+        "priority": _ai_autopilot_int(item.get("priority")),
+        "price": round(_ai_autopilot_num(item.get("price")), 2),
+        "ad_count": _ai_autopilot_int(item.get("ad_count")),
+        "trend_status": trend_status,
+        "trend_score": trend_score,
+        "strict_pass": bool(item.get("strict_pass")),
+        "strict_validation": item.get("strict_validation") or f"{_ai_autopilot_int(validation_summary.get('verified_count'))}/{max(1, _ai_autopilot_int(validation_summary.get('required_count'), 2))}",
+        "why": item.get("follow_reason") or item.get("reason") or item.get("money_signal") or "",
+        "do_now": item.get("do_now") or item.get("next_action") or "",
+        "how_to_follow": item.get("how_to_follow") or item.get("monitoring_focus") or "",
+        "test_plan": item.get("test_plan") or "",
+        "auto_judgement": item.get("auto_judgement") or "",
+        "blocking": blocking[:5],
+        "evidence_gaps": evidence_gaps[:5],
+        "scorecard": scorecard[:5],
+        "validation_summary": validation_summary,
+    }
+
+
+def _ai_autopilot_text_blob(*values) -> str:
+    parts: list[str] = []
+    for value in values:
+        if value in (None, ""):
+            continue
+        if isinstance(value, dict):
+            parts.extend(str(v) for v in value.values())
+        elif isinstance(value, (list, tuple, set)):
+            parts.extend(str(v) for v in value)
+        else:
+            parts.append(str(value))
+    return " ".join(parts).lower()
+
+
+def _ai_autopilot_hard_blockers(item: dict) -> list[str]:
+    risk = item.get("risk") if isinstance(item.get("risk"), dict) else {}
+    economics = item.get("economics") if isinstance(item.get("economics"), dict) else {}
+    validation_summary = item.get("validation_summary") if isinstance(item.get("validation_summary"), dict) else {}
+    required_validation = item.get("required_validation") if isinstance(item.get("required_validation"), dict) else {}
+    summary = required_validation.get("summary") if isinstance(required_validation.get("summary"), dict) else validation_summary
+    blockers = []
+    for key in ("blockers", "missing", "evidence_gaps", "economics_gaps"):
+        value = risk.get(key) if isinstance(risk, dict) else None
+        if isinstance(value, list):
+            blockers.extend(str(x) for x in value if x)
+    for key in ("validation_blocking", "evidence_gaps", "blocking"):
+        value = item.get(key)
+        if isinstance(value, list):
+            blockers.extend(str(x) for x in value if x)
+    blockers.extend(str(x) for x in (item.get("follow_reason"), item.get("reason"), item.get("next_action")) if x)
+
+    hard_terms = (
+        "trademark infringement", "copyright infringement", "patent infringement", "counterfeit",
+        "knockoff", "fake product", "recalled", "banned", "prohibited", "fda restricted",
+        "ip侵权", "知识产权侵权", "侵权", "专利侵权", "商标侵权", "版权侵权",
+        "仿牌", "假货", "召回", "禁售", "违法", "违规禁售", "危险品", "处方药", "医疗器械",
+    )
+    soft_terms = (
+        "缺 ", "缺少", "未拿到", "待核", "待验", "不够清楚", "证据不足", "缺真实",
+        "缺 meta", "缺 amazon", "缺 reddit", "缺同类", "缺素材", "缺广告", "毛利或价格不足以证明",
+        "必须拿到真实报价", "待人工确认", "不要复制", "不能复制", "品牌词", "logo", "达人素材",
+        "竞品视频", "竞品图片", "评论截图", "页面排版", "可追溯", "待确认",
+    )
+    hard: list[str] = []
+    for text in blockers:
+        lowered = str(text).lower()
+        if any(term in lowered for term in hard_terms) and not any(term in lowered for term in soft_terms):
+            hard.append(str(text))
+
+    price = _ai_autopilot_num(item.get("price") or economics.get("price"), 0)
+    contribution = _ai_autopilot_num(economics.get("contribution_before_ads"), 0)
+    margin = _ai_autopilot_num(economics.get("contribution_margin_pct"), 0)
+    target_cpa = _ai_autopilot_num(item.get("target_cpa") or economics.get("target_cpa"), 0)
+    break_even_cpa = _ai_autopilot_num(item.get("break_even_cpa") or economics.get("break_even_cpa"), 0)
+    if price <= 0:
+        hard.append("价格无效，无法计算毛利")
+    elif price < 12 and margin <= 0:
+        hard.append("客单价过低且无毛利空间")
+    elif contribution < -3 and margin < -10:
+        hard.append("贡献毛利为负，买量越多亏越多")
+    elif target_cpa > 0 and break_even_cpa > 0 and break_even_cpa < target_cpa * 0.45 and margin <= 0:
+        hard.append("保本 CPA 明显低于目标 CPA，经济性不可测")
+
+    blocking_count = _ai_autopilot_int(summary.get("blocking_count"))
+    if blocking_count >= 8:
+        text_blob = _ai_autopilot_text_blob(blockers)
+        if any(term in text_blob for term in ("侵权", "禁售", "违法", "召回", "危险品", "fda restricted", "trademark infringement")):
+            hard.append("必验阻塞集中在合规/IP/履约风险")
+
+    seen: set[str] = set()
+    compact: list[str] = []
+    for reason in hard:
+        reason = str(reason or "").strip()
+        if not reason or reason in seen:
+            continue
+        seen.add(reason)
+        compact.append(reason)
+        if len(compact) >= 3:
+            break
+    return compact
+
+
+def _ai_autopilot_trend_priority(item: dict) -> float:
+    trend_score = _ai_autopilot_num(item.get("trend_score"), 0)
+    trend_status = str(item.get("trend_status") or "").lower()
+    priority = _ai_autopilot_num(item.get("priority") or item.get("follow_priority_score"), 0)
+    ad_count = _ai_autopilot_num(item.get("ad_count"), 0)
+    status_bonus = {
+        "breakout": 45,
+        "hot": 40,
+        "rising": 36,
+        "emerging": 32,
+        "up": 28,
+        "watch": 22,
+        "stable": 10,
+        "proxy": 6,
+        "weak": 0,
+        "unverified": 0,
+    }.get(trend_status, 0)
+    ad_bonus = min(ad_count, 80) * 0.28
+    return round(status_bonus + trend_score * 1.7 + priority * 0.18 + ad_bonus, 2)
+
+
+def _ai_autopilot_choose_follow_lane(item: dict) -> tuple[str, str, str, list[str]]:
+    hard_blockers = _ai_autopilot_hard_blockers(item)
+    if hard_blockers:
+        return (
+            "auto_do_not_follow",
+            "硬风险暂不跟",
+            "硬风险会吞掉利润，暂不进入跟进池",
+            hard_blockers,
+        )
+
+    trend_score = _ai_autopilot_num(item.get("trend_score"), 0)
+    trend_status = str(item.get("trend_status") or "").lower()
+    trend_priority = _ai_autopilot_trend_priority(item)
+    ad_count = _ai_autopilot_int(item.get("ad_count"))
+    strict_pass = bool(item.get("strict_pass"))
+    original = str(item.get("follow_status") or item.get("status") or "")
+
+    if strict_pass and (ad_count > 0 or trend_priority >= 45):
+        return (
+            "auto_follow_now",
+            "强跟",
+            "需求/趋势/验真已足够，直接准备 DRAFT 与小预算测试单",
+            [],
+        )
+    if trend_status in {"breakout", "hot", "rising", "emerging", "up"} or trend_score >= 10 or trend_priority >= 36:
+        return (
+            "auto_follow_now",
+            "趋势优先跟",
+            "独立站新品默认进入跟进池；趋势越高越靠前，缺证据只影响测试强度",
+            [],
+        )
+    if ad_count > 0 or original in {"先拆素材", "马上跟", "可以跟"} or trend_score >= 3 or trend_status in {"watch", "stable", "proxy"} or trend_priority >= 18:
+        return (
+            "auto_teardown_first",
+            "轻跟先拆",
+            "新品可跟，先拆素材/价格锚点/PDP，再补供应链和素材承接",
+            [],
+        )
+    return (
+        "auto_prove_first",
+        "补证跟",
+        "新品可跟，先自动补趋势/广告/社区证据，补齐后升级优先级",
+        [],
+    )
+
+
+def _ai_autopilot_follow_status_for_lane(lane: str) -> str:
+    return {
+        "auto_follow_now": "马上跟",
+        "auto_teardown_first": "先拆素材",
+        "auto_prove_first": "补证观察",
+        "auto_do_not_follow": "硬风险暂不跟",
+        "auto_low_priority": "低优先",
+    }.get(str(lane or ""), "低优先")
+
+
+def _ai_autopilot_enrich_follow_item(item: dict) -> tuple[str, dict]:
+    lane, follow_level, judgement, hard_blockers = _ai_autopilot_choose_follow_lane(item)
+    queue_item = dict(item)
+    queue_item["original_follow_status"] = item.get("original_follow_status") or item.get("follow_status") or item.get("status") or ""
+    queue_item["follow_status"] = _ai_autopilot_follow_status_for_lane(lane)
+    queue_item["follow_level"] = follow_level
+    queue_item["trend_priority"] = _ai_autopilot_trend_priority(queue_item)
+    queue_item["auto_judgement"] = judgement
+
+    if hard_blockers:
+        queue_item["validation_blocking"] = hard_blockers
+        queue_item["follow_reason"] = hard_blockers[0]
+        queue_item["do_now"] = "硬风险暂不跟；只保留监控，等待合规/IP/履约或经济性风险解除。"
+        queue_item["how_to_follow"] = "不做同款、不建 DRAFT、不投放；硬风险解除后再回到趋势队列。"
+        queue_item["test_plan"] = "先解除硬风险，再谈轻跟或强跟。"
+    elif lane == "auto_follow_now":
+        queue_item["follow_reason"] = judgement
+        queue_item["do_now"] = "准备 Shopify DRAFT、供应链报价和小预算测试单；不自动花钱。"
+        queue_item["how_to_follow"] = "强跟：趋势越高越靠前，先测最强 hook 和差异化套装。"
+        queue_item["test_plan"] = "3 套素材先测 CTR/CVR/CAC；达到止损线自动停，跑出信号再放量。"
+    elif lane == "auto_teardown_first":
+        queue_item["follow_reason"] = judgement
+        queue_item["do_now"] = "拆竞品首屏、广告钩子、价格锚点、bundle 和 FAQ；同步找供应链。"
+        queue_item["how_to_follow"] = "轻跟：不复制素材，只复用需求和 offer 结构。"
+        queue_item["test_plan"] = "先补素材包、COGS、交付时效；通过后升级小预算测试。"
+    elif lane == "auto_prove_first":
+        queue_item["follow_reason"] = judgement
+        queue_item["do_now"] = "自动补 Google Trends / Meta Ads / Reddit-UGC / Amazon 评论证据；不等人工筛选。"
+        queue_item["how_to_follow"] = "新品仍进跟进池，按趋势分层：强趋势先测，弱趋势先补证。"
+        queue_item["test_plan"] = "补到趋势、广告、社区或市场任意两类有效证据后，自动升到先拆或马上跟。"
+    elif judgement:
+        queue_item["follow_reason"] = judgement
+    return lane, queue_item
+
+
+def _ai_autopilot_sort_lane(items: list[dict]) -> list[dict]:
+    return sorted(
+        items,
+        key=lambda item: (
+            -_ai_autopilot_num(item.get("trend_priority"), 0),
+            -_ai_autopilot_num(item.get("trend_score"), 0),
+            -_ai_autopilot_num(item.get("ad_count"), 0),
+            -_ai_autopilot_num(item.get("priority"), 0),
+            _ai_autopilot_num(item.get("rank"), 9999),
+        ),
+    )
+
+
+def _ai_autopilot_build_follow_queue(latest: dict | None = None, loop: dict | None = None, limit: int = 50) -> dict:
+    latest = latest if isinstance(latest, dict) else get_latest_profit_pipeline()
+    if not isinstance(loop, dict):
+        try:
+            loop = _build_v2_closed_loop(latest, cycles=3, limit=limit) if isinstance(latest, dict) and latest.get("ok") else {"items": [], "summary": {}}
+        except Exception:
+            loop = {"items": [], "summary": {}}
+    items = loop.get("items") if isinstance(loop.get("items"), list) else []
+    lanes = {
+        "auto_follow_now": [],
+        "auto_teardown_first": [],
+        "auto_prove_first": [],
+        "auto_do_not_follow": [],
+        "auto_low_priority": [],
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        lane, queue_item = _ai_autopilot_enrich_follow_item(item)
+        lanes[lane].append(_ai_autopilot_pick_queue_item(queue_item))
+    for key in lanes:
+        lanes[key] = _ai_autopilot_sort_lane(lanes[key])[:20]
+
+    summary = loop.get("summary", {}) if isinstance(loop.get("summary"), dict) else {}
+    follow_count = len(lanes["auto_follow_now"])
+    teardown_count = len(lanes["auto_teardown_first"])
+    proof_count = len(lanes["auto_prove_first"])
+    avoid_count = len(lanes["auto_do_not_follow"])
+    if follow_count:
+        decision = "新品已自动进入跟进池：强趋势优先跟，直接准备小预算测试"
+        primary_lane = "auto_follow_now"
+    elif teardown_count:
+        decision = "新品已自动进入跟进池，按趋势先拆素材和补供应链"
+        primary_lane = "auto_teardown_first"
+    elif proof_count:
+        decision = "新品已自动进入跟进池，缺证据不拦截，系统自动补证后升级"
+        primary_lane = "auto_prove_first"
+    elif avoid_count:
+        decision = "仅硬风险暂不跟，系统自动避开合规/IP/经济性硬坑"
+        primary_lane = "auto_do_not_follow"
+    else:
+        decision = "没有强信号，继续自动监控变化"
+        primary_lane = "auto_low_priority"
+    return {
+        "ok": True,
+        "generated_at": _ai_autopilot_iso(),
+        "decision": decision,
+        "primary_lane": primary_lane,
+        "counts": {
+            "follow_now": follow_count,
+            "teardown_first": teardown_count,
+            "prove_first": proof_count,
+            "do_not_follow": avoid_count,
+            "low_priority": len(lanes["auto_low_priority"]),
+            "source_products": _ai_autopilot_int(summary.get("source_products") or len(items)),
+            "important_20_with_ads": _ai_autopilot_int(summary.get("important_20_with_ads")),
+        },
+        "lanes": lanes,
+        "operator_instruction": [
+            "独立站新品默认进入跟进池，系统自动选品和分流，不需要人工先筛选。",
+            "趋势越高越靠前；缺广告/社区/供应链证据不等于不能跟，只决定强跟、轻跟或补证跟。",
+            "不跟只留给合规/IP/履约/经济性不可逆硬风险。",
+            "可跟品只进入小预算测试准备，不自动花钱和不自动发布。",
+        ],
+    }
+
+
+def _ai_autopilot_quality_assessment(
+    monitor: dict | None = None,
+    latest: dict | None = None,
+    loop: dict | None = None,
+) -> dict:
+    try:
+        monitor = monitor if isinstance(monitor, dict) else (_read_dashboard_disk_cache(max_age_seconds=0) or _load_all())
+    except Exception:
+        monitor = {}
+    latest = latest if isinstance(latest, dict) else get_latest_profit_pipeline()
+    if not isinstance(latest, dict):
+        latest = {"ok": False, "error": "profit pipeline unavailable"}
+    if not isinstance(loop, dict):
+        try:
+            loop = _build_v2_closed_loop(latest, cycles=3, limit=50) if latest.get("ok") else {"ok": False, "items": [], "summary": {}}
+        except Exception as exc:
+            loop = {"ok": False, "items": [], "summary": {}, "warnings": [f"{exc.__class__.__name__}: {exc}"]}
+
+    refresh = _monitor_refresh_status_copy()
+    trends = _gtrends_status_copy()
+    daily = _v2_daily_status_copy(raw=True)
+    stats = latest.get("stats", {}) if isinstance(latest.get("stats"), dict) else {}
+    summary = loop.get("summary", {}) if isinstance(loop.get("summary"), dict) else {}
+    items = loop.get("items") if isinstance(loop.get("items"), list) else []
+    auto_lane_counts: Counter[str] = Counter()
+    for item in items:
+        if isinstance(item, dict):
+            lane, _, _, _ = _ai_autopilot_choose_follow_lane(item)
+            auto_lane_counts[lane] += 1
+
+    generated_at = monitor.get("generated_at") or ""
+    dashboard_age = _ai_autopilot_age_hours(generated_at)
+    stores = _ai_autopilot_int(monitor.get("total_stores"))
+    products = _ai_autopilot_int(monitor.get("total_products"))
+    active_1d = _ai_autopilot_int(monitor.get("active_1d"))
+    active_3d = _ai_autopilot_int(monitor.get("active_3d"))
+    price_coverage = max(0.0, min(_ai_autopilot_num(monitor.get("price_coverage_pct")), 100.0))
+    refresh_completed = _ai_autopilot_int(refresh.get("completed"))
+    refresh_total = _ai_autopilot_int(refresh.get("total"))
+    refresh_ok = _ai_autopilot_int(refresh.get("ok_count")) + _ai_autopilot_int(refresh.get("baseline_kept_count"))
+    refresh_bad = _ai_autopilot_int(refresh.get("failed_count")) + _ai_autopilot_int(refresh.get("no_data_count"))
+    refresh_success_ratio = _ai_autopilot_ratio(refresh_ok, refresh_completed or refresh_total or 1)
+    freshness_score = 40 if dashboard_age <= 1 else 32 if dashboard_age <= 6 else 23 if dashboard_age <= 24 else 12 if dashboard_age <= 72 else 4
+    active_score = min(25.0, _ai_autopilot_ratio(active_1d, max(stores, 1)) * 240)
+    coverage_score = min(20.0, price_coverage * 0.2)
+    refresh_score = 15.0 if refresh.get("running") else (max(7.0, refresh_success_ratio * 15.0) if (refresh_completed or refresh_total) else 9.0)
+    data_score = _ai_autopilot_score(freshness_score + active_score + coverage_score + refresh_score)
+
+    source_products = _ai_autopilot_int(stats.get("source_products") or len(latest.get("actions") or []))
+    returned_actions = _ai_autopilot_int(stats.get("returned_actions") or len(latest.get("actions") or []))
+    trend_checked = _ai_autopilot_int(stats.get("trend_checked_products"))
+    trend_verified = _ai_autopilot_int(stats.get("trend_verified_products"))
+    traffic_validated = _ai_autopilot_int(stats.get("traffic_validated_products"))
+    unverified = _ai_autopilot_int(stats.get("unverified_products"))
+    one_source = _ai_autopilot_int(stats.get("one_source_products"))
+    trend_ratio = _ai_autopilot_ratio(trend_verified or trend_checked, source_products or returned_actions or 1)
+    traffic_ratio = _ai_autopilot_ratio(traffic_validated, source_products or returned_actions or 1)
+    multi_source_ratio = 1.0 - _ai_autopilot_ratio(one_source + unverified, source_products or returned_actions or 1)
+    action_ratio = _ai_autopilot_ratio(returned_actions, source_products or returned_actions or 1)
+    evidence_score = _ai_autopilot_score(trend_ratio * 35 + traffic_ratio * 25 + max(0, multi_source_ratio) * 25 + action_ratio * 15)
+
+    if items:
+        follow_now = auto_lane_counts["auto_follow_now"]
+        teardown_first = auto_lane_counts["auto_teardown_first"]
+        verify_first = auto_lane_counts["auto_prove_first"]
+        avoid = auto_lane_counts["auto_do_not_follow"]
+        low_priority = auto_lane_counts["auto_low_priority"]
+    else:
+        follow_now = _ai_autopilot_int(summary.get("follow_now"))
+        teardown_first = _ai_autopilot_int(summary.get("teardown_first"))
+        verify_first = _ai_autopilot_int(summary.get("verify_first"))
+        avoid = _ai_autopilot_int(summary.get("avoid"))
+        low_priority = 0
+    important_with_ads = _ai_autopilot_int(summary.get("important_20_with_ads"))
+    top_ad_count = _ai_autopilot_int(summary.get("top_ad_count"))
+    classified = follow_now + teardown_first + verify_first + avoid + low_priority
+    required_total = 0
+    verified_total = 0
+    blocking_total = 0
+    strict_pass = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("strict_pass"):
+            strict_pass += 1
+        validation = item.get("validation_summary") if isinstance(item.get("validation_summary"), dict) else {}
+        if not validation:
+            required_validation = item.get("required_validation") if isinstance(item.get("required_validation"), dict) else {}
+            validation = required_validation.get("summary") if isinstance(required_validation.get("summary"), dict) else {}
+        required_total += _ai_autopilot_int(validation.get("required_count"))
+        verified_total += _ai_autopilot_int(validation.get("verified_count"))
+        blocking_total += _ai_autopilot_int(validation.get("blocking_count"))
+    item_count = len(items)
+    classified_ratio = _ai_autopilot_ratio(classified, item_count or returned_actions or 1)
+    required_ratio = _ai_autopilot_ratio(verified_total, required_total or 1) if required_total else _ai_autopilot_ratio(strict_pass, item_count or 1)
+    ad_ratio = _ai_autopilot_ratio(important_with_ads, max(_ai_autopilot_int(summary.get("important_20")), 1))
+    blocking_penalty_room = max(0.0, 1.0 - _ai_autopilot_ratio(blocking_total, max(item_count * 2, 1)))
+    trend_queue_ratio = _ai_autopilot_ratio(follow_now + teardown_first, item_count or returned_actions or 1)
+    judgement_score = _ai_autopilot_score(classified_ratio * 20 + trend_queue_ratio * 30 + required_ratio * 18 + ad_ratio * 12 + blocking_penalty_room * 12 + (8 if top_ad_count > 0 else 0))
+
+    overall = _ai_autopilot_score(data_score * 0.34 + evidence_score * 0.36 + judgement_score * 0.30)
+    next_actions: list[str] = []
+    if data_score < 76 or dashboard_age > 6:
+        next_actions.append("自动刷新竞品快照，优先补齐新旧产品、价格变化和非Shopify兜底抓取")
+    if evidence_score < 76:
+        next_actions.append("自动补 Google Trends / 广告 / Reddit-UGC / 市场证据，让新品自动升级强跟或轻跟")
+    if judgement_score < 76:
+        next_actions.append("自动重跑跟品工作台，按新品入池、趋势优先、硬风险拦截重新排序")
+    if not next_actions:
+        next_actions.append("维持巡航：继续监控变化，只在数据过期或证据不足时自动介入")
+
+    return {
+        "ok": True,
+        "generated_at": _ai_autopilot_iso(),
+        "precision_score": overall,
+        "precision_grade": _ai_autopilot_grade(overall),
+        "precision_label": _ai_autopilot_quality_label(overall),
+        "data_quality": {
+            "score": data_score,
+            "grade": _ai_autopilot_grade(data_score),
+            "label": _ai_autopilot_quality_label(data_score),
+            "dashboard_age_hours": dashboard_age,
+            "generated_at": generated_at or "未生成",
+            "stores": stores,
+            "products": products,
+            "active_1d": active_1d,
+            "active_3d": active_3d,
+            "price_coverage_pct": round(price_coverage, 1),
+            "refresh_state": str(refresh.get("state") or "idle"),
+            "refresh_running": bool(refresh.get("running")),
+            "refresh_success_ratio": round(refresh_success_ratio, 3),
+            "refresh_bad_domains": refresh_bad,
+        },
+        "evidence_quality": {
+            "score": evidence_score,
+            "grade": _ai_autopilot_grade(evidence_score),
+            "label": _ai_autopilot_quality_label(evidence_score),
+            "source_products": source_products,
+            "returned_actions": returned_actions,
+            "trend_checked_products": trend_checked,
+            "trend_verified_products": trend_verified,
+            "traffic_validated_products": traffic_validated,
+            "unverified_products": unverified,
+            "one_source_products": one_source,
+            "trend_ratio": round(trend_ratio, 3),
+            "traffic_ratio": round(traffic_ratio, 3),
+            "multi_source_ratio": round(max(0.0, multi_source_ratio), 3),
+            "gtrends_state": str(trends.get("state") or "idle"),
+            "gtrends_running": bool(trends.get("running")),
+            "gtrends_completed_keywords": _ai_autopilot_int(trends.get("completed_keywords")),
+        },
+        "judgement_quality": {
+            "score": judgement_score,
+            "grade": _ai_autopilot_grade(judgement_score),
+            "label": _ai_autopilot_quality_label(judgement_score),
+            "items": item_count,
+            "classified_products": classified,
+            "follow_now": follow_now,
+            "teardown_first": teardown_first,
+            "verify_first": verify_first,
+            "prove_first": verify_first,
+            "avoid": avoid,
+            "low_priority": low_priority,
+            "strict_pass_products": strict_pass,
+            "required_validation_total": required_total,
+            "required_validation_verified": verified_total,
+            "blocking_validation_total": blocking_total,
+            "important_20_with_ads": important_with_ads,
+            "top_ad_count": top_ad_count,
+        },
+        "runtime": {
+            "background_refresh": {
+                "running": bool(refresh.get("running")),
+                "state": str(refresh.get("state") or "idle"),
+                "progress_pct": _ai_autopilot_num(refresh.get("progress_pct")),
+            },
+            "gtrends": {
+                "running": bool(trends.get("running")),
+                "state": str(trends.get("state") or "idle"),
+                "progress_pct": _ai_autopilot_num(trends.get("progress_pct")),
+            },
+            "daily_monitor": {
+                "enabled": bool(daily.get("enabled")),
+                "active_run": bool(daily.get("active_run")),
+                "state": str(daily.get("state") or "disabled"),
+            },
+        },
+        "next_auto_actions": next_actions[:4],
+    }
+
+
+def _ai_autopilot_should_refresh(assessment: dict, status: dict) -> tuple[bool, str, int, str]:
+    data = assessment.get("data_quality", {}) if isinstance(assessment, dict) else {}
+    runtime = assessment.get("runtime", {}) if isinstance(assessment, dict) else {}
+    refresh_runtime = runtime.get("background_refresh", {}) if isinstance(runtime.get("background_refresh"), dict) else {}
+    if refresh_runtime.get("running"):
+        return False, "smart", 0, "竞品快照刷新已在运行，等待完成后再判断"
+    full_hours = max(1, _ai_autopilot_int(status.get("full_refresh_hours"), 24))
+    age_hours = _ai_autopilot_num(data.get("dashboard_age_hours"), 9999)
+    data_score = _ai_autopilot_int(data.get("score"))
+    if age_hours >= full_hours:
+        return True, "all", 0, f"数据已超过 {full_hours} 小时，自动全站尽力扫描"
+    if data_score < 70 or _ai_autopilot_int(data.get("active_1d")) <= 0:
+        limit = max(50, min(_ai_autopilot_int(status.get("smart_refresh_limit"), 180), 10000))
+        return True, "smart", limit, "数据精度不足，自动智能快刷高价值竞品"
+    return False, "smart", 0, "竞品快照仍在可用阈值内"
+
+
+def _ai_autopilot_should_run_workbench(assessment: dict, latest: dict, status: dict) -> tuple[bool, str]:
+    runtime = assessment.get("runtime", {}) if isinstance(assessment, dict) else {}
+    if (runtime.get("background_refresh") or {}).get("running"):
+        return False, "等待竞品刷新完成后再重算28跟品"
+    if not isinstance(latest, dict) or not latest.get("ok"):
+        return True, "还没有28跟品结果，自动生成第一版判断"
+    generated_at = latest.get("generated_at") or latest.get("source_generated_at")
+    age_hours = _ai_autopilot_age_hours(generated_at)
+    evidence_score = _ai_autopilot_int((assessment.get("evidence_quality") or {}).get("score"))
+    judgement_score = _ai_autopilot_int((assessment.get("judgement_quality") or {}).get("score"))
+    returned = _ai_autopilot_int((assessment.get("evidence_quality") or {}).get("returned_actions"))
+    if age_hours >= 0.25:
+        return True, f"28跟品结果已 {age_hours:.1f} 小时未重算"
+    if returned <= 0:
+        return True, "没有可行动候选，自动重新跑工作台"
+    if evidence_score < 76 or judgement_score < 76:
+        return True, "证据/判断可信度偏低，自动重算分流"
+    return False, "28跟品判断仍在可用阈值内"
+
+
+def _ai_autopilot_should_run_trends(assessment: dict, status: dict) -> tuple[bool, str]:
+    evidence = assessment.get("evidence_quality", {}) if isinstance(assessment, dict) else {}
+    runtime = assessment.get("runtime", {}) if isinstance(assessment, dict) else {}
+    gtrends_runtime = runtime.get("gtrends", {}) if isinstance(runtime.get("gtrends"), dict) else {}
+    if gtrends_runtime.get("running"):
+        return False, "Google Trends 已在后台验证"
+    evidence_score = _ai_autopilot_int(evidence.get("score"))
+    unverified = _ai_autopilot_int(evidence.get("unverified_products"))
+    source_products = max(1, _ai_autopilot_int(evidence.get("source_products") or evidence.get("returned_actions") or 1))
+    current_status = _gtrends_status_copy()
+    gtrends_age = _ai_autopilot_age_hours(current_status.get("finished_at"))
+    if evidence_score < 76 and (unverified / source_products >= 0.2 or _ai_autopilot_num(evidence.get("traffic_ratio")) < 0.25):
+        if gtrends_age >= 12 or _ai_autopilot_int(current_status.get("completed_keywords")) <= 0:
+            return True, "证据不足，自动补 Google Trends 关键词缓存"
+    return False, "趋势证据仍在可用阈值内"
+
+
+def _ai_autopilot_start_monitor_refresh(mode: str, limit: int, workers: int = 8) -> dict:
+    global _MONITOR_REFRESH_THREAD
+    with _MONITOR_REFRESH_LOCK:
+        if _MONITOR_REFRESH_STATUS.get("running"):
+            return {**_monitor_refresh_status_copy(), "started": False, "already_running": True}
+    domains, refresh_plan = _prioritized_monitor_domains(mode=mode, limit=limit)
+    if not domains:
+        return {"ok": False, "started": False, "message": "没有可刷新的监控域名", "mode": mode, "limit": limit}
+    workers = max(1, min(int(workers), 6 if refresh_plan.get("mode") == "all" else 16))
+    _MONITOR_REFRESH_THREAD = threading.Thread(
+        target=_run_monitor_background_refresh,
+        args=(domains, workers, refresh_plan),
+        daemon=True,
+    )
+    _MONITOR_REFRESH_THREAD.start()
+    time.sleep(0.05)
+    return {**_monitor_refresh_status_copy(), "started": True, "already_running": False}
+
+
+def _ai_autopilot_start_gtrends(source: str, limit: int, geo: str) -> dict:
+    global _GTRENDS_BG_THREAD
+    with _GTRENDS_BG_LOCK:
+        if _GTRENDS_BG_STATUS.get("running"):
+            return {**_gtrends_status_copy(), "started": False, "already_running": True}
+    keywords, meta = _gtrends_collect_keywords(source, max(1, min(limit, 300)))
+    if not keywords:
+        return {"ok": False, "started": False, "message": "没有可验证的关键词", "selection_meta": meta}
+    normalized_source = (source or "v2").lower().replace("-", "_")
+    _GTRENDS_BG_THREAD = threading.Thread(
+        target=_run_gtrends_background_job,
+        args=(keywords, normalized_source, (geo or "US").upper(), "today 12-m", 30, 1),
+        daemon=True,
+    )
+    _GTRENDS_BG_THREAD.start()
+    time.sleep(0.05)
+    return {**_gtrends_status_copy(), "started": True, "already_running": False, "selection_meta": meta}
+
+
+def _run_ai_autopilot_once(trigger: str = "scheduled") -> dict:
+    with _AI_AUTOPILOT_LOCK:
+        if _AI_AUTOPILOT_STATUS.get("active_run"):
+            return {"ok": True, "started": False, "already_running": True}
+        _AI_AUTOPILOT_STATUS.update(
+            ok=True,
+            active_run=True,
+            state="running",
+            message=f"AI自动驾驶正在巡航判断 ({trigger})",
+            last_error="",
+            run_requested=False,
+        )
+        started_status = dict(_AI_AUTOPILOT_STATUS)
+    _ai_autopilot_persist_status(started_status)
+
+    actions: list[dict] = []
+    try:
+        status = _ai_autopilot_status_copy(raw=True)
+        latest = get_latest_profit_pipeline()
+        assessment = _ai_autopilot_quality_assessment(latest=latest)
+
+        should_refresh, refresh_mode, refresh_limit, refresh_reason = _ai_autopilot_should_refresh(assessment, status)
+        if should_refresh:
+            refresh_result = _ai_autopilot_start_monitor_refresh(refresh_mode, refresh_limit, workers=12 if refresh_mode == "all" else 8)
+            actions.append({
+                "type": "refresh",
+                "started": bool(refresh_result.get("started")),
+                "mode": refresh_mode,
+                "limit": refresh_limit,
+                "reason": refresh_reason,
+                "state": refresh_result.get("state", "queued"),
+            })
+        else:
+            actions.append({"type": "refresh", "started": False, "reason": refresh_reason})
+
+        latest = get_latest_profit_pipeline()
+        assessment = _ai_autopilot_quality_assessment(latest=latest)
+        should_workbench, workbench_reason = _ai_autopilot_should_run_workbench(assessment, latest, status)
+        if should_workbench:
+            try:
+                workbench = _run_v2_operator_workbench(
+                    max(10, min(_ai_autopilot_int(status.get("workbench_limit"), 50), 100)),
+                    max(0, min(_ai_autopilot_int(status.get("trend_top_n"), 50), 100)),
+                    5000,
+                    300,
+                    str(status.get("trend_geo") or "US"),
+                )
+                wb_stats = workbench.get("stats", {}) if isinstance(workbench, dict) else {}
+                actions.append({
+                    "type": "workbench",
+                    "started": True,
+                    "reason": workbench_reason,
+                    "returned_actions": _ai_autopilot_int(wb_stats.get("returned_actions")),
+                    "avoid_products": _ai_autopilot_int(wb_stats.get("avoid_products")),
+                    "generated_at": workbench.get("generated_at", "") if isinstance(workbench, dict) else "",
+                })
+            except AutoIntelRunLocked as exc:
+                actions.append({"type": "workbench", "started": False, "reason": "28跟品已有任务运行，下一轮重试", "error": str(exc)})
+            latest = get_latest_profit_pipeline()
+            assessment = _ai_autopilot_quality_assessment(latest=latest)
+        else:
+            actions.append({"type": "workbench", "started": False, "reason": workbench_reason})
+
+        should_trends, trends_reason = _ai_autopilot_should_run_trends(assessment, status)
+        if should_trends:
+            trends_result = _ai_autopilot_start_gtrends("v2", _ai_autopilot_int(status.get("trend_top_n"), 50), str(status.get("trend_geo") or "US"))
+            actions.append({
+                "type": "gtrends",
+                "started": bool(trends_result.get("started")),
+                "reason": trends_reason,
+                "total_keywords": _ai_autopilot_int(trends_result.get("total_keywords")),
+                "state": trends_result.get("state", "queued"),
+            })
+        else:
+            actions.append({"type": "gtrends", "started": False, "reason": trends_reason})
+
+        final_latest = get_latest_profit_pipeline()
+        final_assessment = _ai_autopilot_quality_assessment(latest=final_latest)
+        final_queue = _ai_autopilot_build_follow_queue(
+            latest=final_latest,
+            limit=max(10, min(_ai_autopilot_int(status.get("workbench_limit"), 50), 100)),
+        )
+        started_actions = [a for a in actions if a.get("started")]
+        queue_counts = final_queue.get("counts", {}) if isinstance(final_queue, dict) else {}
+        msg = (
+            f"AI自动驾驶已自动选品：可跟{queue_counts.get('follow_now', 0)}、先拆{queue_counts.get('teardown_first', 0)}、补证{queue_counts.get('prove_first', 0)}、不碰{queue_counts.get('do_not_follow', 0)}"
+        )
+        if started_actions:
+            msg += "；本轮自动处理 " + "、".join(a["type"] for a in started_actions)
+        _set_ai_autopilot_status(
+            ok=True,
+            active_run=False,
+            enabled=True,
+            running=True,
+            state="enabled",
+            message=msg,
+            last_run_at=_ai_autopilot_iso(),
+            runs_completed=_ai_autopilot_int(status.get("runs_completed")) + 1,
+            last_actions=actions[-8:],
+            last_assessment=final_assessment,
+            data_quality=final_assessment["data_quality"],
+            evidence_quality=final_assessment["evidence_quality"],
+            judgement_quality=final_assessment["judgement_quality"],
+            auto_follow_queue=final_queue.get("lanes", {}) if isinstance(final_queue, dict) else {},
+            auto_selection_summary={k: v for k, v in final_queue.items() if k != "lanes"} if isinstance(final_queue, dict) else {},
+        )
+        return _ai_autopilot_status_copy()
+    except Exception as exc:
+        _set_ai_autopilot_status(
+            ok=False,
+            active_run=False,
+            state="enabled",
+            message="AI自动驾驶本轮失败，下一轮自动重试",
+            last_error=f"{exc.__class__.__name__}: {exc}",
+            last_actions=actions[-8:] or [{"type": "error", "started": False, "reason": str(exc)[:180]}],
+        )
+        return _ai_autopilot_status_copy()
+
+
+def _ai_autopilot_loop() -> None:
+    _set_ai_autopilot_status(running=True, state="enabled", message="AI自动驾驶已开启")
+    while not _AI_AUTOPILOT_STOP.wait(8):
+        status = _ai_autopilot_status_copy(raw=True)
+        if not status.get("enabled"):
+            break
+        if status.get("active_run"):
+            continue
+        next_at = _ai_autopilot_parse_time(status.get("next_check_at")) or datetime.now()
+        if status.get("run_requested") or datetime.now() >= next_at:
+            _run_ai_autopilot_once("manual" if status.get("run_requested") else "scheduled")
+    current = _ai_autopilot_status_copy(raw=True)
+    _set_ai_autopilot_status(
+        running=False,
+        active_run=False,
+        state="disabled" if not current.get("enabled") else "enabled",
+        message="AI自动驾驶已关闭" if not current.get("enabled") else "AI自动驾驶线程已停止，等待恢复",
+    )
+
+
+def _ensure_ai_autopilot_thread() -> bool:
+    global _AI_AUTOPILOT_THREAD
+    with _AI_AUTOPILOT_LOCK:
+        thread_alive = _AI_AUTOPILOT_THREAD is not None and _AI_AUTOPILOT_THREAD.is_alive()
+    if thread_alive:
+        return False
+    _AI_AUTOPILOT_STOP.clear()
+    _AI_AUTOPILOT_THREAD = threading.Thread(target=_ai_autopilot_loop, daemon=True)
+    _AI_AUTOPILOT_THREAD.start()
+    return True
+
+
+def _request_ai_autopilot_run(trigger: str = "manual") -> bool:
+    with _AI_AUTOPILOT_LOCK:
+        already_active = bool(_AI_AUTOPILOT_STATUS.get("active_run"))
+        _AI_AUTOPILOT_STATUS["run_requested"] = True
+        queued_status = dict(_AI_AUTOPILOT_STATUS)
+    _ai_autopilot_persist_status(queued_status)
+    if already_active:
+        return False
+    threading.Thread(target=_run_ai_autopilot_once, args=(trigger,), daemon=True).start()
+    return True
+
+
+def _v2_daily_due(status: dict) -> bool:
+    now = datetime.now()
+    hour = max(0, min(int(status.get("schedule_hour") or 9), 23))
+    scheduled_at = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    return status.get("last_run_date") != now.strftime("%Y-%m-%d") and now >= scheduled_at
+
+
+def _run_v2_daily_once(trigger: str = "scheduled") -> None:
+    global _v2_cache, _v2_cache_ts
+    status = _v2_daily_status_copy(raw=True)
+    _set_v2_daily_status(
+        active_run=True,
+        state="running_scan",
+        message=f"每日自动抓取运行中 ({trigger})",
+        last_error="",
+    )
+    try:
+        # Force the daily job to hit Shopify instead of reusing a short-lived manual cache.
+        _v2_cache = None
+        _v2_cache_ts = 0
+        scan = api_v2_today_scan(limit=int(status.get("scan_limit") or 0))
+        scan_summary = {
+            "scan_date": scan.get("scan_date"),
+            "scan_time": scan.get("scan_time"),
+            "scanned_domains": scan.get("scanned_domains", 0),
+            "failed_domains": scan.get("failed_domains", 0),
+            "total_new_today": scan.get("total_new_today", 0),
+            "domains_with_new": scan.get("domains_with_new", 0),
+        }
+        _set_v2_daily_status(
+            state="running_workbench",
+            message="新品抓取完成，正在刷新28跟品判断",
+            scan_summary=scan_summary,
+        )
+        workbench = _run_v2_operator_workbench(
+            int(status.get("workbench_limit") or 50),
+            int(status.get("trend_top_n") or 50),
+            int(status.get("fb_limit") or 5000),
+            int(status.get("fb_exact_verify_limit") or 300),
+            str(status.get("trend_geo") or "US"),
+        )
+        wb_stats = workbench.get("stats", {}) if isinstance(workbench, dict) else {}
+        workbench_summary = {
+            "generated_at": workbench.get("generated_at") if isinstance(workbench, dict) else "",
+            "source_products": wb_stats.get("source_products", 0),
+            "returned_actions": wb_stats.get("returned_actions", 0),
+            "launch_now_products": wb_stats.get("launch_now_products", 0),
+            "observe_products": wb_stats.get("observe_products", 0),
+            "avoid_products": wb_stats.get("avoid_products", 0),
+            "traffic_validated_products": wb_stats.get("traffic_validated_products", 0),
+        }
+        now = datetime.now()
+        _set_v2_daily_status(
+            ok=True,
+            active_run=False,
+            state="enabled",
+            message="每日自动抓取完成，等待下一次",
+            last_run_at=_v2_daily_iso(now),
+            last_run_date=now.strftime("%Y-%m-%d"),
+            runs_completed=int(status.get("runs_completed") or 0) + 1,
+            run_requested=False,
+            workbench_summary=workbench_summary,
+        )
+    except AutoIntelRunLocked as exc:
+        _set_v2_daily_status(
+            ok=False,
+            active_run=False,
+            state="enabled",
+            message="28跟品已有任务在运行，稍后会重试",
+            last_error=str(exc),
+            run_requested=False,
+        )
+    except Exception as exc:
+        _set_v2_daily_status(
+            ok=False,
+            active_run=False,
+            state="failed",
+            message="每日自动抓取失败",
+            last_error=f"{exc.__class__.__name__}: {exc}",
+            run_requested=False,
+        )
+
+
+def _v2_daily_monitor_loop() -> None:
+    _set_v2_daily_status(running=True, state="enabled", message="每日自动抓取已开启")
+    while not _V2_DAILY_MONITOR_STOP.wait(15):
+        status = _v2_daily_status_copy(raw=True)
+        if not status.get("enabled"):
+            break
+        if status.get("active_run"):
+            continue
+        if status.get("run_requested") or _v2_daily_due(status):
+            _run_v2_daily_once("manual" if status.get("run_requested") else "scheduled")
+    _set_v2_daily_status(running=False, active_run=False, state="disabled", message="每日自动抓取已关闭")
+
+
+def _ensure_v2_daily_monitor_thread() -> bool:
+    global _V2_DAILY_MONITOR_THREAD
+    with _V2_DAILY_MONITOR_LOCK:
+        thread_alive = _V2_DAILY_MONITOR_THREAD is not None and _V2_DAILY_MONITOR_THREAD.is_alive()
+    if thread_alive:
+        return False
+    _V2_DAILY_MONITOR_STOP.clear()
+    _V2_DAILY_MONITOR_THREAD = threading.Thread(target=_v2_daily_monitor_loop, daemon=True)
+    _V2_DAILY_MONITOR_THREAD.start()
+    return True
+
+
+_v2_daily_load_status_from_disk()
+_set_v2_daily_status(
+    workbench_limit=max(50, int(_V2_DAILY_MONITOR_STATUS.get("workbench_limit") or 50)),
+    trend_top_n=max(50, int(_V2_DAILY_MONITOR_STATUS.get("trend_top_n") or 50)),
+)
+_ai_autopilot_load_status_from_disk()
+_set_ai_autopilot_status(
+    interval_seconds=60,
+    smart_refresh_limit=max(50, int(_AI_AUTOPILOT_STATUS.get("smart_refresh_limit") or 180)),
+    full_refresh_hours=max(1, int(_AI_AUTOPILOT_STATUS.get("full_refresh_hours") or 24)),
+    workbench_limit=max(50, int(_AI_AUTOPILOT_STATUS.get("workbench_limit") or 50)),
+    trend_top_n=max(50, int(_AI_AUTOPILOT_STATUS.get("trend_top_n") or 50)),
+)
+
+
+@app.on_event("startup")
+def _startup_background_automation():
+    if _v2_daily_status_copy(raw=True).get("enabled"):
+        _ensure_v2_daily_monitor_thread()
+    if _ai_autopilot_status_copy(raw=True).get("enabled"):
+        _ensure_ai_autopilot_thread()
+
+
+def _gtrends_batches(keywords: list[str], batch_size: int = 5) -> list[list[str]]:
+    return [keywords[i:i + batch_size] for i in range(0, len(keywords), batch_size)]
+
+
+def _gtrends_normalize_keyword(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    text = re.sub(r"[^a-z0-9 &+-]+", "", text).strip(" -+&")
+    return text[:80]
+
+
+def _gtrends_keywords_from_product(product: dict) -> list[str]:
+    pv = product.get("platform_validation") if isinstance(product.get("platform_validation"), dict) else {}
+    candidates = list(pv.get("keywords") or [])
+    if not candidates:
+        try:
+            candidates = build_trend_keywords(product)
+        except Exception:
+            candidates = []
+    if not candidates:
+        title = product.get("title") or product.get("product_title") or ""
+        words = [w for w in re.findall(r"[a-z0-9]+", str(title).lower()) if len(w) >= 3]
+        if len(words) >= 3:
+            candidates.append(" ".join(words[:3]))
+        if len(words) >= 2:
+            candidates.append(" ".join(words[:2]))
+    return [_gtrends_normalize_keyword(k) for k in candidates if _gtrends_normalize_keyword(k)]
+
+
+def _gtrends_collect_keywords(source: str, limit: int) -> tuple[list[str], dict]:
+    source = (source or "v2").lower().replace("-", "_")
+    products: list[dict] = []
+    meta = {"source": source, "product_count": 0}
+    if source in {"seven_day", "seven", "7d"}:
+        data = api_new_products_7d_judgement(
+            limit=max(5, min(limit, 300)),
+            trend_top_n=0,
+            fb_limit=1000,
+            fb_exact_verify_limit=300,
+            trend_geo="US",
+            force=False,
+        )
+        products = data.get("products", []) if isinstance(data, dict) else []
+        meta.update({"scan_date": (data or {}).get("as_of_date", ""), "method_version": (data or {}).get("method_version", "")})
+    else:
+        data = api_v2_today_fast(product_limit=max(50, min(limit * 4, 2000)), score_limit=max(50, min(limit * 4, 2000)))
+        products = data.get("scored_products") or data.get("products") or []
+        meta.update({"scan_date": (data or {}).get("scan_date", ""), "method": (data or {}).get("method", "")})
+
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        for keyword in _gtrends_keywords_from_product(product):
+            if not keyword or keyword in seen:
+                continue
+            seen.add(keyword)
+            keywords.append(keyword)
+            if len(keywords) >= limit:
+                meta["product_count"] = len(products)
+                return keywords, meta
+    meta["product_count"] = len(products)
+    return keywords, meta
+
+
+def _gtrends_read_records(keywords: list[str], geo: str, timeframe: str) -> list[dict]:
+    db_path = GTRENDS_BULK_DIR / "cache.db"
+    if not db_path.exists():
+        return []
+    records = []
+    try:
+        conn = sqlite3.connect(db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        try:
+            for keyword in keywords:
+                row = conn.execute(
+                    """
+                    SELECT keyword, geo, timeframe, avg_score, median, last_30d, peak,
+                           peak_date, trend_dir, confidence, volatility,
+                           seasonal_peak_month, yoy_change, data_points, source, ts
+                    FROM trends_v2
+                    WHERE keyword=? AND geo=? AND timeframe=?
+                    """,
+                    (keyword, geo, timeframe),
+                ).fetchone()
+                if not row:
+                    records.append({"keyword": keyword, "status": "missing"})
+                    continue
+                item = dict(row)
+                item["status"] = "ok"
+                item["cached_at"] = datetime.fromtimestamp(float(item.get("ts") or 0)).isoformat(timespec="seconds") if item.get("ts") else ""
+                try:
+                    related_rows = conn.execute(
+                        """
+                        SELECT query_type, related_kw, value
+                        FROM related_queries
+                        WHERE keyword=? AND geo=? AND timeframe=?
+                        ORDER BY query_type, value DESC
+                        LIMIT 20
+                        """,
+                        (keyword, geo, timeframe),
+                    ).fetchall()
+                except sqlite3.Error:
+                    related_rows = []
+                try:
+                    region_rows = conn.execute(
+                        """
+                        SELECT region, value
+                        FROM region_interest
+                        WHERE keyword=? AND geo=? AND timeframe=?
+                        ORDER BY value DESC
+                        LIMIT 20
+                        """,
+                        (keyword, geo, timeframe),
+                    ).fetchall()
+                except sqlite3.Error:
+                    region_rows = []
+                item["related_queries"] = [dict(r) for r in related_rows]
+                item["region_interest"] = [dict(r) for r in region_rows]
+                item["related_queries_count"] = len(related_rows)
+                item["region_interest_count"] = len(region_rows)
+                records.append(item)
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        records.append({"status": "read_failed", "error": str(exc)})
+    return records
+
+
+def _run_gtrends_background_job(keywords: list[str], source: str, geo: str, timeframe: str, interval_seconds: int, workers: int):
+    started = time.time()
+    batch_size = 5
+    batches = _gtrends_batches(keywords, batch_size)
+    _set_gtrends_status(
+        ok=True,
+        running=True,
+        state="running",
+        message="Google Trends 后台验证运行中",
+        source=source,
+        geo=geo,
+        timeframe=timeframe,
+        batch_size=batch_size,
+        interval_seconds=interval_seconds,
+        total_keywords=len(keywords),
+        completed_keywords=0,
+        total_batches=len(batches),
+        completed_batches=0,
+        started_at=started,
+        finished_at=None,
+        current_batch=[],
+        keywords=keywords,
+        results=[],
+        warnings=[],
+    )
+    warnings: list[str] = []
+    completed_keywords = 0
+    scraper = GTRENDS_BULK_DIR / "bulk_scraper.py"
+    if not scraper.exists():
+        _set_gtrends_status(ok=False, running=False, state="failed", message=f"找不到 bulk_scraper.py: {scraper}", finished_at=time.time())
+        return
+
+    for index, batch in enumerate(batches, start=1):
+        _set_gtrends_status(
+            message=f"正在查询第 {index}/{len(batches)} 批，每批 5 个词",
+            current_batch=batch,
+        )
+        input_path = GTRENDS_BULK_DIR / f"bg_8001_{os.getpid()}_{int(time.time())}_{index}.txt"
+        try:
+            input_path.write_text("\n".join(batch) + "\n", encoding="utf-8")
+            cmd = [
+                sys.executable or "python3",
+                str(scraper),
+                "--input",
+                str(input_path),
+                "--geo",
+                geo,
+                "--timeframe",
+                timeframe,
+                "--workers",
+                str(max(1, min(int(workers), 2))),
+                "--ttl",
+                "7",
+                "--related",
+                "--regions",
+            ]
+            proxies = GTRENDS_BULK_DIR / "proxies.txt"
+            if proxies.exists() and proxies.read_text(encoding="utf-8", errors="ignore").strip():
+                cmd.extend(["--proxies", str(proxies)])
+            result = subprocess.run(
+                cmd,
+                cwd=str(GTRENDS_BULK_DIR),
+                text=True,
+                capture_output=True,
+                timeout=900,
+                check=False,
+            )
+            if result.returncode != 0:
+                warnings.append(f"batch_{index}_failed:{result.returncode}:{(result.stderr or result.stdout)[-240:]}")
+        except subprocess.TimeoutExpired:
+            warnings.append(f"batch_{index}_timeout")
+        except Exception as exc:
+            warnings.append(f"batch_{index}_error:{exc.__class__.__name__}:{exc}")
+        finally:
+            try:
+                input_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        completed_keywords += len(batch)
+        records = _gtrends_read_records(keywords, geo, timeframe)
+        _set_gtrends_status(
+            completed_keywords=completed_keywords,
+            completed_batches=index,
+            results=records,
+            warnings=warnings,
+        )
+        if index < len(batches):
+            _set_gtrends_status(message=f"第 {index} 批完成，间隔 {interval_seconds}s 后继续")
+            time.sleep(max(1, int(interval_seconds)))
+
+    records = _gtrends_read_records(keywords, geo, timeframe)
+    ok_count = sum(1 for r in records if r.get("status") == "ok")
+    _set_gtrends_status(
+        ok=True,
+        running=False,
+        state="completed",
+        message=f"Google Trends 验证完成：{ok_count}/{len(keywords)} 个词有完整缓存",
+        finished_at=time.time(),
+        current_batch=[],
+        results=records,
+        warnings=warnings,
+    )
+
+
+def _set_monitor_refresh_status(**updates):
+    with _MONITOR_REFRESH_LOCK:
+        _MONITOR_REFRESH_STATUS.update(updates)
+
+
+def _record_monitor_refresh_result(result: dict):
+    with _MONITOR_REFRESH_LOCK:
+        _MONITOR_REFRESH_STATUS["completed"] += 1
+        _MONITOR_REFRESH_STATUS["last_domain"] = result.get("domain", "")
+        status = result.get("status", "error")
+        if status == "ok":
+            _MONITOR_REFRESH_STATUS["ok_count"] += 1
+            _MONITOR_REFRESH_STATUS["new_products"] += int(result.get("new_products", 0) or 0)
+            _MONITOR_REFRESH_STATUS["updated_products"] += int(result.get("updated_products", 0) or 0)
+            _MONITOR_REFRESH_STATUS["removed_products"] += int(result.get("removed_products", 0) or 0)
+            _MONITOR_REFRESH_STATUS["price_changes"] += int(result.get("price_changes", 0) or 0)
+            if result.get("baseline_kept"):
+                _MONITOR_REFRESH_STATUS["baseline_kept_count"] = int(_MONITOR_REFRESH_STATUS.get("baseline_kept_count", 0) or 0) + 1
+        elif status == "no_data":
+            _MONITOR_REFRESH_STATUS["no_data_count"] += 1
+        else:
+            _MONITOR_REFRESH_STATUS["failed_count"] += 1
+            # v6.0: 错误分类统计
+            err_type = result.get("error_type", "unknown")
+            breakdown = _MONITOR_REFRESH_STATUS.setdefault("error_breakdown", {})
+            breakdown[err_type] = breakdown.get(err_type, 0) + 1
+        # v6.0: 响应时间统计
+        resp_ms = result.get("response_ms", 0)
+        if resp_ms > 0:
+            _MONITOR_REFRESH_STATUS.setdefault("total_response_ms", 0)
+            _MONITOR_REFRESH_STATUS["total_response_ms"] += resp_ms
+        recent = list(_MONITOR_REFRESH_STATUS.get("recent_results", []))
+        recent.append(result)
+        _MONITOR_REFRESH_STATUS["recent_results"] = recent[-30:]
+    _store_registry_mark_refresh_result(result)
+
+
+def _refresh_monitor_domain(domain: str) -> dict:
+    domain = su.normalize_domain(domain)
+    t0 = time.time()
+    try:
+        session = su.get_session()
+        products = su.fetch_all_products(domain, session, best_effort=True)
+        response_ms = round((time.time() - t0) * 1000)
+
+        if not products:
+            snapshot = su.load_snapshot(domain)
+            old_products = snapshot.get("products", {}) if isinstance(snapshot, dict) else {}
+            old_count = int(snapshot.get("product_count") or len(old_products) or 0) if isinstance(snapshot, dict) else 0
+            if old_count > 0:
+                return {
+                    "domain": domain,
+                    "status": "ok",
+                    "product_count": old_count,
+                    "new_products": 0,
+                    "updated_products": 0,
+                    "removed_products": 0,
+                    "price_changes": 0,
+                    "response_ms": response_ms,
+                    "baseline_kept": True,
+                    "reason": "当前抓取无数据，保留历史快照作为竞品基线",
+                }
+            return {"domain": domain, "status": "no_data", "product_count": 0, "response_ms": response_ms}
+
+        changes = su.detect_changes(domain, products)
+        parsed = [su.parse_product(p) for p in products]
+        su.save_snapshot(domain, parsed)
+
+        # 记录成功
+        su.record_domain_result(domain, True, response_ms)
+
+        updated = changes.get("updated_products", []) or []
+        price_changes = [
+            item for item in updated
+            if item.get("old_price") != item.get("new_price")
+        ]
+        return {
+            "domain": domain,
+            "status": "ok",
+            "product_count": len(products),
+            "new_products": len(changes.get("new_products", []) or []),
+            "updated_products": len(updated),
+            "removed_products": int(changes.get("removed_count", 0) or 0),
+            "price_changes": len(price_changes),
+            "response_ms": response_ms,
+            "best_effort": any(bool(p.get("_best_effort")) for p in products),
+        }
+    except Exception as exc:
+        response_ms = round((time.time() - t0) * 1000)
+        error_type = su._classify_error(exc) if hasattr(su, '_classify_error') else "unknown"
+        su.record_domain_result(domain, False, response_ms, error_type)
+        return {"domain": domain, "status": "error", "error": str(exc)[:180], "error_type": error_type, "response_ms": response_ms}
+
+
+def _run_monitor_background_refresh(domains: list[str], workers: int, refresh_plan: dict | None = None):
+    global _cache, _cache_ts, _v2_cache, _v2_cache_ts
+
+    start_ts = time.time()
+    _set_monitor_refresh_status(
+        ok=True,
+        running=True,
+        state="running",
+        message=(refresh_plan or {}).get("strategy", "后台刷新运行中"),
+        started_at=start_ts,
+        finished_at=None,
+        elapsed_seconds=0,
+        total=len(domains),
+        completed=0,
+        ok_count=0,
+        failed_count=0,
+        no_data_count=0,
+        new_products=0,
+        updated_products=0,
+        removed_products=0,
+        price_changes=0,
+        baseline_kept_count=0,
+        error_breakdown={},
+        total_response_ms=0,
+        last_domain="",
+        recent_results=[],
+        report_path="",
+        workers=workers,
+        refresh_plan=refresh_plan or {},
+    )
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(_refresh_monitor_domain, domain): domain for domain in domains}
+            for future in concurrent.futures.as_completed(future_map):
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {"domain": future_map[future], "status": "error", "error": str(exc)[:180]}
+                _record_monitor_refresh_result(result)
+
+        # v6.0: 刷新完成后清理
+        su.flush_blacklist_on_complete()
+        su.cleanup_stale_blacklist(max_age_days=90)
+
+        _cache = None
+        _cache_ts = 0
+        _v2_cache = None
+        _v2_cache_ts = 0
+        fresh = _load_all(force=True)
+
+        finished_ts = time.time()
+        report = {
+            **_monitor_refresh_status_copy(),
+            "finished_at": finished_ts,
+            "summary_after_refresh": {
+                "total_stores": fresh.get("total_stores", 0),
+                "total_products": fresh.get("total_products", 0),
+                "active_1d": fresh.get("active_1d", 0),
+                "active_3d": fresh.get("active_3d", 0),
+            },
+        }
+        report_dir = MONITOR_DIR
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_path = report_dir / f"background_refresh_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        latest_path = report_dir / "background_refresh_latest.json"
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        latest_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        _set_monitor_refresh_status(
+            running=False,
+            state="completed",
+            message="后台刷新完成，首页缓存已更新",
+            finished_at=finished_ts,
+            report_path=str(report_path),
+        )
+    except Exception as exc:
+        _set_monitor_refresh_status(
+            ok=False,
+            running=False,
+            state="failed",
+            message=f"后台刷新失败: {str(exc)[:160]}",
+            finished_at=time.time(),
+        )
+
+def _load_all(force=False):
+    global _cache, _cache_ts
+    now = time.time()
+    if not force and _cache is not None and (now - _cache_ts) < _CACHE_TTL:
+        return _cache
+    if not force:
+        disk_cache = _read_dashboard_disk_cache()
+        if disk_cache:
+            _cache = disk_cache
+            try:
+                _cache_ts = _DASHBOARD_CACHE_PATH.stat().st_mtime
+            except OSError:
+                _cache_ts = now
+            return _cache
+
+    stores = []
+    all_prices = []
+    total_products = 0
+    all_titles = []
+    word_freq = Counter()
+    domain_seen = set()
+    active_7d = 0; active_3d = 0; active_1d = 0
+    today = datetime.now().strftime("%Y-%m-%d")
+    d7 = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    d3 = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+
+    for fp in sorted(glob.glob(str(MONITOR_DIR / "*_snapshot.json"))):
+        try:
+            data = json.loads(Path(fp).read_text(encoding="utf-8"))
+            domain = data.get("domain", Path(fp).stem.replace("_snapshot", ""))
+            if domain in domain_seen: continue
+            domain_seen.add(domain)
+
+            prods = data.get("products", {})
+            if isinstance(prods, dict):
+                product_items = list(prods.values())
+            elif isinstance(prods, list):
+                product_items = prods
+            else:
+                product_items = []
+            try:
+                pc = int(data.get("product_count", len(product_items)) or 0)
+            except (TypeError, ValueError):
+                pc = len(product_items)
+            pc = max(pc, len(product_items))
+            total_products += pc
+            lc = data.get("last_check", "")
+            lc_date = lc[:10] if lc else ""
+
+            prices = []
+            for p in product_items:
+                if not isinstance(p, dict):
+                    continue
+                pr = _valid_price(p.get("price"))
+                if pr is not None:
+                    prices.append(pr); all_prices.append(pr)
+                t = p.get("title", "")
+                if t: all_titles.append(t)
+
+            if lc_date:
+                if lc_date == today: active_1d += 1
+                if lc_date >= d3: active_3d += 1
+                if lc_date >= d7: active_7d += 1
+
+            sp = sorted(prices); n = len(sp)
+            stores.append({
+                "domain": domain, "product_count": pc,
+                "priced_product_count": n,
+                "price_coverage_pct": round(n / pc * 100, 1) if pc else 0,
+                "last_check": lc[:16] if lc else "",
+                "p_min": round(sp[0], 2) if n else 0,
+                "p_max": round(sp[-1], 2) if n else 0,
+                "p_avg": round(sum(prices) / n, 2) if n else 0,
+                "p_med": _median_sorted(sp),
+                "p_q25": _quantile_sorted(sp, 0.25),
+                "p_q75": _quantile_sorted(sp, 0.75),
+            })
+        except: continue
+
+    stores.sort(key=lambda s: -s["product_count"])
+
+    # 价格带
+    bands = {"$0 - 25": 0, "$25 - 50": 0, "$50 - 100": 0, "$100 - 200": 0, "$200 - 500": 0, "$500+": 0}
+    for pr in all_prices:
+        if pr < 25: bands["$0 - 25"] += 1
+        elif pr < 50: bands["$25 - 50"] += 1
+        elif pr < 100: bands["$50 - 100"] += 1
+        elif pr < 200: bands["$100 - 200"] += 1
+        elif pr < 500: bands["$200 - 500"] += 1
+        else: bands["$500+"] += 1
+
+    # 店铺规模分级
+    tiers = {"巨型 (>5000)": 0, "大型 (1000-5000)": 0, "中型 (100-999)": 0, "小型 (10-99)": 0, "微型 (<10)": 0}
+    for s in stores:
+        if s["product_count"] > 5000: tiers["巨型 (>5000)"] += 1
+        elif s["product_count"] > 1000: tiers["大型 (1000-5000)"] += 1
+        elif s["product_count"] > 100: tiers["中型 (100-999)"] += 1
+        elif s["product_count"] > 10: tiers["小型 (10-99)"] += 1
+        else: tiers["微型 (<10)"] += 1
+
+    # 活动时间线
+    activity = defaultdict(int)
+    for s in stores:
+        if s["last_check"]:
+            activity[s["last_check"][:10]] += 1
+    activity_sorted = dict(sorted(activity.items(), reverse=True)[:14])
+
+    _cache = {
+        "schema_version": 2,
+        "total_stores": len(stores), "total_products": total_products,
+        "priced_products": len(all_prices),
+        "price_coverage_pct": round(len(all_prices) / total_products * 100, 1) if total_products else 0,
+        "active_1d": active_1d, "active_3d": active_3d, "active_7d": active_7d,
+        "all_prices_sorted": sorted(all_prices),
+        "price_bands": bands, "store_tiers": tiers,
+        "stores": stores, "activity": activity_sorted,
+        "generated_at": datetime.now().isoformat(),
+    }
+    _cache_ts = now
+    _write_dashboard_disk_cache(_cache)
+    return _cache
+
+
+def _store_detail(domain):
+    domain = su.normalize_domain(domain)
+    fp = MONITOR_DIR / f"{domain}_snapshot.json"
+    if not fp.exists():
+        fp = MONITOR_DIR / f"{domain.replace('www.', '')}_snapshot.json"
+    if not fp.exists(): return None
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    prods = data.get("products", {})
+    plist = list(prods.values()) if isinstance(prods, dict) else (prods if isinstance(prods, list) else [])
+    plist = [p for p in plist if isinstance(p, dict)]
+    plist.sort(key=lambda p: _valid_price(p.get("price")) or 0, reverse=True)
+    prices = [price for p in plist if (price := _valid_price(p.get("price"))) is not None]
+    sp = sorted(prices); n = len(sp)
+    try:
+        pc = int(data.get("product_count", len(plist)) or 0)
+    except (TypeError, ValueError):
+        pc = len(plist)
+    pc = max(pc, len(plist))
+    return {
+        "domain": data.get("domain", domain), "last_check": data.get("last_check", ""),
+        "product_count": pc, "priced_product_count": n,
+        "price_coverage_pct": round(n / pc * 100, 1) if pc else 0,
+        "products": plist,
+        "price_stats": {
+            "min": round(sp[0], 2) if n else 0, "max": round(sp[-1], 2) if n else 0,
+            "avg": round(sum(prices) / n, 2) if n else 0, "median": _median_sorted(sp),
+            "q25": _quantile_sorted(sp, 0.25),
+            "q75": _quantile_sorted(sp, 0.75),
+        }
+    }
+
+
+def _search_products_across_stores(keyword, limit=50):
+    """跨所有快照搜索产品"""
+    kw = keyword.lower()
+    results = []
+    for fp in sorted(glob.glob(str(MONITOR_DIR / "*_snapshot.json"))):
+        try:
+            data = json.loads(Path(fp).read_text(encoding="utf-8"))
+            domain = data.get("domain", "")
+            prods = data.get("products", {})
+            plist = list(prods.values()) if isinstance(prods, dict) else (prods if isinstance(prods, list) else [])
+            for p in plist:
+                t = (p.get("title") or "").lower()
+                if kw in t:
+                    results.append({"store": domain, "title": p.get("title", ""),
+                                    "price": p.get("price", 0), "handle": p.get("handle", "")})
+                    if len(results) >= limit: return results
+        except: continue
+    return results
+
+
+# ═══════════════════════════════════════════════════════════
+#  Dashboard 数据 API
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/dashboard/summary")
+def api_summary():
+    d = _load_all()
+    registry = _store_registry_ensure_baseline(d.get("stores", []))
+    sp = d["all_prices_sorted"]; n = len(sp)
+    under_50 = sum(1 for price in sp if price < 50)
+    return {
+        "total_stores": d["total_stores"], "total_products": d["total_products"],
+        "total_registered_stores": int(registry.get("total_registered_stores") or d["total_stores"]),
+        "total_snapshot_stores": int(registry.get("total_snapshot_stores") or d["total_stores"]),
+        "registry_target": int(registry.get("target") or STORE_REGISTRY_TARGET),
+        "registry_coverage_pct": registry.get("registry_coverage_pct", 0),
+        "registry_without_snapshot": int(registry.get("without_snapshot") or 0),
+        "scan_queue_pending": int(registry.get("scan_queue_pending") or 0),
+        "registry_sources": registry.get("sources", []),
+        "priced_products": d.get("priced_products", n),
+        "price_coverage_pct": d.get("price_coverage_pct", 0),
+        "active_1d": d["active_1d"], "active_3d": d["active_3d"], "active_7d": d["active_7d"],
+        "avg_price": round(sum(sp) / n, 2) if n else 0,
+        "median_price": _median_sorted(sp),
+        "under_50_count": under_50,
+        "under_50_pct": round(under_50 / n * 100, 1) if n else 0,
+        "price_bands": d["price_bands"], "store_tiers": d["store_tiers"],
+        "activity": d["activity"], "generated_at": d["generated_at"],
+    }
+
+@app.get("/api/dashboard/stores")
+def api_stores(sort: str = "products", order: str = "desc", search: str = "",
+               limit: int = Query(100, ge=1, le=1000),
+               offset: int = Query(0, ge=0),
+               snapshot: str = Query("all")):
+    d = _load_all()
+    _store_registry_ensure_baseline(d.get("stores", []))
+    page = _store_registry_page(
+        limit=limit,
+        offset=offset,
+        sort=sort,
+        order=order,
+        search=search,
+        snapshot=snapshot,
+    )
+    if page.get("ok"):
+        return page
+    stores = list(d["stores"])
+    if search:
+        q = search.lower(); stores = [s for s in stores if q in s["domain"].lower()]
+    key = {"products": "product_count", "price-avg": "p_avg", "domain": "domain", "last_check": "last_check"}.get(sort, "product_count")
+    rev = order == "desc"
+    if key in ("product_count", "p_avg"):
+        stores.sort(key=lambda s: s.get(key, 0), reverse=rev)
+    else:
+        stores.sort(key=lambda s: str(s.get(key, "")), reverse=rev)
+    total = len(stores)
+    return {"ok": True, "total": total, "offset": offset, "limit": limit, "stores": stores[offset:offset+limit], "fallback": True}
+
+@app.get("/api/dashboard/store/{domain}")
+def api_store_detail(domain: str):
+    d = _store_detail(domain)
+    if d is None: raise HTTPException(status_code=404)
+    return d
+
+@app.get("/api/dashboard/search-products")
+def api_search_products(q: str = "", limit: int = 50):
+    if not q: return {"results": []}
+    return {"results": _search_products_across_stores(q, limit)}
+
+@app.get("/api/dashboard/top-stores")
+def api_top_stores(n: int = 10):
+    d = _load_all()
+    return {"top_by_products": d["stores"][:n],
+            "top_by_price": sorted(d["stores"], key=lambda s: -s.get("p_avg", 0))[:n]}
+
+@app.get("/api/dashboard/external-brands")
+def api_external_brands(limit: int = 5000):
+    """从 127.0.0.1:8000 获取独立站监控品牌列表"""
+    import urllib.request
+    try:
+        url = f"http://127.0.0.1:8000/brands?limit={limit}"
+        req = urllib.request.Request(url)
+        with _LOCAL_OPENER.open(req, timeout=10) as resp:
+            brands = json.loads(resp.read())
+    except Exception as e:
+        return {"ok": False, "error": str(e), "brands": []}
+
+    # 加载本地快照域名集合
+    snap_domains = set()
+    for fp in glob.glob(str(MONITOR_DIR / "*_snapshot.json")):
+        d = su.normalize_domain(os.path.basename(fp).replace("_snapshot.json", ""))
+        if d:
+            snap_domains.add(d)
+
+    # 加载 watchlist 中的域名
+    wl_domains = set()
+    wl_path = MONITOR_DIR / "competitors_watchlist.json"
+    if wl_path.exists():
+        try:
+            wl = json.loads(wl_path.read_text(encoding="utf-8"))
+            for entry in wl:
+                if isinstance(entry, dict):
+                    domain = su.normalize_domain(entry.get("domain", ""))
+                    if domain:
+                        wl_domains.add(domain)
+                else:
+                    domain = su.normalize_domain(str(entry))
+                    if domain:
+                        wl_domains.add(domain)
+        except: pass
+
+    enriched = []
+    for b in (brands if isinstance(brands, list) else []):
+        domain = su.normalize_domain(b.get("domain", ""))
+        enriched.append({
+            **b,
+            "domain": domain,
+            "has_snapshot": domain in snap_domains,
+            "in_watchlist": domain in wl_domains,
+        })
+
+    # 统计
+    in_both = sum(1 for b in enriched if b["has_snapshot"])
+    return {
+        "ok": True,
+        "total_from_8000": len(enriched),
+        "with_snapshot": in_both,
+        "without_snapshot": len(enriched) - in_both,
+        "brands": enriched,
+    }
+
+@app.get("/api/dashboard/check-listing-times")
+def api_check_listing_times(domains: str = "", limit: int = 20):
+    """检测指定域名的产品上架时间（从 Shopify products.json 读取 created_at / published_at）"""
+    import urllib.request, ssl, concurrent.futures
+
+    domain_list = [d.strip() for d in domains.split(",") if d.strip()] if domains else []
+    # 如果没有传域名，从 8000 端口获取品牌列表
+    if not domain_list:
+        try:
+            url = f"http://127.0.0.1:8000/brands?limit={limit}"
+            req = urllib.request.Request(url)
+            with _LOCAL_OPENER.open(req, timeout=10) as resp:
+                brands = json.loads(resp.read())
+            domain_list = [b.get("domain", "") for b in (brands if isinstance(brands, list) else [])][:limit]
+        except Exception as e:
+            return {"ok": False, "error": f"无法从 8000 端口获取品牌: {e}"}
+
+    if not domain_list:
+        return {"ok": False, "error": "无域名"}
+
+    # 只查前 N 个
+    domain_list = domain_list[:limit]
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    def check_one(domain):
+        try:
+            url = f"https://{domain}/products.json?limit=50"
+            req = urllib.request.Request(url, headers={"User-Agent": su.USER_AGENT})
+            with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
+                data = json.loads(resp.read())
+            products = data.get("products", [])
+
+            created_dates = []
+            published_dates = []
+            for p in products:
+                ca = p.get("created_at", "")
+                pa = p.get("published_at", "")
+                if ca: created_dates.append(ca[:10])
+                if pa: published_dates.append(pa[:10])
+
+            created_dates_sorted = sorted(created_dates)
+            published_dates_sorted = sorted(published_dates)
+
+            # 上架频率分析
+            if len(created_dates_sorted) >= 2:
+                first = created_dates_sorted[0]
+                last = created_dates_sorted[-1]
+                days_span = max((datetime.strptime(last, "%Y-%m-%d") - datetime.strptime(first, "%Y-%m-%d")).days, 1)
+                cadence = round(days_span / len(created_dates_sorted), 1)  # 平均几天上一个新品
+            else:
+                cadence = None
+
+            return {
+                "domain": domain,
+                "ok": True,
+                "product_count": len(products),
+                "oldest_created": created_dates_sorted[0] if created_dates_sorted else None,
+                "newest_created": created_dates_sorted[-1] if created_dates_sorted else None,
+                "oldest_published": published_dates_sorted[0] if published_dates_sorted else None,
+                "newest_published": published_dates_sorted[-1] if published_dates_sorted else None,
+                "cadence_days": cadence,
+                "active": len(published_dates_sorted) > 0,
+            }
+        except Exception as e:
+            return {"domain": domain, "ok": False, "error": str(e)[:100]}
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(check_one, d): d for d in domain_list}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results.append(future.result(timeout=15))
+            except Exception as e:
+                d = futures[future]
+                results.append({"domain": d, "ok": False, "error": str(e)[:100]})
+
+    # 排序：成功优先，然后按最新创建时间倒序
+    results.sort(key=lambda r: (
+        not r.get("ok", False),
+        # 用字符串比较实现倒序：把早的日期排后面
+    ))
+    # 二次排序：成功的按 newest_created 倒序
+    ok_results = [r for r in results if r.get("ok")]
+    fail_results = [r for r in results if not r.get("ok")]
+    ok_results.sort(key=lambda r: r.get("newest_created") or "", reverse=True)
+    results = ok_results + fail_results
+
+    success = [r for r in results if r.get("ok")]
+    return {
+        "ok": True,
+        "total_checked": len(results),
+        "success_count": len(success),
+        "failed_count": len(results) - len(success),
+        "results": results,
+        "generated_at": datetime.now().isoformat(),
+    }
+
+
+@app.post("/api/dashboard/refresh")
+def api_refresh(force: bool = Query(False)):
+    d = _load_all(force=force)
+    registry = _store_registry_ensure_baseline(d.get("stores", []))
+    return {"status": "ok", "force": force, "registry": registry}
+
+
+class StoreRegistryImportRequest(BaseModel):
+    domains: list[str] = []
+    text: str = ""
+    source: str = "import"
+
+
+@app.get("/api/dashboard/store-registry/status")
+def api_store_registry_status():
+    d = _load_all()
+    return _store_registry_ensure_baseline(d.get("stores", []))
+
+
+@app.get("/api/dashboard/store-registry/stores")
+def api_store_registry_stores(
+    sort: str = "priority",
+    order: str = "desc",
+    search: str = "",
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+    snapshot: str = Query("all"),
+):
+    _store_registry_ensure_baseline(_load_all().get("stores", []))
+    return _store_registry_page(
+        limit=limit,
+        offset=offset,
+        sort=sort,
+        order=order,
+        search=search,
+        snapshot=snapshot,
+    )
+
+
+@app.post("/api/dashboard/store-registry/seed")
+def api_store_registry_seed(
+    source: str = Query("8000"),
+    limit: int = Query(STORE_REGISTRY_TARGET, ge=1, le=STORE_REGISTRY_TARGET),
+    page_size: int = Query(5000, ge=100, le=20000),
+):
+    """Seed the million-store registry from verified local sources."""
+
+    normalized_source = (source or "8000").lower().replace("-", "_")
+    details: dict = {"source": normalized_source}
+    if normalized_source in {"snapshot", "snapshots", "baseline"}:
+        d = _load_all(force=True)
+        details["snapshots_imported_or_updated"] = _store_registry_seed_from_snapshot_rows(d.get("stores", []))
+        details["watchlist_imported_or_updated"] = _store_registry_seed_from_watchlist()
+    elif normalized_source in {"watchlist"}:
+        details["watchlist_imported_or_updated"] = _store_registry_seed_from_watchlist()
+    elif normalized_source in {"8000", "fb", "brands"}:
+        details.update(_store_registry_seed_from_8000(limit=limit, page_size=page_size))
+        d = _load_all()
+        details["snapshots_imported_or_updated"] = _store_registry_seed_from_snapshot_rows(d.get("stores", []))
+        details["watchlist_imported_or_updated"] = _store_registry_seed_from_watchlist()
+    elif normalized_source in {"all"}:
+        d = _load_all(force=True)
+        details["snapshots_imported_or_updated"] = _store_registry_seed_from_snapshot_rows(d.get("stores", []))
+        details["watchlist_imported_or_updated"] = _store_registry_seed_from_watchlist()
+        details["brands_8000"] = _store_registry_seed_from_8000(limit=limit, page_size=page_size)
+    else:
+        raise HTTPException(status_code=400, detail="source 只支持 8000 / snapshots / watchlist / all")
+    return {"ok": True, "details": details, "registry": _store_registry_stats()}
+
+
+@app.post("/api/dashboard/store-registry/import")
+def api_store_registry_import(req: StoreRegistryImportRequest):
+    raw_domains = list(req.domains or [])
+    if req.text:
+        raw_domains.extend(re.findall(r"(?:https?://)?(?:www\.)?[a-z0-9][a-z0-9.-]+\.[a-z]{2,}(?:/[^\s,;]*)?", req.text, flags=re.I))
+    result = _store_registry_import_domains(raw_domains, source=req.source or "import")
+    return {**result, "registry": _store_registry_stats()}
+
+
+@app.post("/api/dashboard/background-refresh")
+def api_dashboard_background_refresh(
+    limit: int = Query(0, ge=0, le=STORE_REGISTRY_TARGET),
+    workers: int = Query(8, ge=1, le=32),
+    mode: str = Query("smart"),
+):
+    """Start a monitor refresh in the background."""
+
+    global _MONITOR_REFRESH_THREAD
+    with _MONITOR_REFRESH_LOCK:
+        already_running = bool(_MONITOR_REFRESH_STATUS.get("running"))
+    if already_running:
+        return {**_monitor_refresh_status_copy(), "started": False, "already_running": True}
+
+    domains, refresh_plan = _prioritized_monitor_domains(mode=mode, limit=limit)
+    if not domains:
+        raise HTTPException(status_code=400, detail="没有可刷新的监控域名")
+
+    workers = max(1, min(int(workers), 6 if refresh_plan.get("mode") == "all" else 16))
+    _MONITOR_REFRESH_THREAD = threading.Thread(
+        target=_run_monitor_background_refresh,
+        args=(domains, workers, refresh_plan),
+        daemon=True,
+    )
+    _MONITOR_REFRESH_THREAD.start()
+
+    time.sleep(0.05)
+    return {**_monitor_refresh_status_copy(), "started": True, "already_running": False}
+
+
+@app.get("/api/dashboard/background-refresh/status")
+def api_dashboard_background_refresh_status():
+    """Return status for the background monitor refresh task."""
+
+    return _monitor_refresh_status_copy()
+
+
+@app.get("/api/scrape-precision/audit")
+def api_scrape_precision_audit(
+    limit: int = Query(30, ge=1, le=200),
+    refresh: bool = Query(False),
+    cache_seconds: int = Query(900, ge=0, le=86400),
+):
+    """Audit snapshot quality and return precision-first refresh targets."""
+
+    if not refresh:
+        cached = read_cached_scrape_precision(MONITOR_DIR, limit=limit, max_age_seconds=cache_seconds)
+        if cached.get("ok"):
+            return cached
+    return audit_scrape_precision(MONITOR_DIR, limit=limit)
+
+
+@app.post("/api/scrape-precision/refresh-focus")
+def api_scrape_precision_refresh_focus(
+    limit: int = Query(30, ge=1, le=200),
+    workers: int = Query(8, ge=1, le=16),
+):
+    """Start a background refresh for the lowest-precision snapshot domains."""
+
+    global _MONITOR_REFRESH_THREAD
+    with _MONITOR_REFRESH_LOCK:
+        already_running = bool(_MONITOR_REFRESH_STATUS.get("running"))
+    if already_running:
+        return {**_monitor_refresh_status_copy(), "started": False, "already_running": True}
+
+    audit = read_cached_scrape_precision(MONITOR_DIR, limit=limit, max_age_seconds=900)
+    if not audit.get("ok"):
+        audit = audit_scrape_precision(MONITOR_DIR, limit=limit)
+    domains = [
+        str(item.get("domain") or "").strip()
+        for item in audit.get("focus_domains", [])
+        if item.get("domain")
+    ]
+    if not domains:
+        raise HTTPException(status_code=400, detail="没有低精度域名可补抓")
+
+    refresh_plan = {
+        "mode": "precision_focus",
+        "candidate_count": int((audit.get("summary") or {}).get("snapshot_files") or len(domains)),
+        "selected_count": len(domains),
+        "limit": limit,
+        "strategy": "精准补抓：只刷新 snapshot 精度最低、图片/价格/描述缺口最大或数据过期的域名。",
+        "precision_audit": {
+            "version": audit.get("version"),
+            "avg_precision_score": (audit.get("summary") or {}).get("avg_precision_score", 0),
+            "issue_totals": (audit.get("summary") or {}).get("issue_totals", {}),
+        },
+        "top_reasons": [
+            {
+                "domain": item.get("domain"),
+                "score": item.get("precision_score"),
+                "reasons": item.get("refresh_reasons", [])[:4],
+            }
+            for item in audit.get("focus_domains", [])[:10]
+        ],
+    }
+    _MONITOR_REFRESH_THREAD = threading.Thread(
+        target=_run_monitor_background_refresh,
+        args=(domains, max(1, min(int(workers), 16)), refresh_plan),
+        daemon=True,
+    )
+    _MONITOR_REFRESH_THREAD.start()
+    time.sleep(0.05)
+    return {
+        **_monitor_refresh_status_copy(),
+        "started": True,
+        "already_running": False,
+        "audit_summary": audit.get("summary", {}),
+        "focus_domains": domains,
+    }
+
+
+def _profit_command_money(value, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        if isinstance(value, str):
+            text = value.replace(",", "").strip()
+            match = re.search(r"-?\d+(?:\.\d+)?", text)
+            return float(match.group(0)) if match else default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+_PROFIT_MONITORING_SIGNALS = [
+    {
+        "name": "广告还在跑",
+        "watch": "Meta/Google/TikTok 素材数、重复投放、落地页入口",
+        "money": "对手持续付 CAC，说明需求或 offer 可能已经被市场验证。",
+        "action": "有广告但证据不齐时进「先拆素材」，先拆钩子、承诺、价格锚点。",
+        "lane": "先拆素材",
+    },
+    {
+        "name": "价格/促销变化",
+        "watch": "价格下调、折扣频率、满减、免邮、订阅优惠",
+        "money": "促销不是看热闹，要判断它是在放量、清库存，还是被迫价格战。",
+        "action": "只跟能保住毛利的 offer；低价互卷先轻跟测 AOV，毛利确定为负才暂不跟。",
+        "lane": "轻跟先拆",
+    },
+    {
+        "name": "新品/变体/套装",
+        "watch": "新品上线、颜色尺码扩展、starter kit、bundle、pre-order",
+        "money": "竞品在用小 SKU 测需求，变体和套装暴露他们愿意押注的卖点。",
+        "action": "新品默认进跟进池；趋势强先跟，趋势弱先补证，不复制同质单品。",
+        "lane": "趋势优先跟",
+    },
+    {
+        "name": "落地页/素材变化",
+        "watch": "标题、首屏承诺、评价模块、FAQ、加购/订阅布局",
+        "money": "页面改动通常来自转化学习；连续保留的元素比一次性文案更值钱。",
+        "action": "拆结构，不抄皮肤：保留钩子，重写定位和证明。",
+        "lane": "先拆素材",
+    },
+    {
+        "name": "评论痛点/社区抱怨",
+        "watch": "Reddit、评价、YouTube/TikTok 评论里的差评、替代品、购买犹豫",
+        "money": "抱怨就是差异化入口：更好材质、更快配送、更清楚承诺、更低风险试用。",
+        "action": "有痛点但无广告时补证；痛点能转成卖点才进入测试。",
+        "lane": "补证观察",
+    },
+    {
+        "name": "库存/售罄/补货",
+        "watch": "缺货、补货、预售、热卖尺码消失、库存恢复",
+        "money": "售罄可能是真需求，也可能是小库存假象，必须和广告/评论一起看。",
+        "action": "库存信号只能加分，不能单独触发上架。",
+        "lane": "补证观察",
+    },
+    {
+        "name": "单品经济性",
+        "watch": "售价、COGS、运费、退货风险、目标 CPA、复购/AOV",
+        "money": "社区讨论反复强调：不知道利润和 CAC，竞品价格就是噪音。",
+        "action": "利润不清先轻跟补证；贡献毛利为负、合规/IP/履约硬风险才暂不跟。",
+        "lane": "硬风险暂不跟",
+    },
+]
+
+
+_PROFIT_FIRST_PRINCIPLES = [
+    {
+        "name": "利润方程先于竞品动作",
+        "axiom": "赚钱不是因为对手在卖，而是售价减掉 COGS、履约、退货、平台费和 CAC 后仍有正贡献。",
+        "watch": "售价、折扣、运费门槛、目标 CPA、保本 CPA、退货/破损风险",
+        "decision": "真实 COGS 不清楚先轻跟补证；贡献毛利明显为负才暂不跟。",
+    },
+    {
+        "name": "需求必须由行为证明",
+        "axiom": "用户说喜欢不等于会付钱；对手持续投广告、补货、扩变体、被评论讨论，才是更硬的需求信号。",
+        "watch": "广告持续性、售罄/补货、重复上新、评论数量、Reddit/UGC 真实讨论",
+        "decision": "新品先进入跟进池；趋势强优先跟，证据弱就自动补证和轻跟。",
+    },
+    {
+        "name": "获客成本决定能不能放大",
+        "axiom": "同一个产品，对手能赚钱不代表我们能赚钱；关键是我们能否用更低 CAC 或更高 AOV 承接流量。",
+        "watch": "广告素材密度、素材寿命、价格带、bundle、订阅、加购、复购线索",
+        "decision": "广告在跑但未证明我们有获客优势时，只进「先拆素材」。",
+    },
+    {
+        "name": "差异化来自痛点缺口",
+        "axiom": "直接复制会把利润推向价格战；用户抱怨、差评和替代品讨论才是可以切入的利润缺口。",
+        "watch": "差评关键词、Reddit 抱怨、FAQ、退货原因、竞品承诺没有覆盖的场景",
+        "decision": "找不到差异化承诺，就不做同款同价跟卖。",
+    },
+    {
+        "name": "信任降低转化摩擦",
+        "axiom": "PDP、评价、UGC、前后对比和风险逆转，本质上是在降低用户购买不确定性。",
+        "watch": "首屏证明、评价模块、UGC、保证/退换、FAQ、before/after 演示",
+        "decision": "页面证明不可复用或无法重建时，不进入马上跟。",
+    },
+    {
+        "name": "履约风险会吞掉毛利",
+        "axiom": "大件、易碎、合规、IP、医疗宣称、低质供应链，都会把纸面毛利变成真实亏损。",
+        "watch": "尺寸重量、破损率、合规词、IP 词、供应商稳定性、配送时效",
+        "decision": "风险无法量化时，先接供应链和合规证据；高风险直接不碰。",
+    },
+    {
+        "name": "监控的是变化，不是截图",
+        "axiom": "单次快照只说明某一刻存在；连续变化才说明对手在学习、放量、清库存或撤退。",
+        "watch": "连续价格变化、广告加量/停投、页面迭代、库存恢复、变体扩张",
+        "decision": "只把连续信号升级成动作，单点信号保留观察。",
+    },
+]
+
+
+_PROFIT_FIRST_PRINCIPLE_RULES = [
+    "所有竞品变化都要落到一个变量：AOV、毛利、CVR、CAC、复购、风险、时间窗口。",
+    "不能解释为利润变量的变化，只记录，不行动。",
+    "独立站新品默认可跟入池；趋势越高越靠前，先抢时间窗口。",
+    "缺证据不等于不能跟，只决定强跟、轻跟、补证跟和首测强度。",
+    "不能跟只留给硬门槛：合规/IP/履约不可控、假货无效、贡献毛利确定为负。",
+]
+
+
+_PROFIT_LANE_RULES = [
+    {"lane": "马上跟", "rule": "强趋势、广告或验真信号足够强，直接准备 DRAFT 和小预算测试单。"},
+    {"lane": "先拆素材", "rule": "新品可跟但证据/供应链/素材未齐；先拆 offer、价格锚点、PDP 和素材角度。"},
+    {"lane": "补证观察", "rule": "新品仍在跟进池；系统自动补趋势、Meta、Reddit/评论/UGC、供应链证据。"},
+    {"lane": "硬风险暂不跟", "rule": "只拦合规/IP/履约/假货/贡献毛利确定为负的不可逆风险。"},
+]
+
+
+_PROFIT_COMMUNITY_BASIS = [
+    "Reddit r/ecommerce 讨论里，价格追踪只是第一层；真正赚钱的是识别模式、时间窗口、品类差异和自己的毛利结构。",
+    "r/ecommerce、r/dropshipping 和 r/ProductManagement 反复提到：连续监控新品、促销、bundle、价格、库存和页面变化，比人工截图更能发现趋势。",
+    "r/PPC 更重视素材、hook、offer、落地页和广告持续性，因为这些代表对手正在花钱验证。",
+    "社媒聆听讨论的共同点是过滤噪声：不要所有提及都看，只看投诉、替代品、持续需求、价格/库存突变和购买犹豫。",
+    "Reddit 官方资料强调用社区讨论捕捉产品发布、用户抱怨、竞品反应和早期趋势，越早发现越有测试窗口。",
+]
+
+
+_PROFIT_COMMUNITY_SOURCE_LINKS = [
+    {
+        "label": "Reddit 官方竞品趋势",
+        "url": "https://www.business.reddit.com/learning-hub/articles/monitoring-competitor-trends",
+        "lesson": "监控竞品提及、产品发布、价格、站点和信息变化，用实时反应判断市场窗口。",
+    },
+    {
+        "label": "Reddit 社媒聆听",
+        "url": "https://www.business.reddit.com/learning-hub/articles/what-is-social-listening",
+        "lesson": "社媒聆听要追踪品牌、产品、行业词和竞品提及，找情绪、主题、社区和早期趋势。",
+    },
+    {
+        "label": "Reddit 使用方法",
+        "url": "https://www.business.reddit.com/learning-hub/articles/how-to-use-reddit-for-social-listening",
+        "lesson": "社区讨论能提前暴露趋势、抱怨、替代品和竞品反馈，适合转成差异化卖点。",
+    },
+    {
+        "label": "r/ProductManagement 连续信号",
+        "url": "https://www.reddit.com/r/ProductManagement/comments/1swvfd9/how_do_pms_handle_competitive_monitoring_at/",
+        "lesson": "从静态表格转到连续信号：发布、价格/页面变化和用户情绪，系统只突出发生了什么变化。",
+    },
+    {
+        "label": "r/PPC 竞品广告拆解",
+        "url": "https://www.reddit.com/r/PPC/comments/1g14bhp/do_spying_competitor_ads_really_help/",
+        "lesson": "看竞品广告要拆 messaging、落地页、USP、价格点和差异化；不要照抄，因为你看不到对方真实 ROAS/CPA。",
+    },
+    {
+        "label": "r/ecommerce 价格/竞品监控",
+        "url": "https://www.reddit.com/r/ecommerce/comments/1p6vzep/what_are_you_using_for_price_competitor_monitoring/",
+        "lesson": "商家要的是价格、竞品、MAP、新品等变化提醒，不是每周没人看的 CSV。",
+    },
+    {
+        "label": "r/ecommerce 自动价格追踪",
+        "url": "https://www.reddit.com/r/ecommerce/comments/1s8uxca/how_do_you_track_prices_from_competitors/",
+        "lesson": "人工查价会吞掉更重要的选品时间；价格、页面和库存变化要自动化。",
+    },
+    {
+        "label": "r/dropshipping Shopify 竞品促销",
+        "url": "https://www.reddit.com/r/dropshipping/comments/1sxhyuq/do_shopify_merchants_actively_monitor_competitor/",
+        "lesson": "Shopify 商家关心竞品价格/促销是否值得自动监控；系统应把变化转成跟品优先级。",
+    },
+]
+
+
+def _profit_command_item_insight(
+    status: str,
+    ad_count: int,
+    strict: int,
+    required: int,
+    price: float,
+    target_cpa: float,
+    break_even_cpa: float,
+    evidence_gaps: list,
+    reason: str,
+) -> tuple[str, str, str]:
+    """Translate the follow lane into a short money-focused operator hint."""
+
+    gaps_text = " ".join(str(g) for g in evidence_gaps or [])
+    reason_text = f"{reason} {gaps_text}"
+    if status == "马上跟":
+        return (
+            "对手需求、广告和经济性都过线；只用小预算验证，不盲目铺货。",
+            "盯广告是否继续跑、首屏 offer 是否变化、售价是否还能覆盖目标 CPA。",
+            "第一性原理：需求、利润、信任和履约同时过线，才允许小预算验证。",
+        )
+    if status == "先拆素材":
+        if ad_count >= 80:
+            return (
+                "广告已放量，说明需求强，但跟品拥挤；先拆素材再找差异化入口。",
+                "盯长期保留的 hook、落地页承诺、bundle/订阅优惠，避免直接打价格战。",
+                "第一性原理：需求行为已出现，但获客优势和差异化还没证明。",
+            )
+        return (
+            "对手已经付费测试，先把 hook、价格锚点、PDP 证明拆清楚。",
+            "盯素材是否连续出现、广告是否加量、评论里是否有未被满足的痛点。",
+            "第一性原理：先验证对手为何愿意付 CAC，再判断我们能否更便宜成交。",
+        )
+    if status == "补证观察":
+        if "Reddit" in gaps_text or "UGC" in gaps_text:
+            return (
+                "有产品机会，但还缺真实社区/UGC 需求；先看购买动机、差评痛点和替代品缺口。",
+                "去 Reddit/YouTube/TikTok/Amazon 评论补痛点、替代品和购买犹豫。",
+                "第一性原理：没有真实用户行为，需求仍是假设。",
+            )
+        if "Meta" in gaps_text or "广告" in gaps_text:
+            return (
+                "进了重要20%，但还没看到对手持续买流量；先别上架。",
+                "补 Meta/Google/TikTok 广告证据，确认不是一次性上新或小站噪音。",
+                "第一性原理：没有付费获客行为，不能确认需求能被放大。",
+            )
+        return (
+            "方向值得看，但证据不足；补齐两类外部验证再进入素材拆解。",
+            "优先补趋势、社区讨论、评价痛点和竞品页面变化。",
+            "第一性原理：证据不足时，最赚钱的动作是自动补证和控制测试强度。",
+        )
+    if status in {"不碰", "硬风险暂不跟"}:
+        if "经济" in reason_text or "毛利" in reason_text or break_even_cpa <= target_cpa:
+            return (
+                "利润空间太窄，广告一跑就可能亏；这是价格战信号，不是机会。",
+                "先接真实 COGS/运费/退货率；保本 CPA 不够就不要跟。",
+                "第一性原理：贡献毛利无法覆盖 CAC，销量越大亏得越快。",
+            )
+        if "合规" in reason_text or "IP" in reason_text or "审核" in reason_text:
+            return (
+                "合规/IP/平台审核风险会吞掉利润，不能靠销量补回来。",
+                "只记录竞品动作，不进入上架和投放。",
+                "第一性原理：不可控风险会把纸面毛利变成真实损失。",
+            )
+        return (
+            "需求、利润或风险条件不成立；监控它是为了避坑。",
+            "只保留黑名单/观察，不消耗选品和上架时间。",
+            "第一性原理：硬门槛不成立时，省下执行成本就是利润。",
+        )
+    if price and price < 29:
+        return (
+            "低客单品要特别小心，CAC 容错很低；除非有强复购或 bundle。",
+            "盯是否能做套装、加购或订阅，否则只低优先监控。",
+            "第一性原理：低 AOV 压缩 CAC 空间，必须靠 AOV 或复购补回来。",
+        )
+    return (
+        "还没进入强趋势区，但新品仍在跟进池；先轻跟或自动补证。",
+        "盯趋势、广告、价格、评论痛点是否出现连续信号。",
+        "第一性原理：时间窗口有价值，缺证据决定跟法，不等于不能跟。",
+    )
+
+
+def _profit_command_item_playbook(status: str, ad_count: int, strict: int, required: int, evidence_gaps: list) -> dict:
+    gaps_text = " ".join(str(g) for g in evidence_gaps or [])
+    if status == "马上跟":
+        return {
+            "do_now": "建 Shopify DRAFT，接供应链报价，准备小预算测试。",
+            "how_to_follow": "跟需求和 offer，不照抄页面；用更强证明、更好套装或更清楚承诺切入。",
+            "test_plan": "3 套素材：痛点演示、竞品差评反打、bundle/优惠锚点；先小预算看 CTR/CVR/CAC。",
+        }
+    if status == "先拆素材":
+        return {
+            "do_now": "先拆广告素材、首屏承诺、价格锚点和落地页证明。",
+            "how_to_follow": "只复用被市场验证的卖点结构，换角度、换证明、换套装，避免同质低价跟卖。",
+            "test_plan": "补供应链和素材后再进 DRAFT；广告数越高，越要找差异化切口。",
+        }
+    if status == "补证观察":
+        if "Reddit" in gaps_text or "UGC" in gaps_text:
+            do_now = "补 Reddit/评论/UGC，找真实购买理由、抱怨和替代品。"
+        elif "Meta" in gaps_text or "广告" in gaps_text:
+            do_now = "补 Meta/Google/TikTok 广告证据，确认对手是否持续买流量。"
+        else:
+            do_now = "补两类外部证据，再决定是否进入素材拆解。"
+        return {
+            "do_now": do_now,
+            "how_to_follow": "先证明需求，再证明我们能更好成交；证据不齐不碰上架动作。",
+            "test_plan": f"当前验真 {strict}/{required}；补到至少 {required}/{required} 后再进入「先拆素材」。",
+        }
+    if status in {"不碰", "硬风险暂不跟"}:
+        return {
+            "do_now": "硬风险暂不跟，不建 DRAFT，不投广告，只保留监控。",
+            "how_to_follow": "不要碰合规/IP/履约不可控或贡献毛利确定为负的品。",
+            "test_plan": "解除硬风险后回到趋势队列；缺证据类产品不在这里拦截。",
+        }
+    return {
+        "do_now": "继续自动监控和补证，不占用强跟动作位。",
+        "how_to_follow": "新品默认保留跟进；趋势、广告、评论或库存连续变化后自动提高优先级。",
+        "test_plan": "弱趋势先轻跟补证；出现强趋势再进入素材和测试准备。",
+    }
+
+
+def _profit_command_compact_list(value, limit: int = 4) -> list:
+    if not isinstance(value, list):
+        return []
+    out: list = []
+    for item in value:
+        if item in (None, ""):
+            continue
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _profit_command_truthy(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "ok", "pass", "ready", "ai_ready"}
+    return bool(value)
+
+
+def _profit_command_state(state: str, label: str, text: str, reason: str = "") -> dict:
+    return {"state": state, "label": label, "text": text, "reason": reason}
+
+
+_VALIDATION_SHORT_LABELS = {
+    "meta_ads": "广告",
+    "google_trends": "趋势",
+    "social_ugc": "UGC",
+    "marketplace": "市场",
+    "supply_chain": "供应链",
+    "unit_economics": "利润",
+    "pdp_assets": "PDP",
+    "creative_pack": "素材",
+    "risk_compliance": "风险",
+}
+
+
+def _profit_command_validation_status_label(status: str) -> str:
+    return {
+        "verified": "已验",
+        "pending": "待验",
+        "failed": "失败",
+        "lead_only": "线索",
+    }.get(str(status or ""), "待验")
+
+
+def _profit_command_validation_short(slot: dict) -> str:
+    key = str(slot.get("key") or "")
+    label = _VALIDATION_SHORT_LABELS.get(key) or str(slot.get("label") or key or "验证")[:6]
+    return label
+
+
+def _profit_command_decision_scorecard(item: dict) -> list[dict]:
+    economics = item.get("economics") if isinstance(item.get("economics"), dict) else {}
+    demand = item.get("demand") if isinstance(item.get("demand"), dict) else {}
+    readiness = item.get("readiness") if isinstance(item.get("readiness"), dict) else {}
+    risk = item.get("risk") if isinstance(item.get("risk"), dict) else {}
+    execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
+
+    margin = _profit_command_money(economics.get("contribution_margin_pct"), 0)
+    cpa_room = _profit_command_money(economics.get("cpa_room"), 0)
+    contribution = _profit_command_money(economics.get("contribution_before_ads"), 0)
+    econ_ready = _profit_command_truthy(economics.get("ready"))
+    needs_cogs = _profit_command_truthy(economics.get("requires_real_cogs"))
+    if econ_ready and margin >= 30 and cpa_room > 0 and not needs_cogs:
+        econ_state = "pass"
+        econ_reason = "贡献毛利和目标 CPA 有余量。"
+    elif contribution > 0 or margin > 0 or cpa_room > 0:
+        econ_state = "warn"
+        econ_reason = "纸面利润存在，但 COGS/运费/CPA 仍要复核。"
+    else:
+        econ_state = "block"
+        econ_reason = "无法证明买流量后仍有正贡献。"
+
+    strict = int(_profit_command_money(demand.get("strict_validation_count"), 0))
+    required = max(1, int(_profit_command_money(demand.get("required_validation_count"), 2)))
+    ad_count = int(_profit_command_money(demand.get("ad_count"), item.get("ad_count", 0)))
+    proof_count = int(_profit_command_money(demand.get("proof_source_count"), len(demand.get("proof_sources") or [])))
+    market_ready = _profit_command_truthy(demand.get("market_ready"))
+    trend_status = str(demand.get("trend_status") or item.get("trend_status") or "").lower()
+    trend_score = _profit_command_money(demand.get("trend_score"), item.get("trend_score", 0))
+    if strict >= required and (ad_count > 0 or proof_count >= required):
+        demand_state = "pass"
+        demand_reason = "广告、趋势、社区或平台证据达到测试门槛。"
+    elif trend_status in {"breakout", "hot", "rising", "emerging", "up", "watch"} or trend_score >= 3:
+        demand_state = "warn"
+        demand_reason = "新品趋势已出现，先进入跟进池并自动补证。"
+    elif ad_count > 0 or strict > 0 or proof_count > 0 or market_ready:
+        demand_state = "warn"
+        demand_reason = "已有需求信号，但还不足以直接上架。"
+    else:
+        demand_state = "warn"
+        demand_reason = "证据弱，先补证跟；缺证据不等于不能跟。"
+
+    assets_ready = _profit_command_truthy(readiness.get("assets_ready"))
+    pdp_ready = _profit_command_truthy(readiness.get("pdp_ready"))
+    ai_ready = _profit_command_truthy(readiness.get("ai_ready"))
+    draft_ready = _profit_command_truthy(readiness.get("draft_ready"))
+    creative_axes = _profit_command_compact_list(readiness.get("creative_axes"), 3)
+    if assets_ready and pdp_ready and (ai_ready or draft_ready):
+        ready_state = "pass"
+        ready_reason = "素材、PDP 和测试入口可以承接流量。"
+    elif assets_ready or pdp_ready or creative_axes:
+        ready_state = "warn"
+        ready_reason = "已有切入角度，但素材包或 PDP 证明仍不完整。"
+    else:
+        ready_state = "block"
+        ready_reason = "缺素材、图片或落地页证明，无法安全测试。"
+
+    blockers = _profit_command_compact_list(risk.get("blockers"), 3)
+    missing = _profit_command_compact_list(risk.get("missing"), 3)
+    evidence_gaps = _profit_command_compact_list(risk.get("evidence_gaps"), 3)
+    economics_gaps = _profit_command_compact_list(risk.get("economics_gaps"), 2)
+    if blockers:
+        risk_state = "block"
+        risk_reason = str(blockers[0])
+    elif missing or evidence_gaps or economics_gaps or risk.get("next_gate"):
+        risk_state = "warn"
+        risk_reason = str((missing or evidence_gaps or economics_gaps or [risk.get("next_gate")])[0])
+    else:
+        risk_state = "pass"
+        risk_reason = "暂无硬风险。"
+
+    first_budget = _profit_command_money(execution.get("first_budget"), economics.get("first_test_budget", 0))
+    kill_rules = _profit_command_compact_list(execution.get("kill_rules"), 2)
+    scale_rules = _profit_command_compact_list(execution.get("scale_rules"), 2)
+    if first_budget > 0 and kill_rules and scale_rules:
+        exec_state = "pass"
+        exec_reason = "预算、止损和放量规则明确。"
+    elif first_budget > 0 or execution.get("campaign_mode") or kill_rules or scale_rules:
+        exec_state = "warn"
+        exec_reason = "有测试方向，但止损/放量规则还要补齐。"
+    else:
+        exec_state = "warn"
+        exec_reason = "还没有测试单，先由系统补素材、证据和预算规则。"
+
+    return [
+        _profit_command_state(econ_state, "利润", f"毛利{margin:.1f}% · CPA余量${cpa_room:.2f}", econ_reason),
+        _profit_command_state(demand_state, "需求", f"验真{strict}/{required} · 广告{ad_count}", demand_reason),
+        _profit_command_state(ready_state, "承接", f"素材{'齐' if assets_ready else '缺'} · PDP{'齐' if pdp_ready else '缺'}", ready_reason),
+        _profit_command_state(risk_state, "风险", risk_reason[:42], risk_reason),
+        _profit_command_state(exec_state, "执行", f"首测${first_budget:.2f}" if first_budget else "未排测试预算", exec_reason),
+    ]
+
+
+def _profit_command_decision_tags(item: dict, scorecard: list[dict]) -> list[str]:
+    economics = item.get("economics") if isinstance(item.get("economics"), dict) else {}
+    demand = item.get("demand") if isinstance(item.get("demand"), dict) else {}
+    readiness = item.get("readiness") if isinstance(item.get("readiness"), dict) else {}
+    risk = item.get("risk") if isinstance(item.get("risk"), dict) else {}
+    execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
+    required_validation = item.get("required_validation") if isinstance(item.get("required_validation"), dict) else {}
+    validation_summary = required_validation.get("summary") if isinstance(required_validation.get("summary"), dict) else item.get("validation_summary") if isinstance(item.get("validation_summary"), dict) else {}
+    validation_slots = required_validation.get("slots") if isinstance(required_validation.get("slots"), list) else []
+
+    margin = _profit_command_money(economics.get("contribution_margin_pct"), 0)
+    cpa_room = _profit_command_money(economics.get("cpa_room"), 0)
+    strict = int(_profit_command_money(demand.get("strict_validation_count"), item.get("strict_validation_count", 0)))
+    required = max(1, int(_profit_command_money(demand.get("required_validation_count"), item.get("required_validation_count", 2))))
+    ad_count = int(_profit_command_money(demand.get("ad_count"), item.get("ad_count", 0)))
+    image_count = int(_profit_command_money(readiness.get("image_count"), 0))
+    first_budget = _profit_command_money(execution.get("first_budget"), economics.get("first_test_budget", 0))
+
+    tags: list[str] = []
+    if margin:
+        tags.append(f"毛利{margin:.1f}%")
+    tags.append(f"CPA余量${cpa_room:.2f}" if cpa_room > 0 else "CPA无余量")
+    tags.append(f"验真{strict}/{required}")
+    if validation_summary:
+        verified_count = int(_profit_command_money(validation_summary.get("verified_count"), 0))
+        required_count = int(_profit_command_money(validation_summary.get("required_count"), 0))
+        blocking_count = int(_profit_command_money(validation_summary.get("blocking_count"), 0))
+        if required_count:
+            tags.append(f"必验{verified_count}/{required_count}")
+        if blocking_count:
+            tags.append(f"阻塞{blocking_count}")
+    for slot in validation_slots:
+        if not isinstance(slot, dict):
+            continue
+        status = str(slot.get("status") or "")
+        if status == "verified":
+            continue
+        tags.append(f"{_profit_command_validation_status_label(status)}:{_profit_command_validation_short(slot)}")
+        if len(tags) >= 8:
+            break
+    tags.append(f"广告{ad_count}" if ad_count > 0 else "缺广告")
+    tags.append("素材齐" if _profit_command_truthy(readiness.get("assets_ready")) else "素材未齐")
+    tags.append("PDP齐" if _profit_command_truthy(readiness.get("pdp_ready")) else f"PDP缺图{image_count}")
+    if _profit_command_truthy(readiness.get("ai_ready")):
+        tags.append("AI可投")
+    elif readiness.get("platform_ai_readiness"):
+        tags.append(f"AI:{readiness.get('platform_ai_readiness')}")
+    if first_budget:
+        tags.append(f"首测${first_budget:.0f}")
+    if _profit_command_truthy(economics.get("requires_real_cogs")):
+        tags.append("COGS待核")
+    next_gate = str(risk.get("next_gate") or "").strip()
+    if next_gate:
+        tags.append("下一关：" + next_gate[:18])
+
+    for card in scorecard:
+        if card.get("state") == "block":
+            tags.append(f"{card.get('label', '门槛')}未过")
+
+    seen: set[str] = set()
+    compact: list[str] = []
+    for tag in tags:
+        text = str(tag or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        compact.append(text)
+        if len(compact) >= 12:
+            break
+    return compact
+
+
+def _profit_command_judgement_fields(item: dict) -> dict:
+    economics = item.get("economics") if isinstance(item.get("economics"), dict) else {}
+    demand = item.get("demand") if isinstance(item.get("demand"), dict) else {}
+    readiness = item.get("readiness") if isinstance(item.get("readiness"), dict) else {}
+    risk = item.get("risk") if isinstance(item.get("risk"), dict) else {}
+    execution = item.get("execution") if isinstance(item.get("execution"), dict) else {}
+    required_validation = item.get("required_validation") if isinstance(item.get("required_validation"), dict) else {}
+    validation_summary = required_validation.get("summary") if isinstance(required_validation.get("summary"), dict) else item.get("validation_summary") if isinstance(item.get("validation_summary"), dict) else {}
+    validation_slots = required_validation.get("slots") if isinstance(required_validation.get("slots"), list) else []
+    pending_slots = [
+        {
+            "key": slot.get("key", ""),
+            "label": slot.get("label", ""),
+            "status": slot.get("status", ""),
+            "short": _profit_command_validation_short(slot),
+            "next_action": slot.get("next_action", ""),
+            "search_links": _profit_command_compact_list(slot.get("search_links"), 2),
+        }
+        for slot in validation_slots
+        if isinstance(slot, dict) and slot.get("status") != "verified"
+    ][:8]
+    return {
+        "economics": {
+            "price": round(_profit_command_money(economics.get("price"), item.get("price", 0)), 2),
+            "estimated_cogs": round(_profit_command_money(economics.get("estimated_cogs"), 0), 2),
+            "margin_pct": round(_profit_command_money(economics.get("contribution_margin_pct"), 0), 1),
+            "contribution_before_ads": round(_profit_command_money(economics.get("contribution_before_ads"), 0), 2),
+            "target_cpa": round(_profit_command_money(economics.get("target_cpa"), item.get("target_cpa", 0)), 2),
+            "break_even_cpa": round(_profit_command_money(economics.get("break_even_cpa"), item.get("break_even_cpa", 0)), 2),
+            "cpa_room": round(_profit_command_money(economics.get("cpa_room"), 0), 2),
+            "first_test_budget": round(_profit_command_money(economics.get("first_test_budget"), execution.get("first_budget", 0)), 2),
+            "ready": _profit_command_truthy(economics.get("ready")),
+            "requires_real_cogs": _profit_command_truthy(economics.get("requires_real_cogs")),
+        },
+        "demand": {
+            "ad_count": int(_profit_command_money(demand.get("ad_count"), item.get("ad_count", 0))),
+            "strict_validation": f"{int(_profit_command_money(demand.get('strict_validation_count'), 0))}/{int(_profit_command_money(demand.get('required_validation_count'), 2))}",
+            "proof_sources": _profit_command_compact_list(demand.get("proof_sources"), 5),
+            "traffic_sources": _profit_command_compact_list(demand.get("traffic_sources"), 4),
+            "trend_status": demand.get("trend_status", item.get("trend_status", "")),
+            "trend_score": round(_profit_command_money(demand.get("trend_score"), item.get("trend_score", 0)), 2),
+            "platform_validation_score": round(_profit_command_money(demand.get("platform_validation_score"), 0), 2),
+            "market_ready": _profit_command_truthy(demand.get("market_ready")),
+        },
+        "readiness": {
+            "assets_ready": _profit_command_truthy(readiness.get("assets_ready")),
+            "pdp_ready": _profit_command_truthy(readiness.get("pdp_ready")),
+            "ai_ready": _profit_command_truthy(readiness.get("ai_ready")),
+            "draft_ready": _profit_command_truthy(readiness.get("draft_ready")),
+            "image_count": int(_profit_command_money(readiness.get("image_count"), 0)),
+            "variant_count": int(_profit_command_money(readiness.get("variant_count"), 0)),
+            "best_channels": _profit_command_compact_list(readiness.get("best_channels"), 4),
+            "creative_axes": _profit_command_compact_list(readiness.get("creative_axes"), 5),
+            "landing_page_must_haves": _profit_command_compact_list(readiness.get("landing_page_must_haves"), 5),
+        },
+        "risk": {
+            "blockers": _profit_command_compact_list(risk.get("blockers"), 4),
+            "missing": _profit_command_compact_list(risk.get("missing"), 5),
+            "evidence_gaps": _profit_command_compact_list(risk.get("evidence_gaps"), 5),
+            "creative_gaps": _profit_command_compact_list(risk.get("creative_gaps"), 4),
+            "pdp_gaps": _profit_command_compact_list(risk.get("pdp_gaps"), 4),
+            "economics_gaps": _profit_command_compact_list(risk.get("economics_gaps"), 4),
+            "next_gate": risk.get("next_gate", ""),
+            "do_not_copy": _profit_command_compact_list(risk.get("do_not_copy"), 4),
+        },
+        "execution": {
+            "campaign_mode": execution.get("campaign_mode", ""),
+            "first_budget": round(_profit_command_money(execution.get("first_budget"), 0), 2),
+            "daily_budget": execution.get("daily_budget", ""),
+            "creative_count": int(_profit_command_money(execution.get("creative_count"), 0)),
+            "kill_rules": _profit_command_compact_list(execution.get("kill_rules"), 3),
+            "scale_rules": _profit_command_compact_list(execution.get("scale_rules"), 3),
+            "review_window": execution.get("review_window", ""),
+            "learn_points": _profit_command_compact_list(execution.get("learn_points"), 5),
+        },
+        "validation": {
+            "status": validation_summary.get("status", ""),
+            "verified_count": int(_profit_command_money(validation_summary.get("verified_count"), 0)),
+            "required_count": int(_profit_command_money(validation_summary.get("required_count"), 0)),
+            "pending_count": int(_profit_command_money(validation_summary.get("pending_count"), 0)),
+            "lead_only_count": int(_profit_command_money(validation_summary.get("lead_only_count"), 0)),
+            "failed_count": int(_profit_command_money(validation_summary.get("failed_count"), 0)),
+            "blocking_count": int(_profit_command_money(validation_summary.get("blocking_count"), 0)),
+            "next_action": validation_summary.get("next_action", ""),
+            "pending_slots": pending_slots,
+            "blocking_missing": _profit_command_compact_list(item.get("validation_blocking") or required_validation.get("blocking_missing"), 6),
+            "tasks": _profit_command_compact_list(item.get("validation_tasks") or required_validation.get("pending_tasks"), 8),
+        },
+    }
+
+
+def _profit_command_item(item: dict) -> dict:
+    price = _profit_command_money(item.get("price"), 0)
+    target_cpa = _profit_command_money(item.get("target_cpa"), 0)
+    break_even_cpa = _profit_command_money(item.get("break_even_cpa"), 0)
+    priority = int(_profit_command_money(item.get("priority") or item.get("follow_priority_score"), 0))
+    strict = int(_profit_command_money(item.get("strict_validation_count"), 0))
+    required = int(_profit_command_money(item.get("required_validation_count"), 2))
+    evidence_gaps = item.get("evidence_gaps") if isinstance(item.get("evidence_gaps"), list) else []
+    status = item.get("follow_status", "低优先")
+    ad_count = int(_profit_command_money(item.get("ad_count"), 0))
+    money_signal, monitoring_focus, first_principle_check = _profit_command_item_insight(
+        status,
+        ad_count,
+        strict,
+        required,
+        price,
+        target_cpa,
+        break_even_cpa,
+        evidence_gaps,
+        str(item.get("follow_reason", "")),
+    )
+    playbook = _profit_command_item_playbook(status, ad_count, strict, required, evidence_gaps)
+    judgement_fields = _profit_command_judgement_fields(item)
+    scorecard = _profit_command_decision_scorecard(item)
+    decision_tags = _profit_command_decision_tags(item, scorecard)
+    required_validation = item.get("required_validation") if isinstance(item.get("required_validation"), dict) else {}
+    validation_summary = required_validation.get("summary") if isinstance(required_validation.get("summary"), dict) else item.get("validation_summary") if isinstance(item.get("validation_summary"), dict) else {}
+    return {
+        "rank": item.get("rank"),
+        "title": item.get("title", ""),
+        "domain": item.get("domain", ""),
+        "product_url": item.get("product_url", ""),
+        "price": round(price, 2),
+        "status": status,
+        "priority": priority,
+        "ad_count": ad_count,
+        "ad_heat": item.get("ad_heat", ""),
+        "strict_validation": f"{strict}/{required}",
+        "strict_pass": bool(item.get("strict_pass")),
+        "trend_status": item.get("trend_status", "unverified"),
+        "trend_score": round(_profit_command_money(item.get("trend_score"), 0), 2),
+        "target_cpa": round(target_cpa, 2),
+        "break_even_cpa": round(break_even_cpa, 2),
+        "gross_room": round(max(break_even_cpa, target_cpa, 0), 2),
+        "reason": item.get("follow_reason", ""),
+        "next_action": item.get("next_action", ""),
+        "money_signal": money_signal,
+        "monitoring_focus": monitoring_focus,
+        "first_principle_check": first_principle_check,
+        "do_now": playbook["do_now"],
+        "how_to_follow": playbook["how_to_follow"],
+        "test_plan": playbook["test_plan"],
+        "evidence_gaps": evidence_gaps[:3],
+        "judgement_fields": judgement_fields,
+        "decision_scorecard": scorecard,
+        "decision_tags": decision_tags,
+        "required_validation": required_validation,
+        "validation_summary": validation_summary,
+        "validation_tasks": _profit_command_compact_list(item.get("validation_tasks") or required_validation.get("pending_tasks"), 8),
+        "validation_blocking": _profit_command_compact_list(item.get("validation_blocking") or required_validation.get("blocking_missing"), 6),
+    }
+
+
+def _profit_command_monitoring_insights(loop: dict, monitor: dict, refresh_status: dict) -> dict:
+    summary = loop.get("summary", {}) if isinstance(loop, dict) else {}
+    live_alerts: list[dict] = []
+
+    new_products = int(_profit_command_money(refresh_status.get("new_products"), 0))
+    price_changes = int(_profit_command_money(refresh_status.get("price_changes"), 0))
+    updated_products = int(_profit_command_money(refresh_status.get("updated_products"), 0))
+    baseline_kept = int(_profit_command_money(refresh_status.get("baseline_kept_count"), 0))
+    top_ad_count = int(_profit_command_money(summary.get("top_ad_count"), 0))
+    important_with_ads = int(_profit_command_money(summary.get("important_20_with_ads"), 0))
+    under_50_pct = _profit_command_money(monitor.get("under_50_pct"), 0)
+
+    if new_products:
+        live_alerts.append({
+            "label": "新品测试",
+            "value": new_products,
+            "text": "本轮发现新 SKU，先看是否有广告/社区证据，不把上新当需求。",
+        })
+    if price_changes:
+        live_alerts.append({
+            "label": "价格/促销变化",
+            "value": price_changes,
+            "text": "价格变化要结合毛利和频率判断：放量、清库存，还是价格战。",
+        })
+    if updated_products:
+        live_alerts.append({
+            "label": "页面/商品更新",
+            "value": updated_products,
+            "text": "更新过的 PDP 更值得拆首屏、评价、FAQ、bundle 和订阅布局。",
+        })
+    if top_ad_count:
+        live_alerts.append({
+            "label": "广告验真",
+            "value": top_ad_count,
+            "text": f"重要候选里已有 {important_with_ads} 个命中广告，优先拆长期投放素材。",
+        })
+    else:
+        live_alerts.append({
+            "label": "广告缺口",
+            "value": 0,
+            "text": "当前重要候选还没命中广告，先补 Meta/Google/TikTok/Reddit 证据。",
+        })
+    if under_50_pct >= 60:
+        live_alerts.append({
+            "label": "低客单拥挤",
+            "value": round(under_50_pct, 1),
+            "text": "低于 $50 的产品占比高，必须靠 bundle、复购或高毛利避开纯价格战。",
+        })
+    if baseline_kept:
+        live_alerts.append({
+            "label": "历史基线保留",
+            "value": baseline_kept,
+            "text": "部分站点当前抓空但保留历史快照，避免把反爬/临时失败误判成没机会。",
+        })
+
+    return {
+        "principle": "竞品监控不是为了抄，而是用对手花钱和用户抱怨来降低试错成本。",
+        "source": "Reddit Shopify/ecommerce/PPC/dropshipping 讨论归纳 + 本地竞品快照",
+        "first_principles": _PROFIT_FIRST_PRINCIPLES,
+        "first_principle_rules": _PROFIT_FIRST_PRINCIPLE_RULES,
+        "decision_equation": "行动价值 = 需求证据 × 经济空间 × 差异化 × 履约确定性 × 时间窗口 - 执行成本",
+        "signals": _PROFIT_MONITORING_SIGNALS,
+        "lane_rules": _PROFIT_LANE_RULES,
+        "money_rules": [
+            "先算利润，再看竞品：不知道 COGS、运费、目标 CPA，所有价格变化都是噪音。",
+            "广告持续存在比单次上新更有价值；对手愿意继续花钱，才值得拆 offer。",
+            "促销要看频率和产品：快销品小折扣比冷门品大折扣更危险。",
+            "评论和 Reddit 抱怨优先转成差异化卖点，不直接复制同款同价。",
+            "新品先进入跟进池；硬风险暂不跟也有价值，因为它帮你省掉不可逆亏损。",
+        ],
+        "live_alerts": live_alerts[:6],
+        "community_basis": _PROFIT_COMMUNITY_BASIS,
+        "community_source_links": _PROFIT_COMMUNITY_SOURCE_LINKS,
+    }
+
+
+def _profit_command_pick_names(items: list[dict], limit: int = 3) -> list[str]:
+    names: list[str] = []
+    for item in items[:limit]:
+        title = str(item.get("title") or "").strip()
+        domain = str(item.get("domain") or "").strip()
+        if title and domain:
+            names.append(f"{title} · {domain}")
+        elif title:
+            names.append(title)
+        elif domain:
+            names.append(domain)
+    return names
+
+
+def _profit_command_bottleneck_summary(items: list[dict]) -> dict:
+    """Summarize why the active queue cannot move faster."""
+
+    if not items:
+        return {"summary": "暂无候选短板。", "top_labels": [], "actions": [], "tag_counts": []}
+
+    label_counts: Counter[str] = Counter()
+    tag_counts: Counter[str] = Counter()
+    reasons: dict[str, str] = {}
+    for item in items:
+        for tag in item.get("decision_tags") or []:
+            tag_counts[str(tag)] += 1
+        for card in item.get("decision_scorecard") or []:
+            label = str(card.get("label") or "").strip()
+            state = str(card.get("state") or "").strip()
+            if not label or state == "pass":
+                continue
+            label_counts[label] += 1
+            reasons.setdefault(label, str(card.get("reason") or card.get("text") or ""))
+
+    top = label_counts.most_common(3)
+    if not top:
+        return {
+            "summary": "主要门槛已过，机会动作：只做小预算验证。",
+            "top_labels": [],
+            "actions": ["按首测预算投放，严格执行止损线。"],
+            "tag_counts": tag_counts.most_common(6),
+        }
+
+    action_map = {
+        "利润": "先核 COGS、运费、退货率和目标 CPA；没有 CPA 余量不进广告。",
+        "需求": "先补广告库、趋势、Reddit/评论/UGC 证据；没有行为证据不进强跟。",
+        "承接": "先补素材包、PDP 图片/视频、评价证明和首屏承诺。",
+        "风险": "先清合规、IP、物流和供应链硬风险；挡住会吞利润的品。",
+        "执行": "补首测预算、止损线和放量规则；没有测试单不发布。",
+    }
+    top_text = "；".join(f"{label}{count}个" for label, count in top)
+    return {
+        "summary": f"当前最大短板：{top_text}。",
+        "top_labels": [{"label": label, "count": count, "reason": reasons.get(label, "")} for label, count in top],
+        "actions": [action_map.get(label, f"补齐{label}门槛。") for label, _ in top],
+        "tag_counts": tag_counts.most_common(6),
+    }
+
+
+def _profit_command_operator_brief(
+    can_follow: list[dict],
+    can_prepare: list[dict],
+    need_proof: list[dict],
+    cannot_follow: list[dict],
+    low_priority: list[dict],
+) -> dict:
+    """One-screen operator brief: what to follow, what to do, and how to follow."""
+
+    if can_follow:
+        mode = "follow_now"
+        headline = f"今天强跟 {len(can_follow)} 个：建 DRAFT，小预算验证，不铺货。"
+        target_lane = "强趋势跟"
+        primary = can_follow
+        do_today = [
+            "给前 3 个可跟品建 Shopify DRAFT，先不发布。",
+            "接真实 COGS/运费/库存，确认保本 CPA 仍然有空间。",
+            "每个品做 3 套素材：痛点演示、差评反打、bundle/优惠锚点。",
+        ]
+        how = [
+            "跟需求和 offer，不跟页面皮肤。",
+            "用更强证明、更好套装、更清楚承诺切入。",
+            "先用小预算验证 CTR/CVR/CAC，亏损信号一出现就停。",
+        ]
+    elif can_prepare:
+        mode = "teardown_first"
+        headline = f"今天轻跟 {len(can_prepare)} 个：先拆最可能赚钱的竞品。"
+        target_lane = "轻跟先拆"
+        primary = can_prepare
+        do_today = [
+            "拆前 3 个竞品的广告钩子、首屏承诺、价格锚点和证明模块。",
+            "找 Reddit/评论里的抱怨，把抱怨转成差异化卖点。",
+            "同步补供应链报价，利润不清不建 DRAFT。",
+        ]
+        how = [
+            "只复用被市场验证的卖点结构。",
+            "换角度、换证明、换套装，避免同款同价。",
+            "广告越热，越要找细分人群或反向痛点。",
+        ]
+    elif need_proof:
+        mode = "prove_first"
+        headline = f"今天补证跟 {len(need_proof)} 个：新品继续入池，自动补证。"
+        target_lane = "补证跟"
+        primary = need_proof
+        do_today = [
+            "给前 3 个候选补 Meta/Google/TikTok 广告证据。",
+            "补 Reddit/YouTube/TikTok/Amazon 评论，找真实购买理由。",
+            "补到至少 2 类严格验真后，再进入素材拆解。",
+        ]
+        how = [
+            "先证明有人买，再证明我们能更好成交。",
+            "页面好看不是需求，持续广告/评论/补货才是行为证据。",
+            "证据不足时，最赚钱的动作是自动补证和轻量测试准备。",
+        ]
+    elif cannot_follow:
+        mode = "avoid_loss"
+        headline = f"今天只拦 {len(cannot_follow)} 个硬风险机会。"
+        target_lane = "硬风险暂不跟"
+        primary = cannot_follow
+        do_today = [
+            "不建 DRAFT，不投广告，不占用上架时间。",
+            "只记录硬风险原因：合规/IP、履约不可控、假货无效、贡献毛利确定为负。",
+            "等 COGS、广告、趋势或风险证据改善后再重新进入队列。",
+        ]
+        how = [
+            "硬风险暂不跟也是赚钱：省掉不可逆亏损。",
+            "不要为了有产品可做而做产品。",
+            "只跟贡献毛利能覆盖 CAC 的机会。",
+        ]
+    else:
+        mode = "watch"
+        headline = "今天没有足够强的赚钱信号，只监控变化。"
+        target_lane = "低优先监控"
+        primary = low_priority
+        do_today = [
+            "继续跑全站扫描，等新品、价格、广告、评论或库存出现连续变化。",
+            "只记录变化，不做素材、不建 DRAFT。",
+            "下一轮重算后再决定是否进入补证或拆素材。",
+        ]
+        how = [
+            "单点信号不行动，连续变化才升级。",
+            "执行资源只给高胜率机会。",
+            "低优先产品不抢今天的动作位。",
+        ]
+
+    bottleneck = _profit_command_bottleneck_summary(primary)
+    if bottleneck.get("actions"):
+        do_today = (do_today[:2] + bottleneck["actions"][:1])[:3]
+    if bottleneck.get("summary") and bottleneck["summary"] != "暂无候选短板。":
+        how = (how[:2] + [bottleneck["summary"]])[:3]
+
+    return {
+        "mode": mode,
+        "headline": headline,
+        "target_lane": target_lane,
+        "follow_these": _profit_command_pick_names(primary, 5),
+        "do_today": do_today,
+        "how_to_follow": how,
+        "bottleneck": bottleneck,
+        "thinking": [
+            "先问利润：售价 - COGS - 履约 - 退货 - CAC 是否还能赚钱。",
+            "再问需求：对手是否持续投广告、补货、扩变体、被真实用户讨论。",
+            "最后问跟法：我们能否用差异化证明、套装、承诺或人群切口更便宜成交。",
+        ],
+    }
+
+
+@app.get("/api/dashboard/profit-command")
+def api_profit_command(limit: int = Query(50, ge=10, le=100)):
+    """Small profit-first command payload for the simplified homepage."""
+
+    monitor = api_summary()
+    latest = get_latest_profit_pipeline()
+    loop = _build_v2_closed_loop(latest, cycles=3, limit=limit)
+    if not isinstance(loop, dict) or not loop.get("ok"):
+        loop = {
+            "ok": False,
+            "summary": {},
+            "items": [],
+            "rounds": [],
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "warnings": [loop.get("error", "No workbench payload")] if isinstance(loop, dict) else ["No workbench payload"],
+        }
+
+    items = loop.get("items") if isinstance(loop.get("items"), list) else []
+    auto_lane_items = {
+        "auto_follow_now": [],
+        "auto_teardown_first": [],
+        "auto_prove_first": [],
+        "auto_do_not_follow": [],
+        "auto_low_priority": [],
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        lane, enriched = _ai_autopilot_enrich_follow_item(item)
+        auto_lane_items.setdefault(lane, []).append(enriched)
+    for lane in auto_lane_items:
+        auto_lane_items[lane] = _ai_autopilot_sort_lane(auto_lane_items[lane])
+
+    can_follow = [_profit_command_item(item) for item in auto_lane_items["auto_follow_now"]]
+    can_prepare = [_profit_command_item(item) for item in auto_lane_items["auto_teardown_first"]]
+    need_proof = [_profit_command_item(item) for item in auto_lane_items["auto_prove_first"]]
+    cannot_follow = [_profit_command_item(item) for item in auto_lane_items["auto_do_not_follow"]]
+    low_priority = [_profit_command_item(item) for item in auto_lane_items["auto_low_priority"]]
+
+    stats = latest.get("stats", {}) if isinstance(latest, dict) else {}
+    refresh_status = _monitor_refresh_status_copy()
+    try:
+        scrape_precision = read_cached_scrape_precision(MONITOR_DIR, limit=12, max_age_seconds=900)
+    except Exception as exc:
+        scrape_precision = {"ok": False, "error": f"{exc.__class__.__name__}: {exc}", "summary": {}, "focus_domains": []}
+    autopilot = _ai_autopilot_status_copy(raw=True)
+    autopilot_assessment = _ai_autopilot_quality_assessment(monitor=monitor, latest=latest, loop=loop)
+    autopilot_queue = _ai_autopilot_build_follow_queue(latest=latest, loop=loop, limit=limit)
+    autopilot.update(
+        last_assessment=autopilot_assessment,
+        data_quality=autopilot_assessment.get("data_quality", {}),
+        evidence_quality=autopilot_assessment.get("evidence_quality", {}),
+        judgement_quality=autopilot_assessment.get("judgement_quality", {}),
+        auto_follow_queue=autopilot_queue.get("lanes", {}),
+        auto_selection_summary={k: v for k, v in autopilot_queue.items() if k != "lanes"},
+        next_auto_actions=autopilot_assessment.get("next_auto_actions", []),
+        safe_gates=[
+            "自动选品、自动补证、自动重算跟品队列",
+            "自动给出跟哪些、平台趋势、怎么跟、不能跟原因",
+            "不自动花广告费",
+            "不自动发布商品",
+        ],
+    )
+    return {
+        "ok": True,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "monitor": {
+            "stores": monitor.get("total_registered_stores", monitor.get("total_stores", 0)),
+            "registered_stores": monitor.get("total_registered_stores", monitor.get("total_stores", 0)),
+            "snapshot_stores": monitor.get("total_snapshot_stores", monitor.get("total_stores", 0)),
+            "registry_target": monitor.get("registry_target", STORE_REGISTRY_TARGET),
+            "registry_coverage_pct": monitor.get("registry_coverage_pct", 0),
+            "registry_without_snapshot": monitor.get("registry_without_snapshot", 0),
+            "scan_queue_pending": monitor.get("scan_queue_pending", 0),
+            "registry_sources": monitor.get("registry_sources", []),
+            "products": monitor.get("total_products", 0),
+            "active_1d": monitor.get("active_1d", 0),
+            "active_3d": monitor.get("active_3d", 0),
+            "median_price": monitor.get("median_price", 0),
+            "under_50_pct": monitor.get("under_50_pct", 0),
+            "generated_at": monitor.get("generated_at", ""),
+        },
+        "funnel": loop.get("summary", {}),
+        "rounds": loop.get("rounds", []),
+        "stats": {
+            "ready_to_test": stats.get("ready_to_test", 0),
+            "traffic_validated": stats.get("traffic_validated_products", 0),
+            "observe": stats.get("observe_products", 0),
+            "avoid": stats.get("avoid_products", 0),
+            "unit_economics_ready": stats.get("unit_economics_ready_products", 0),
+            "supply_to_verify": stats.get("supply_to_verify_products", 0),
+        },
+        "lanes": {
+            "can_follow_now": can_follow[:12],
+            "can_prepare": can_prepare[:20],
+            "need_proof": need_proof[:20],
+            "cannot_follow": cannot_follow[:20],
+            "low_priority": low_priority[:20],
+        },
+        "operator_brief": _profit_command_operator_brief(can_follow, can_prepare, need_proof, cannot_follow, low_priority),
+        "monitoring_insights": _profit_command_monitoring_insights(loop, monitor, refresh_status),
+        "ai_autopilot": autopilot,
+        "data_precision": autopilot_assessment,
+        "scrape_precision": {
+            "ok": scrape_precision.get("ok", False),
+            "version": scrape_precision.get("version"),
+            "summary": scrape_precision.get("summary", {}),
+            "focus_domains": scrape_precision.get("focus_domains", [])[:5],
+            "refresh_endpoint": "/api/scrape-precision/refresh-focus",
+        },
+        "warnings": loop.get("warnings", []),
+        "source_generated_at": loop.get("source_generated_at", ""),
+    }
+
+
+@app.post("/api/gtrends/background/start")
+def api_gtrends_background_start(
+    source: str = Query("v2"),
+    limit: int = Query(50, ge=1, le=300),
+    geo: str = Query("US", min_length=0, max_length=8),
+    timeframe: str = Query("today 12-m", min_length=1, max_length=32),
+    interval_seconds: int = Query(30, ge=5, le=600),
+    workers: int = Query(1, ge=1, le=2),
+):
+    """Start a slow, background Google Trends validation job in batches of 5 keywords."""
+
+    global _GTRENDS_BG_THREAD
+    with _GTRENDS_BG_LOCK:
+        already_running = bool(_GTRENDS_BG_STATUS.get("running"))
+    if already_running:
+        return {**_gtrends_status_copy(), "started": False, "already_running": True}
+
+    keywords, meta = _gtrends_collect_keywords(source, limit)
+    if not keywords:
+        raise HTTPException(status_code=400, detail="没有可验证的关键词")
+
+    normalized_source = (source or "v2").lower().replace("-", "_")
+    geo = (geo or "US").upper()
+    _GTRENDS_BG_THREAD = threading.Thread(
+        target=_run_gtrends_background_job,
+        args=(keywords, normalized_source, geo, timeframe, interval_seconds, workers),
+        daemon=True,
+    )
+    _GTRENDS_BG_THREAD.start()
+    time.sleep(0.05)
+    return {
+        **_gtrends_status_copy(),
+        "started": True,
+        "already_running": False,
+        "selection_meta": meta,
+    }
+
+
+@app.get("/api/gtrends/background/status")
+def api_gtrends_background_status():
+    """Return current Google Trends background validation status."""
+
+    return _gtrends_status_copy()
+
+
+# ═══════════════════════════════════════════════════════════
+#  新品雷达 (Product Diff) — Shopify /products.json diff + 评分引擎
+# ═══════════════════════════════════════════════════════════
+
+SCORE_STORE = MONITOR_DIR / "radar_scores.json"
+DIFF_STORE  = MONITOR_DIR / "radar_diffs.json"
+AI_STORE    = MONITOR_DIR / "radar_ai_shopping.json"
+
+
+def _load_radar_data():
+    scores = {}
+    if SCORE_STORE.exists():
+        try: scores = json.loads(SCORE_STORE.read_text(encoding="utf-8"))
+        except: pass
+    diffs = {}
+    if DIFF_STORE.exists():
+        try: diffs = json.loads(DIFF_STORE.read_text(encoding="utf-8"))
+        except: pass
+    ai_data = {}
+    if AI_STORE.exists():
+        try: ai_data = json.loads(AI_STORE.read_text(encoding="utf-8"))
+        except: pass
+    return scores, diffs, ai_data
+
+
+def _save_radar_scores(scores):
+    SCORE_STORE.parent.mkdir(parents=True, exist_ok=True)
+    SCORE_STORE.write_text(json.dumps(scores, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _save_radar_diffs(diffs):
+    DIFF_STORE.parent.mkdir(parents=True, exist_ok=True)
+    DIFF_STORE.write_text(json.dumps(diffs, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _save_ai_data(ai_data):
+    AI_STORE.parent.mkdir(parents=True, exist_ok=True)
+    AI_STORE.write_text(json.dumps(ai_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _clean_product_text(value, limit: int = 900) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, dict):
+        value = " ".join(str(v) for v in value.values() if v not in (None, ""))
+    elif isinstance(value, (list, tuple, set)):
+        value = " ".join(str(v) for v in value if v not in (None, ""))
+    text = html.unescape(str(value))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _keyword_hit(text: str, keyword: str) -> bool:
+    keyword = str(keyword or "").lower().strip()
+    if not keyword:
+        return False
+    if re.match(r"^[a-z0-9][a-z0-9 +&'/-]*[a-z0-9]$", keyword):
+        pattern = r"(?<![a-z0-9])" + re.escape(keyword).replace(r"\ ", r"\s+") + r"(?![a-z0-9])"
+        return re.search(pattern, text) is not None
+    return keyword in text
+
+
+def _kw_any(text: str, words) -> bool:
+    return any(_keyword_hit(text, w) for w in words)
+
+
+_PRODUCT_TAXONOMY_RULES = [
+    {
+        "id": "gift_jewelry",
+        "category_group": "Gift & Personalized",
+        "specific_category": "情绪礼品饰品",
+        "use_case": "纪念日/节日送礼和情绪价值表达",
+        "pain_point": "用户想送有记忆点、能表达关系的礼物",
+        "audience": "情侣、家人、宠物主人、纪念礼物买家",
+        "novelty_signal": "个性化/纪念/情绪价值，适合小垂直站快速测礼品场景",
+        "creative_angle": "送礼对象 + 情绪故事 + 个性化效果展示",
+        "keywords": ["personalized", "custom", "engraved", "name necklace", "photo necklace", "birthstone", "memorial", "couple", "gift", "mother", "father", "jewelry", "ring", "necklace", "bracelet", "heart", "love", "anniversary"],
+        "weight": 8,
+    },
+    {
+        "id": "beauty_device",
+        "category_group": "Beauty Device",
+        "specific_category": "家用美容仪",
+        "use_case": "在家完成美容护理，替代部分线下护理",
+        "pain_point": "皮肤、毛发、紧致、痘印或衰老问题需要可视化改善",
+        "audience": "25-55岁美容护理、抗老、脱毛和护肤人群",
+        "novelty_signal": "LED/EMS/RF/IPL 等技术词强，短视频前后对比容易表达",
+        "creative_angle": "前后对比 + 使用过程演示 + 家用省钱逻辑",
+        "keywords": ["led", "red light", "blue light", "microcurrent", "ems", "rf", "radio frequency", "ipl", "laser", "hair removal", "acne", "wrinkle", "anti aging", "skin tightening", "face mask", "beauty device", "facial", "skincare"],
+        "weight": 10,
+    },
+    {
+        "id": "massage_recovery",
+        "category_group": "Massage & Recovery",
+        "specific_category": "按摩放松工具",
+        "use_case": "缓解颈肩腰腿疲劳，做居家放松和运动恢复",
+        "pain_point": "久坐、运动后酸痛、肌肉紧张或局部疲劳",
+        "audience": "办公室久坐人群、健身人群、中老年礼品买家",
+        "novelty_signal": "痛点清晰且演示强，适合问题-演示-结果广告结构",
+        "creative_angle": "痛点部位特写 + 15秒使用演示 + 放松结果",
+        "keywords": ["massager", "massage", "neck", "shoulder", "back", "knee", "foot", "feet", "heat", "heated", "vibration", "muscle", "recovery", "relief", "tension"],
+        "weight": 9,
+    },
+    {
+        "id": "posture_support",
+        "category_group": "Pain Relief & Support",
+        "specific_category": "姿势矫正/支撑护具",
+        "use_case": "改善姿势、支撑关节或降低日常活动不适",
+        "pain_point": "姿势差、足弓/关节/腰背支撑不足",
+        "audience": "久站久坐、运动恢复、足部或关节支撑需求人群",
+        "novelty_signal": "问题解决型，能用前后姿态或受力变化做素材",
+        "creative_angle": "错误姿势/疼点开场 + 支撑原理 + 日常佩戴场景",
+        "keywords": ["posture", "brace", "support", "orthotic", "insole", "compression", "sleeve", "corrector", "splint", "arch support", "lumbar", "ankle", "wrist", "elbow"],
+        "weight": 9,
+    },
+    {
+        "id": "pet",
+        "category_group": "Pet",
+        "specific_category": "宠物工具/用品",
+        "use_case": "解决宠物清洁、喂养、训练、玩耍或出行问题",
+        "pain_point": "掉毛、异味、喂养麻烦、宠物无聊或训练困难",
+        "audience": "狗/猫主人、宠物礼品买家",
+        "novelty_signal": "宠物场景天然有UGC，演示和情绪传播强",
+        "creative_angle": "宠物真实反应 + 主人痛点 + 使用前后变化",
+        "keywords": ["pet", "dog", "cat", "puppy", "kitten", "grooming", "fur", "hair remover", "leash", "harness", "feeder", "litter", "toy", "training", "paw", "bark"],
+        "weight": 9,
+    },
+    {
+        "id": "home_cleaning",
+        "category_group": "Home Cleaning",
+        "specific_category": "家居清洁工具",
+        "use_case": "快速清洁污渍、毛发、缝隙或难处理区域",
+        "pain_point": "清洁费时、污渍难除、死角难处理",
+        "audience": "家庭主妇/主夫、租房人群、宠物家庭、车主",
+        "novelty_signal": "脏到干净变化明显，适合强视觉演示",
+        "creative_angle": "脏污特写 + 一刷/一喷/一擦对比 + 省时结果",
+        "keywords": ["cleaner", "cleaning", "brush", "scrubber", "mop", "vacuum", "stain", "lint", "dust", "spray", "washer", "remove", "remover", "electric brush"],
+        "weight": 8,
+    },
+    {
+        "id": "home_organization",
+        "category_group": "Home Organization",
+        "specific_category": "收纳整理工具",
+        "use_case": "提升厨房、衣柜、桌面、浴室或车内空间利用率",
+        "pain_point": "空间乱、拿取麻烦、东西不好分类",
+        "audience": "小户型、租房、家庭收纳和办公室人群",
+        "novelty_signal": "前后对比强，适合做空间改善素材",
+        "creative_angle": "混乱场景开场 + 安装/折叠演示 + 整洁结果",
+        "keywords": ["organizer", "storage", "rack", "shelf", "hanger", "holder", "closet", "drawer", "cabinet", "space saving", "foldable", "mount", "wall mounted"],
+        "weight": 7,
+    },
+    {
+        "id": "kitchen_gadget",
+        "category_group": "Kitchen Gadget",
+        "specific_category": "厨房新奇工具",
+        "use_case": "让切、洗、煮、保存、饮品制作更快更省力",
+        "pain_point": "备菜麻烦、厨房效率低、清洗收纳不方便",
+        "audience": "家庭做饭人群、烘焙/咖啡爱好者、礼品买家",
+        "novelty_signal": "新奇特小工具，演示几秒内能看懂价值",
+        "creative_angle": "传统做法很麻烦 + 工具一键完成 + 成品展示",
+        "keywords": ["kitchen", "slicer", "chopper", "cutter", "peeler", "strainer", "bottle", "coffee", "grinder", "oil sprayer", "air fryer", "baking", "food storage"],
+        "weight": 7,
+    },
+    {
+        "id": "car_accessory",
+        "category_group": "Car Accessory",
+        "specific_category": "汽车配件/车内工具",
+        "use_case": "改善车内收纳、清洁、安全、充电或驾驶便利",
+        "pain_point": "车内凌乱、手机固定难、清洁难或驾驶体验差",
+        "audience": "通勤车主、家庭车主、户外自驾人群",
+        "novelty_signal": "场景明确，可用车内前后对比和安装演示",
+        "creative_angle": "车内痛点 + 10秒安装 + 开车场景收益",
+        "keywords": ["car", "auto", "vehicle", "seat", "dashboard", "windshield", "tire", "trunk", "carplay", "phone mount", "cup holder", "car charger"],
+        "weight": 7,
+    },
+    {
+        "id": "phone_electronics",
+        "category_group": "Phone & Electronics",
+        "specific_category": "手机/数码小配件",
+        "use_case": "提升充电、拍摄、连接、桌面或移动使用体验",
+        "pain_point": "充电慢、线材乱、拍摄不稳、设备使用不方便",
+        "audience": "手机重度用户、内容创作者、办公桌面人群",
+        "novelty_signal": "磁吸/无线/便携等卖点容易做功能演示",
+        "creative_angle": "旧方案不方便 + 新配件一秒解决 + 多场景展示",
+        "keywords": ["phone", "iphone", "android", "charger", "magsafe", "magnetic", "wireless", "bluetooth", "earbuds", "camera", "printer", "projector", "stand", "cable"],
+        "weight": 7,
+    },
+    {
+        "id": "baby_kids",
+        "category_group": "Baby & Kids",
+        "specific_category": "母婴儿童用品",
+        "use_case": "提升喂养、安抚、安全、出行或亲子便利",
+        "pain_point": "育儿流程麻烦、安全焦虑、孩子无聊或难安抚",
+        "audience": "新手父母、儿童礼品买家",
+        "novelty_signal": "父母痛点强，但素材与合规表述要谨慎",
+        "creative_angle": "父母真实场景 + 省心步骤 + 安全/舒适结果",
+        "keywords": ["baby", "toddler", "kids", "child", "children", "stroller", "teether", "bottle", "pacifier", "nursery", "diaper", "child safety"],
+        "weight": 7,
+    },
+    {
+        "id": "fitness",
+        "category_group": "Fitness",
+        "specific_category": "健身训练小器械",
+        "use_case": "居家训练、塑形、拉伸或运动表现提升",
+        "pain_point": "没时间去健身房、训练动作难坚持、恢复不足",
+        "audience": "居家健身、塑形、运动恢复人群",
+        "novelty_signal": "动作演示强，适合挑战/跟练型内容",
+        "creative_angle": "目标部位 + 30秒动作演示 + 居家训练结果",
+        "keywords": ["fitness", "workout", "gym", "resistance", "yoga", "abs", "muscle", "trainer", "exercise", "stretch", "pilates", "strength"],
+        "weight": 7,
+    },
+    {
+        "id": "outdoor_garden",
+        "category_group": "Outdoor & Garden",
+        "specific_category": "户外/园艺工具",
+        "use_case": "改善庭院、露营、照明、浇灌或户外收纳",
+        "pain_point": "户外维护麻烦、露营携带不便、夜间照明不足",
+        "audience": "庭院家庭、露营爱好者、DIY园艺人群",
+        "novelty_signal": "季节性和场景强，适合按天气/季节测试",
+        "creative_angle": "户外麻烦场景 + 工具演示 + 季节性Offer",
+        "keywords": ["garden", "outdoor", "camping", "solar", "plant", "hose", "patio", "lantern", "flashlight", "bbq", "grill", "waterproof"],
+        "weight": 6,
+    },
+    {
+        "id": "travel",
+        "category_group": "Travel",
+        "specific_category": "旅行便携用品",
+        "use_case": "让出差、旅行、收纳、洗漱或随身携带更轻便",
+        "pain_point": "行李乱、空间不够、外出携带不方便",
+        "audience": "旅行者、通勤者、出差人群",
+        "novelty_signal": "便携/折叠/多功能卖点适合对比演示",
+        "creative_angle": "普通携带很乱 + 便携收纳演示 + 出行场景",
+        "keywords": ["travel", "luggage", "passport", "toiletry", "portable", "packing cube", "carry on", "backpack", "foldable bag"],
+        "weight": 6,
+    },
+    {
+        "id": "fashion_accessory",
+        "category_group": "Fashion Accessory",
+        "specific_category": "穿戴/时尚配件",
+        "use_case": "提升穿搭、塑形、通勤收纳或日常便利",
+        "pain_point": "穿搭不完整、身形修饰、随身物品不好带",
+        "audience": "女性穿搭、通勤、礼品和社媒内容人群",
+        "novelty_signal": "视觉审美强，需找差异化款式或套装",
+        "creative_angle": "穿搭前后对比 + 使用细节 + 场景套装",
+        "keywords": ["bag", "purse", "wallet", "shapewear", "bra", "leggings", "sunglasses", "hat", "belt", "scarf", "crossbody", "tote"],
+        "weight": 5,
+    },
+    {
+        "id": "toy_hobby",
+        "category_group": "Toy & Hobby",
+        "specific_category": "玩具/手作新奇品",
+        "use_case": "解压、亲子互动、桌面娱乐或手作创作",
+        "pain_point": "无聊、压力大、亲子互动缺少新玩法",
+        "audience": "亲子家庭、礼品买家、桌面解压人群",
+        "novelty_signal": "新奇和可玩性强，依赖短视频展示玩法",
+        "creative_angle": "玩法开场 + 反应镜头 + 送礼/解压场景",
+        "keywords": ["toy", "puzzle", "game", "craft", "diy", "model", "sensory", "fidget", "plush", "drawing", "paint"],
+        "weight": 5,
+    },
+    {
+        "id": "wellness_sleep",
+        "category_group": "Wellness & Sleep",
+        "specific_category": "睡眠/舒缓健康用品",
+        "use_case": "改善睡眠、放松、空气、香氛或日常舒适度",
+        "pain_point": "睡不好、压力大、空气干燥或放松困难",
+        "audience": "睡眠焦虑、居家舒缓、办公室人群",
+        "novelty_signal": "痛点明确，但健康功效表述需要保守",
+        "creative_angle": "睡前痛点 + 使用仪式感 + 第二天状态",
+        "keywords": ["sleep", "pillow", "snore", "eye mask", "humidifier", "aromatherapy", "diffuser", "essential oil", "stress", "relax", "comfort"],
+        "weight": 6,
+    },
+]
+
+
+_MICRO_PRODUCT_RULES = [
+    {"specific_category": "宠物除毛刷/粘毛器", "product_shape": "手持清洁工具", "core_mechanism": "刷洗/刮除毛发", "demo_scene": "沙发、地毯、衣物毛发前后对比", "keywords": ["pet hair remover", "fur remover", "hair remover", "lint roller", "grooming brush", "deshedding"]},
+    {"specific_category": "宠物自动喂水/喂食器", "product_shape": "宠物喂养设备", "core_mechanism": "自动补水/定量喂食", "demo_scene": "主人不在家也能稳定喂养", "keywords": ["pet feeder", "automatic feeder", "water fountain", "pet fountain", "feeding bowl"]},
+    {"specific_category": "宠物牵引/车载出行用品", "product_shape": "宠物出行配件", "core_mechanism": "固定、防挣脱、便携出行", "demo_scene": "遛狗/车内/旅行安全固定", "keywords": ["leash", "harness", "dog seat belt", "pet carrier", "travel bag"]},
+    {"specific_category": "LED/红光面罩美容仪", "product_shape": "家用美容设备", "core_mechanism": "光疗/红蓝光护理", "demo_scene": "戴上使用过程 + 肤况前后对比", "keywords": ["led mask", "red light mask", "light therapy mask", "blue light mask"]},
+    {"specific_category": "IPL/激光脱毛仪", "product_shape": "家用美容设备", "core_mechanism": "光电脱毛", "demo_scene": "腿部/腋下使用流程 + 周期效果", "keywords": ["ipl", "hair removal", "laser hair removal"]},
+    {"specific_category": "EMS/RF脸部紧致仪", "product_shape": "家用美容设备", "core_mechanism": "微电流/射频紧致", "demo_scene": "脸部提拉动作 + 轮廓前后对比", "keywords": ["microcurrent", "ems", "rf", "radio frequency", "skin tightening"]},
+    {"specific_category": "颈肩热敷按摩器", "product_shape": "穿戴按摩设备", "core_mechanism": "热敷/震动/揉捏放松", "demo_scene": "久坐疼点开场 + 佩戴放松", "keywords": ["neck massager", "shoulder massager", "heated neck", "neck and shoulder"]},
+    {"specific_category": "足部按摩/足底放松器", "product_shape": "居家放松设备", "core_mechanism": "滚轮/气压/热敷放松", "demo_scene": "下班脚酸 + 足底按摩反馈", "keywords": ["foot massager", "feet massager", "foot roller", "heated foot"]},
+    {"specific_category": "膝盖/关节热敷护具", "product_shape": "穿戴支撑护具", "core_mechanism": "热敷/压缩/支撑", "demo_scene": "上下楼/运动后关节不适场景", "keywords": ["knee brace", "heated knee", "knee massager", "joint support"]},
+    {"specific_category": "姿势矫正带/背部支撑", "product_shape": "穿戴矫正护具", "core_mechanism": "肩背拉伸支撑", "demo_scene": "驼背前后姿态对比", "keywords": ["posture corrector", "posture brace", "back brace", "lumbar support"]},
+    {"specific_category": "鞋垫/足弓支撑", "product_shape": "穿戴足部配件", "core_mechanism": "足弓承托/缓震", "demo_scene": "久站/走路足底受力变化", "keywords": ["insole", "orthotic", "arch support", "heel cushion"]},
+    {"specific_category": "电动刷洗清洁器", "product_shape": "电动清洁工具", "core_mechanism": "旋转刷头去污", "demo_scene": "浴室缝隙/锅底/地砖一刷变干净", "keywords": ["electric scrubber", "spin scrubber", "cleaning brush", "power scrubber"]},
+    {"specific_category": "污渍清洁喷剂/去污工具", "product_shape": "清洁耗材/工具", "core_mechanism": "喷涂溶解/擦除污渍", "demo_scene": "顽固污渍前后对比", "keywords": ["stain remover", "cleaning spray", "spot remover", "grout cleaner"]},
+    {"specific_category": "毛发/绒毛清理工具", "product_shape": "手持清洁工具", "core_mechanism": "刮除/粘附毛絮", "demo_scene": "衣服、沙发、车座毛絮清除", "keywords": ["lint remover", "fabric shaver", "hair remover", "fur remover"]},
+    {"specific_category": "厨房切菜/削皮工具", "product_shape": "厨房手动工具", "core_mechanism": "切削/省力备菜", "demo_scene": "传统备菜麻烦 vs 一步完成", "keywords": ["slicer", "chopper", "cutter", "peeler", "mandoline"]},
+    {"specific_category": "咖啡/饮品小工具", "product_shape": "厨房饮品工具", "core_mechanism": "研磨/萃取/搅拌/便携饮用", "demo_scene": "在家/办公室快速做饮品", "keywords": ["coffee grinder", "milk frother", "espresso", "portable blender", "cold brew"]},
+    {"specific_category": "厨房密封/食物保存工具", "product_shape": "厨房收纳耗材", "core_mechanism": "密封、防潮、延长保存", "demo_scene": "食材凌乱/变质痛点前后对比", "keywords": ["food storage", "vacuum sealer", "sealer", "storage bag", "fresh keeper"]},
+    {"specific_category": "衣柜/衣架收纳工具", "product_shape": "空间收纳工具", "core_mechanism": "挂放/折叠/分层", "demo_scene": "衣柜杂乱到整齐的前后对比", "keywords": ["closet organizer", "hanger", "wardrobe", "clothes organizer"]},
+    {"specific_category": "抽屉/桌面收纳盒", "product_shape": "空间收纳工具", "core_mechanism": "分格/叠放/快速拿取", "demo_scene": "桌面、抽屉、化妆台整理", "keywords": ["drawer organizer", "desk organizer", "storage box", "makeup organizer"]},
+    {"specific_category": "车载手机支架/固定器", "product_shape": "车内安装配件", "core_mechanism": "磁吸/夹持/吸盘固定", "demo_scene": "开车导航不晃、不挡视线", "keywords": ["car phone mount", "phone mount", "car holder", "dashboard holder"]},
+    {"specific_category": "车内收纳/座椅配件", "product_shape": "车内收纳配件", "core_mechanism": "挂装/分层/防掉落", "demo_scene": "车内杂乱到有序的前后对比", "keywords": ["car organizer", "seat organizer", "trunk organizer", "cup holder"]},
+    {"specific_category": "磁吸/无线充电配件", "product_shape": "数码充电配件", "core_mechanism": "磁吸定位/无线补电", "demo_scene": "桌面/床头/车内一放即充", "keywords": ["magsafe", "wireless charger", "magnetic charger", "charging stand"]},
+    {"specific_category": "手机拍摄支架/补光工具", "product_shape": "内容创作配件", "core_mechanism": "稳定拍摄/补光/解放双手", "demo_scene": "自拍视频、直播、桌面拍摄", "keywords": ["tripod", "phone stand", "ring light", "camera mount", "selfie"]},
+    {"specific_category": "旅行收纳/压缩包", "product_shape": "旅行收纳工具", "core_mechanism": "压缩/分区/折叠节省空间", "demo_scene": "行李箱装更多、拿取更快", "keywords": ["packing cube", "compression bag", "travel organizer", "toiletry bag"]},
+    {"specific_category": "露营/户外照明工具", "product_shape": "户外便携工具", "core_mechanism": "照明/太阳能/防水便携", "demo_scene": "露营、庭院、夜间应急", "keywords": ["camping lantern", "solar light", "flashlight", "outdoor light"]},
+    {"specific_category": "亲子安抚/儿童安全用品", "product_shape": "母婴儿童用品", "core_mechanism": "安抚/保护/辅助照看", "demo_scene": "新手父母省心场景", "keywords": ["baby safety", "teether", "pacifier", "stroller", "nursery"]},
+    {"specific_category": "桌面解压/手作玩具", "product_shape": "玩具/手作新奇品", "core_mechanism": "互动玩法/解压/DIY创作", "demo_scene": "玩法反应镜头 + 送礼场景", "keywords": ["fidget", "sensory toy", "diy kit", "craft kit", "puzzle"]},
+]
+
+
+def _infer_micro_product_detail(text: str, title: str) -> dict:
+    best = None
+    for rule in _MICRO_PRODUCT_RULES:
+        matches = [kw for kw in rule["keywords"] if _keyword_hit(text, kw)]
+        if not matches:
+            continue
+        title_hits = [kw for kw in matches if _keyword_hit(title.lower(), kw)]
+        score = len(matches) * 12 + len(title_hits) * 8
+        if best is None or score > best[0]:
+            best = (score, rule, matches)
+    if best:
+        score, rule, matches = best
+        return {
+            "micro_category": rule["specific_category"],
+            "product_shape": rule["product_shape"],
+            "core_mechanism": rule["core_mechanism"],
+            "demo_scene": rule["demo_scene"],
+            "micro_matched_keywords": matches[:6],
+            "micro_confidence_bonus": min(14, 4 + len(matches) * 3),
+        }
+    return {
+        "micro_category": "",
+        "product_shape": "待识别产品形态",
+        "core_mechanism": "需补抓描述/图片后识别核心机制",
+        "demo_scene": "需补抓PDP素材后判断演示场景",
+        "micro_matched_keywords": [],
+        "micro_confidence_bonus": 0,
+    }
+
+
+def _competitor_monitoring_insight(taxonomy: dict, product_info: dict) -> dict:
+    price = _valid_price(product_info.get("price"))
+    confidence = int(taxonomy.get("category_confidence") or 0)
+    depth = taxonomy.get("extraction_depth") or "抓取不足"
+    demo = bool(taxonomy.get("demo_friendly"))
+    risk = str(taxonomy.get("fulfillment_risk") or "")
+    monitor_fields = ["新品上架时间", "价格/折扣/Bundle", "PDP首屏与Offer", "广告Hook/素材角度", "库存/变体变化"]
+    if confidence < 45 or "抓取不足" in depth or "浅层" in depth:
+        monitor_fields.append("描述/图片/标签补抓")
+    if taxonomy.get("pain_point") and "待补" not in str(taxonomy.get("pain_point")):
+        monitor_fields.append("用户痛点/评论表达")
+    if demo:
+        monitor_fields.append("短视频演示脚本")
+
+    if risk.startswith("高风险"):
+        follow_intensity = "暂不跟"
+        next_action = "先做合规/IP/物流硬风险核验；风险未解除不建DRAFT。"
+    elif confidence < 35:
+        follow_intensity = "补抓后轻跟"
+        next_action = "自动补抓PDP描述、图片数、变体、标签和同类竞品，再决定测试强度。"
+    elif price is not None and 29 <= price <= 180 and demo:
+        follow_intensity = "优先轻跟"
+        next_action = "先拆3秒Hook、Offer、价格锚点和差异化套装；供应链报价通过后建DRAFT。"
+    else:
+        follow_intensity = "观察跟"
+        next_action = "进入跟进池，等趋势/广告/社区证据升级后提高优先级。"
+
+    return {
+        "monitoring_reason": "监控竞品是为了降低试错成本：看对手是否持续上新、投放、改价和优化页面，而不是复制素材。",
+        "monitoring_focus_fields": monitor_fields[:8],
+        "follow_intensity": follow_intensity,
+        "next_data_action": next_action,
+        "how_to_follow": taxonomy.get("follow_playbook") or next_action,
+    }
+
+
+def _refine_specific_category(rule_id: str, text: str, fallback: str) -> str:
+    if rule_id == "gift_jewelry":
+        if _kw_any(text, ["ring"]): return "情绪礼品戒指"
+        if _kw_any(text, ["necklace", "pendant"]): return "个性化项链/吊坠"
+        if _kw_any(text, ["bracelet"]): return "纪念手链/手镯"
+        return fallback
+    if rule_id == "beauty_device":
+        if _kw_any(text, ["ipl", "hair removal", "laser"]): return "IPL/激光脱毛仪"
+        if _kw_any(text, ["acne", "red light", "blue light", "led"]): return "LED/红光美容仪"
+        if _kw_any(text, ["ems", "microcurrent", "rf", "skin tightening"]): return "EMS/RF紧致美容仪"
+        return fallback
+    if rule_id == "massage_recovery":
+        if _kw_any(text, ["neck", "shoulder"]): return "颈肩按摩器"
+        if _kw_any(text, ["foot", "feet"]): return "足部按摩/放松工具"
+        if _kw_any(text, ["back", "lumbar"]): return "背部/腰部按摩工具"
+        if _kw_any(text, ["knee"]): return "膝部热敷/按摩护具"
+        return fallback
+    if rule_id == "posture_support":
+        if _kw_any(text, ["insole", "orthotic", "arch support"]): return "鞋垫/足部支撑"
+        if _kw_any(text, ["posture", "corrector"]): return "姿势矫正带"
+        if _kw_any(text, ["compression", "sleeve", "brace"]): return "关节支撑护具"
+        return fallback
+    if rule_id == "pet":
+        if _kw_any(text, ["grooming", "fur", "hair remover"]): return "宠物除毛/清洁工具"
+        if _kw_any(text, ["feeder", "bowl", "water fountain"]): return "宠物喂养用品"
+        if _kw_any(text, ["toy", "training", "bark"]): return "宠物玩具/训练用品"
+        return fallback
+    if rule_id == "home_cleaning":
+        if _kw_any(text, ["stain", "spray", "remover"]): return "污渍清洁/去除工具"
+        if _kw_any(text, ["brush", "scrubber", "electric brush"]): return "刷洗清洁工具"
+        if _kw_any(text, ["lint", "fur", "hair remover"]): return "毛发/绒毛清理工具"
+        return fallback
+    if rule_id == "home_organization":
+        if _kw_any(text, ["closet", "hanger"]): return "衣柜收纳工具"
+        if _kw_any(text, ["kitchen", "cabinet"]): return "厨房收纳工具"
+        if _kw_any(text, ["drawer", "desk"]): return "抽屉/桌面收纳"
+        return fallback
+    if rule_id == "kitchen_gadget":
+        if _kw_any(text, ["slicer", "chopper", "cutter", "peeler"]): return "切削备菜工具"
+        if _kw_any(text, ["coffee", "grinder"]): return "咖啡/饮品工具"
+        if _kw_any(text, ["storage"]): return "厨房食物保存工具"
+        return fallback
+    if rule_id == "car_accessory":
+        if _kw_any(text, ["phone mount", "holder"]): return "车载手机支架/固定器"
+        if _kw_any(text, ["cleaner", "vacuum", "brush"]): return "汽车清洁工具"
+        if _kw_any(text, ["seat", "trunk", "organizer"]): return "车内收纳/座椅配件"
+        return fallback
+    if rule_id == "phone_electronics":
+        if _kw_any(text, ["charger", "wireless", "magsafe"]): return "磁吸/无线充电配件"
+        if _kw_any(text, ["camera", "stand", "tripod"]): return "手机拍摄辅助工具"
+        if _kw_any(text, ["earbuds", "bluetooth"]): return "蓝牙音频配件"
+        return fallback
+    return fallback
+
+
+def _product_extraction_depth(product_info: dict) -> dict:
+    fields = []
+    missing = []
+    checks = [
+        ("title", product_info.get("title") or product_info.get("product_title")),
+        ("price", product_info.get("price")),
+        ("product_type", product_info.get("product_type") or product_info.get("productType")),
+        ("vendor", product_info.get("vendor")),
+        ("tags", product_info.get("tags")),
+        ("description", product_info.get("description") or product_info.get("body_html") or product_info.get("描述摘要")),
+        ("image_count", product_info.get("image_count") or product_info.get("图片数")),
+        ("variant_count", product_info.get("variant_count") or product_info.get("variants_count") or product_info.get("变体数")),
+        ("source", product_info.get("source") or product_info.get("platform")),
+        ("url", product_info.get("url") or product_info.get("product_url")),
+    ]
+    for name, value in checks:
+        present = False
+        if isinstance(value, (list, tuple, set, dict)):
+            present = len(value) > 0
+        elif value not in (None, "", 0, "0", "未分类", "unknown"):
+            present = True
+        if present:
+            fields.append(name)
+        else:
+            missing.append(name)
+    score = len(fields)
+    if score >= 7:
+        label = "深度抓取"
+    elif score >= 5:
+        label = "标准抓取"
+    elif score >= 3:
+        label = "浅层抓取"
+    else:
+        label = "抓取不足"
+    return {
+        "extraction_depth": label,
+        "extraction_score": score,
+        "fields_present": fields or ["title"],
+        "missing_fields": missing or ["无"],
+    }
+
+
+def _infer_product_taxonomy(product_info: dict) -> dict:
+    """Deterministic product classification for micro-vertical and novelty sources."""
+    product_info = product_info or {}
+    text = _text_blob(product_info)
+    title = _clean_product_text(product_info.get("title") or product_info.get("product_title") or "", 180)
+    raw_type = _clean_product_text(product_info.get("product_type") or product_info.get("productType") or "", 120)
+    raw_type_l = raw_type.lower()
+    has_raw_type = bool(raw_type and raw_type_l not in {"未分类", "uncategorized", "unknown", "none", "nan", "n/a"})
+
+    best = None
+    for rule in _PRODUCT_TAXONOMY_RULES:
+        matches = [kw for kw in rule["keywords"] if _keyword_hit(text, kw)]
+        if not matches:
+            continue
+        title_hits = [kw for kw in matches if _keyword_hit(title.lower(), kw)]
+        rule_score = len(matches) * 10 + int(rule.get("weight", 0)) + len(title_hits) * 4
+        if has_raw_type and any(_keyword_hit(raw_type_l, kw) for kw in matches):
+            rule_score += 8
+        if best is None or rule_score > best[0]:
+            best = (rule_score, rule, matches, title_hits)
+
+    if best:
+        rule_score, rule, matches, title_hits = best
+        specific = _refine_specific_category(rule["id"], text, rule["specific_category"])
+        confidence = min(96, 36 + len(matches) * 8 + int(rule.get("weight", 0)) + len(title_hits) * 3)
+        category_group = rule["category_group"]
+        use_case = rule["use_case"]
+        pain_point = rule["pain_point"]
+        audience = rule["audience"]
+        novelty_signal = rule["novelty_signal"]
+        creative_angle = rule["creative_angle"]
+    elif has_raw_type:
+        specific = raw_type
+        category_group = "Other DTC"
+        use_case = f"围绕 {raw_type} 的细分场景继续拆解"
+        pain_point = "痛点未从标题明确命中，需要补描述/标签后复核"
+        audience = "该品类的精准人群待补"
+        novelty_signal = "已有原始产品类型，但缺少更细颗粒度关键词"
+        creative_angle = f"先按 {raw_type} 的竞品首屏、价格锚点和评论痛点拆解"
+        matches = [raw_type]
+        confidence = 42
+    else:
+        title_seed = " ".join([w for w in re.split(r"[^a-zA-Z0-9]+", title) if len(w) > 2][:4]) or (title[:40] if title else "unknown product")
+        specific = f"待细分品类: {title_seed}"
+        category_group = "Unclassified Novelty"
+        use_case = "用途需要从PDP描述、图片或标签继续抽取"
+        pain_point = "痛点未命中，系统已标记为需补抓取"
+        audience = "目标人群待补"
+        novelty_signal = "标题存在但分类字段不足，优先补抓描述/图片/标签"
+        creative_angle = "先补数据，再判断是否有可演示痛点或礼品场景"
+        matches = [title_seed]
+        confidence = 18
+
+    risk_keywords = []
+    if _kw_any(text, ["cbd", "hemp", "nicotine", "vape", "fda", "medical", "diabetes", "weight loss", "ozempic", "disney", "pokemon", "nintendo", "apple", "tesla", "replica"]):
+        fulfillment_risk = "高风险: 合规/IP/平台审核需拦截"
+        risk_keywords.append("合规/IP")
+    elif _kw_any(text, ["glass", "ceramic", "mirror", "furniture", "sofa", "table", "chair", "large"]):
+        fulfillment_risk = "中高风险: 易碎/大件履约需核重量与破损率"
+        risk_keywords.append("易碎/大件")
+    elif _kw_any(text, ["battery", "rechargeable", "wireless", "electric", "liquid", "spray", "essential oil", "cosmetic"]):
+        fulfillment_risk = "中风险: 电池/液体/功效表述需核物流与合规"
+        risk_keywords.append("电池/液体/功效")
+    else:
+        fulfillment_risk = "中低风险: 先核同款成本、重量、交付时效"
+
+    micro = _infer_micro_product_detail(text, title)
+    micro_category = micro.get("micro_category") or ""
+    if micro_category:
+        specific = micro_category
+        confidence = min(97, int(confidence) + int(micro.get("micro_confidence_bonus") or 0))
+        matches = list(dict.fromkeys(list(micro.get("micro_matched_keywords") or []) + list(matches or [])))
+        novelty_signal = f"{novelty_signal}；微品类命中 {micro_category}"
+        creative_angle = f"{micro.get('demo_scene')}；{creative_angle}"
+
+    demo_friendly = _kw_any(text, ["led", "before", "after", "instant", "portable", "mini", "tool", "kit", "spray", "brush", "roller", "massager", "vacuum", "magnetic", "automatic", "foldable"]) or category_group in {"Home Cleaning", "Kitchen Gadget", "Beauty Device", "Massage & Recovery", "Pet"} or bool(micro_category)
+    depth = _product_extraction_depth(product_info)
+    basis = [field for field in depth.get("fields_present", []) if field != "price"]
+    product_type_display = raw_type if has_raw_type else specific
+    follow_playbook = f"跟需求不跟外观：用“{pain_point}”开场，展示“{use_case}”，素材主轴走“{creative_angle}”。"
+    if confidence < 35:
+        follow_playbook = "先补抓描述/图片/标签，再判断；不要因为未分类就跳过，但先放入补证队列。"
+
+    base_taxonomy = {
+        "specific_category": specific,
+        "category_group": category_group,
+        "product_type_raw": raw_type or "未分类",
+        "product_type_inferred": specific,
+        "product_type_display": product_type_display,
+        "use_case": use_case,
+        "pain_point": pain_point,
+        "target_audience": audience,
+        "audience": audience,
+        "novelty_signal": novelty_signal,
+        "creative_angle": creative_angle,
+        "follow_playbook": follow_playbook,
+        "fulfillment_risk": fulfillment_risk,
+        "category_confidence": int(confidence),
+        "matched_keywords": matches[:8] or ["未命中"],
+        "classification_basis": "+".join(basis) if basis else "title",
+        "demo_friendly": bool(demo_friendly),
+        "risk_keywords": risk_keywords or ["无"],
+        "micro_category": micro_category or specific,
+        "product_shape": micro.get("product_shape") or "待识别产品形态",
+        "core_mechanism": micro.get("core_mechanism") or "需补抓描述/图片后识别核心机制",
+        "demo_scene": micro.get("demo_scene") or "需补抓PDP素材后判断演示场景",
+        "micro_matched_keywords": micro.get("micro_matched_keywords") or [],
+        **depth,
+    }
+    base_taxonomy.update(_competitor_monitoring_insight(base_taxonomy, product_info))
+
+    return base_taxonomy
+
+
+def _text_blob(product_info):
+    tags = product_info.get("tags", [])
+    if isinstance(tags, list):
+        tags = " ".join(str(t) for t in tags)
+    images = product_info.get("images", [])
+    if isinstance(images, list):
+        image_text = " ".join(str(img.get("alt") or img.get("src") or img) if isinstance(img, dict) else str(img) for img in images[:8])
+    else:
+        image_text = str(images or "")
+    variants = product_info.get("variants", [])
+    if isinstance(variants, list):
+        variant_text = " ".join(str(v.get("title") or v.get("option1") or v) if isinstance(v, dict) else str(v) for v in variants[:10])
+    else:
+        variant_text = str(variants or "")
+    return _clean_product_text(" ".join([
+        str(product_info.get("title", "")),
+        str(product_info.get("product_title", "")),
+        str(product_info.get("handle", "")),
+        str(product_info.get("url", "")),
+        str(product_info.get("product_url", "")),
+        str(product_info.get("product_type", "")),
+        str(product_info.get("productType", "")),
+        str(product_info.get("vendor", "")),
+        str(tags),
+        image_text,
+        variant_text,
+        str(product_info.get("description", "")),
+        str(product_info.get("body_html", "")),
+        str(product_info.get("描述摘要", "")),
+        str(product_info.get("source", "")),
+        str(product_info.get("platform", "")),
+    ]), limit=5000).lower()
+
+
+def _has_any(text, words):
+    return any(w in text for w in words)
+
+
+def _score_new_product(product_info, domain, extra_signals=None):
+    """新品评分引擎 — FB Ads + Shopify 出单概率评分"""
+    extra_signals = extra_signals or {}
+    score = 12
+    reasons = ["新PDP/今日上新基准 (+12)"]
+    risk_flags = []
+    conversion_angles = []
+
+    text = _text_blob(product_info)
+    taxonomy = _infer_product_taxonomy(product_info)
+    price = float(product_info.get("price", 0) or 0)
+    ad_count = int(extra_signals.get("ad_creative_count", 0) or 0)
+    ai_score = float(extra_signals.get("ai_score", 0) or 0)
+    orbit_score = float(extra_signals.get("orbit_score", 0) or 0)
+    ad_grade = str(extra_signals.get("grade", "") or "").upper()
+
+    if 29 <= price <= 89:
+        score += 18
+        reasons.append(f"冲动购买甜区${price:.0f} (+18)")
+    elif 90 <= price <= 180:
+        score += 14
+        reasons.append(f"AOV可投放区间${price:.0f} (+14)")
+    elif 18 <= price < 29 or 180 < price <= 250:
+        score += 8
+        reasons.append(f"价格可测但需控制CAC ${price:.0f} (+8)")
+    elif price < 12:
+        score -= 8
+        risk_flags.append("客单价过低，广告难打平")
+    elif price > 300:
+        score -= 10
+        risk_flags.append("高客单决策链长，冷启动转化慢")
+
+    if ad_count >= 5 and ad_count <= 80:
+        score += 22
+        reasons.append(f"FB素材数{ad_count}，验证充分且未过饱和 (+22)")
+    elif 1 <= ad_count < 5:
+        score += 12
+        reasons.append(f"FB已有初测素材{ad_count}条 (+12)")
+    elif 80 < ad_count <= 300:
+        score += 12
+        reasons.append(f"FB放量明显{ad_count}条，但注意跟品拥挤 (+12)")
+        risk_flags.append("广告侧可能进入拥挤期")
+    elif ad_count > 300:
+        score += 4
+        reasons.append(f"FB大规模放量{ad_count}条，需求强但竞争重 (+4)")
+        risk_flags.append("素材/受众可能已过热")
+
+    if ai_score >= 80 or orbit_score >= 80:
+        score += 12
+        reasons.append("8000管线AI/Orbit高分验证 (+12)")
+    elif ai_score >= 60 or orbit_score >= 60:
+        score += 7
+        reasons.append("8000管线中高分验证 (+7)")
+
+    if ad_grade in {"HOT", "SOLID", "WATCH"}:
+        bonus = {"HOT": 10, "SOLID": 7, "WATCH": 5}[ad_grade]
+        score += bonus
+        reasons.append(f"FB管线评级{ad_grade} (+{bonus})")
+
+    pain_words = ["pain", "relief", "repair", "remove", "cleaner", "anti", "wrinkle", "acne", "sleep", "posture", "support", "protect", "odor", "stain", "hair", "teeth", "pet", "baby", "organizer"]
+    visual_words = ["led", "light", "before", "after", "instant", "portable", "mini", "tool", "kit", "spray", "brush", "roller", "massager", "vacuum", "magnetic", "automatic"]
+    gift_words = ["gift", "personalized", "custom", "holiday", "christmas", "mother", "father", "couple", "kids"]
+
+    if _has_any(text, pain_words):
+        score += 10
+        reasons.append("痛点/问题解决型标题，广告钩子强 (+10)")
+        conversion_angles.append("痛点前置：问题 → 演示 → 结果")
+    if _has_any(text, visual_words):
+        score += 8
+        reasons.append("一眼可演示/视频素材友好 (+8)")
+        conversion_angles.append("短视频演示：3秒展示变化")
+    if _has_any(text, gift_words):
+        score += 6
+        reasons.append("礼品属性，适合Shopify捆绑/加购 (+6)")
+        conversion_angles.append("礼品场景：送礼对象 + 节日节点")
+
+    category_group = taxonomy.get("category_group", "")
+    category_confidence = int(taxonomy.get("category_confidence") or 0)
+    if category_confidence >= 65:
+        score += 6
+        reasons.append(f"具体品类已判定：{taxonomy.get('specific_category')} (+6)")
+    elif category_confidence < 35:
+        score -= 3
+        risk_flags.append("分类置信度低，需补抓PDP描述/图片/标签")
+    if taxonomy.get("demo_friendly"):
+        score += 5
+        reasons.append("产品形态适合短视频演示 (+5)")
+        conversion_angles.append(taxonomy.get("creative_angle", "短视频演示：3秒展示变化"))
+    if category_group in {"Gift & Personalized", "Beauty Device", "Massage & Recovery", "Pain Relief & Support", "Pet", "Home Cleaning", "Kitchen Gadget"}:
+        score += 4
+        reasons.append(f"{category_group} 属于高频DTC测试池 (+4)")
+
+    image_count = int(product_info.get("image_count", 0) or 0)
+    variant_count = int(product_info.get("variant_count", 0) or 0)
+    if image_count >= 3:
+        score += 5
+        reasons.append("PDP图片充足，落地页可复用 (+5)")
+    if 2 <= variant_count <= 8:
+        score += 4
+        reasons.append("变体适中，适合Bundle/颜色尺码测试 (+4)")
+
+    restricted_words = ["cbd", "hemp", "nicotine", "vape", "fda", "medical", "diabetes", "weight loss", "ozempic", "disney", "pokemon", "nintendo", "apple", "tesla", "replica"]
+    fragile_words = ["glass", "ceramic", "furniture", "mirror", "large", "sofa", "table", "chair"]
+    if _has_any(text, restricted_words):
+        score -= 25
+        risk_flags.append("合规/IP/平台审核风险高")
+    if _has_any(text, fragile_words):
+        score -= 8
+        risk_flags.append("物流破损或大件履约风险")
+    if str(taxonomy.get("fulfillment_risk", "")).startswith("高风险"):
+        score -= 12
+        risk_flags.append(taxonomy.get("fulfillment_risk"))
+    elif str(taxonomy.get("fulfillment_risk", "")).startswith("中高风险"):
+        score -= 5
+        risk_flags.append(taxonomy.get("fulfillment_risk"))
+
+    if extra_signals.get("has_ugc"):
+        score += 10
+        reasons.append("有UGC/自然内容，素材冷启动更容易 (+10)")
+    if extra_signals.get("stock_changed_to_available"):
+        score += 6
+        reasons.append("库存转可售，可立即上架测试 (+6)")
+    if extra_signals.get("multi_competitor_signal"):
+        score += 10
+        reasons.append("多竞品同步上架，需求正在扩散 (+10)")
+
+    score = max(0, min(100, int(round(score))))
+    if score >= 82: tier = "🚀 立即测款"
+    elif score >= 65: tier = "🔬 素材拆解"
+    elif score >= 45: tier = "👀 加入观察"
+    else: tier = "📝 仅记录"
+
+    if not conversion_angles:
+        conversion_angles.append("先拆竞品素材，验证3秒钩子是否清晰")
+
+    return {
+        "score": score,
+        "sellability_score": score,
+        "tier": tier,
+        "reasons": reasons,
+        "risk_flags": risk_flags,
+        "conversion_angles": conversion_angles,
+        "price": price,
+        "ad_heat": "过热" if ad_count > 300 else "放量" if ad_count > 80 else "验证中" if ad_count >= 5 else "初测" if ad_count > 0 else "未知",
+        "shopify_fit": "高" if score >= 75 and price >= 29 else "中" if score >= 55 else "低",
+        "fb_ads_fit": "高" if ad_count >= 5 or _has_any(text, pain_words + visual_words) else "中" if ad_count > 0 else "待验证",
+        **taxonomy,
+    }
+
+
+@app.get("/api/radar/scan")
+@app.post("/api/radar/scan")
+def api_radar_scan(domains: str = "", limit: int = 50):
+    """全量新品雷达扫描 — 对比最新 snapshot 与历史快照，检测新品并评分"""
+    # 获取域名列表
+    domain_list = [d.strip() for d in domains.split(",") if d.strip()] if domains else []
+    if not domain_list:
+        d = _load_all()
+        _store_registry_ensure_baseline(d.get("stores", []))
+        domain_list = _store_registry_pick_scan_batch(limit, include_blacklist=False)
+        if not domain_list:
+            domain_list = [s["domain"] for s in d["stores"][:limit]]
+
+    if not domain_list:
+        return {"ok": False, "error": "无域名"}
+
+    # 尝试获取广告侧数据（从 8000 端口）
+    ad_brands = {}
+    try:
+        import urllib.request
+        url = "http://127.0.0.1:8000/brands?limit=2000"
+        req = urllib.request.Request(url)
+        with _LOCAL_OPENER.open(req, timeout=8) as resp:
+            brands_data = json.loads(resp.read())
+        for b in (brands_data if isinstance(brands_data, list) else []):
+            ad_brands[b.get("domain", "")] = {
+                "ai_score": b.get("ai_score", 0),
+                "orbit_score": b.get("orbit_score", 0),
+                "appearance_count": b.get("appearance_count", 0),
+                "grade": b.get("grade", ""),
+            }
+    except: pass
+
+    scores, old_diffs, _ = _load_radar_data()
+    now = datetime.now().isoformat()
+    results = []
+    new_products_all = []
+
+    for domain in domain_list[:limit]:
+        domain = su.normalize_domain(domain)
+        if not domain:
+            continue
+        detail = _store_detail(domain)
+        if not detail:
+            # Registry-only domains may not have a local snapshot yet. Try the same
+            # best-effort scanner used by monitoring so non-Shopify sites get a fair pass.
+            refresh_result = _refresh_monitor_domain(domain)
+            _store_registry_mark_refresh_result(refresh_result)
+            if refresh_result.get("status") == "ok":
+                detail = _store_detail(domain)
+            if not detail:
+                results.append({
+                    "domain": domain,
+                    "total_products": 0,
+                    "new_products_count": 0,
+                    "new_products": [],
+                    "status": refresh_result.get("status", "no_data"),
+                    "error": refresh_result.get("error", refresh_result.get("reason", "")),
+                    "has_ads": False,
+                    "last_check": "",
+                    "is_first_scan": True,
+                })
+                continue
+
+        products = detail.get("products", [])
+        if not products: continue
+
+        # 查找历史快照对比
+        prev_snapshot = old_diffs.get(domain, {}).get("snapshot_at")
+        prev_products = old_diffs.get(domain, {}).get("product_ids", set())
+        if isinstance(prev_products, list): prev_products = set(prev_products)
+
+        current_ids = set()
+        new_products = []
+
+        for p in products:
+            pid = str(p.get("handle", ""))
+            current_ids.add(pid)
+            if pid not in prev_products:
+                new_products.append(p)
+
+        # 广告侧信号
+        ad_info = ad_brands.get(domain) or ad_brands.get(domain.replace("www.", "")) or {}
+
+        # 评分每个新品
+        scored_new = []
+        is_first_scan = not prev_products  # 首次扫描，所有产品都算"新"
+
+        for np_item in new_products:
+            np_item = _v2_enrich_product_taxonomy(dict(np_item))
+            extra = {
+                "has_recent_ads": bool(ad_info.get("appearance_count", 0) > 0),
+                "ad_creative_count": ad_info.get("appearance_count", 0),
+                "ai_score": ad_info.get("ai_score", 0),
+                "orbit_score": ad_info.get("orbit_score", 0),
+                "grade": ad_info.get("grade", ""),
+            }
+            s = _score_new_product(np_item, domain, extra)
+            s["product_title"] = np_item.get("title", "")
+            s["product_handle"] = np_item.get("handle", "")
+            s["handle"] = np_item.get("handle", "")
+            s["domain"] = domain
+            s["product_type"] = s.get("specific_category") or np_item.get("product_type", "未分类")
+            s["product_type_raw"] = np_item.get("product_type_raw", "未分类")
+            s["product_url"] = _v2_product_url(domain, np_item.get("handle", ""), np_item.get("url") or np_item.get("product_url", ""))
+            s["store_product_count"] = len(products)
+            s["ad_appearances"] = ad_info.get("appearance_count", 0)
+            scored_new.append(s)
+
+        # 更新 diff 记录
+        old_diffs[domain] = {
+            "snapshot_at": now,
+            "product_count": len(products),
+            "product_ids": list(current_ids),
+        }
+
+        results.append({
+            "domain": domain,
+            "total_products": len(products),
+            "new_products_count": len(new_products),
+            "new_products": scored_new[:30],  # 只返回前30个新品避免响应过大
+            "has_ads": bool(ad_info),
+            "ad_score": ad_info.get("ai_score", 0),
+            "ad_grade": ad_info.get("grade", ""),
+            "last_check": detail.get("last_check", ""),
+            "is_first_scan": is_first_scan,
+        })
+        new_products_all.extend(scored_new)
+
+        # 更新该域名评分
+        best_score = max((s["score"] for s in scored_new), default=0) if scored_new else 0
+        scores[domain] = {
+            "last_scan": now,
+            "top_score": best_score,
+            "new_products_found": len(new_products),
+            "total_new_ever": scores.get(domain, {}).get("total_new_ever", 0) + len(new_products),
+        }
+
+    _save_radar_diffs(old_diffs)
+    _save_radar_scores(scores)
+
+    # 按新品评分汇总
+    new_products_all.sort(key=lambda x: -x["score"])
+    tiers = {"🚀 立即测款": 0, "🔬 素材拆解": 0, "👀 加入观察": 0, "📝 仅记录": 0}
+    for np in new_products_all: tiers[np["tier"]] += 1
+
+    return {
+        "ok": True,
+        "total_domains_checked": len(results),
+        "total_new_products": len(new_products_all),
+        "tier_summary": tiers,
+        "top_picks": new_products_all[:20],
+        "domain_results": results,
+        "generated_at": now,
+    }
+
+
+@app.get("/api/radar/scores")
+def api_radar_scores():
+    """获取所有域名的雷达评分"""
+    scores, _, _ = _load_radar_data()
+    # 按 top_score 排序
+    sorted_scores = sorted(scores.items(), key=lambda x: -x[1].get("top_score", 0))
+    return {
+        "ok": True,
+        "total_domains_scored": len(scores),
+        "domains": [{"domain": d, **s} for d, s in sorted_scores],
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+#  AI 购物雷达 (AI Shopping Radar)
+# ═══════════════════════════════════════════════════════════
+
+AI_SHOPPING_PROMPTS = [
+    "best {category} for {pain_point} under ${price}",
+    "I need a product to solve {problem}. Recommend products I can buy online.",
+    "What are the best {category} products from independent brands?",
+    "Compare {competitor} with alternatives under ${price}.",
+    "Where can I buy {product_name}?",
+    "Recommend Shopify DTC brands selling {category}.",
+    "top rated {category} for beginners",
+    "{category} buying guide independent brands",
+    "best selling {category} direct to consumer",
+    "what {category} should I buy from small brands",
+]
+
+
+@app.get("/api/radar/ai-shopping/generate-prompts")
+@app.post("/api/radar/ai-shopping/generate-prompts")
+def api_radar_generate_prompts(
+    keyword: str = "", brand: str = "", price: str = "50",
+    problem: str = "", product_name: str = "", competitor: str = "",
+):
+    """根据品牌/产品信息生成 AI 购物监控 Prompt 模板"""
+    category = keyword or "beauty device"
+    pain = problem or "anti-aging skincare"
+    comp = competitor or brand or "leading brands"
+    pname = product_name or f"{brand} {keyword}"
+    pb = problem or "hair removal"
+
+    prompts = []
+    for tmpl in AI_SHOPPING_PROMPTS:
+        p = tmpl.format(
+            category=category, pain_point=pain, price=price,
+            problem=pb, competitor=comp, product_name=pname,
+        )
+        prompts.append({
+            "template": tmpl,
+            "filled": p,
+            "model": "ChatGPT / Perplexity / Gemini",
+            "country": "US",
+        })
+
+    return {
+        "ok": True,
+        "brand": brand or keyword,
+        "prompts": prompts,
+        "instructions": (
+            "在 ChatGPT / Perplexity / Gemini 中逐个执行上述 prompt，"
+            "记录：是否出现目标品牌、排名第几、引用URL、是否显示价格、是否商品卡。"
+            "完成后通过 /api/radar/ai-shopping/log 记录结果。"
+        ),
+    }
+
+
+class AILogRequest(BaseModel):
+    brand: str = ""
+    keyword: str = ""
+    results: list = []
+
+@app.post("/api/radar/ai-shopping/log")
+def api_radar_ai_log(req: AILogRequest):
+    """记录一次 AI 购物检测结果"""
+    _, _, ai_data = _load_radar_data()
+    brand = req.brand or req.keyword
+    if brand not in ai_data:
+        ai_data[brand] = {"checks": [], "first_seen": datetime.now().isoformat()}
+
+    ai_data[brand]["checks"].append({
+        "timestamp": datetime.now().isoformat(),
+        "results": req.results,
+    })
+    ai_data[brand]["last_check"] = datetime.now().isoformat()
+    ai_data[brand]["total_checks"] = len(ai_data[brand]["checks"])
+
+    # 计算出现率
+    shown_count = sum(
+        1 for c in ai_data[brand]["checks"]
+        for r in c.get("results", [])
+        if r.get("whether_shown")
+    )
+    ai_data[brand]["shown_count"] = shown_count
+
+    _save_ai_data(ai_data)
+    return {"ok": True, "brand": brand, "total_checks": ai_data[brand]["total_checks"]}
+
+
+@app.get("/api/radar/ai-shopping/status")
+def api_radar_ai_status(brand: str = ""):
+    """获取 AI 购物检测状态"""
+    _, _, ai_data = _load_radar_data()
+    if brand:
+        return {"ok": True, "brand": brand, "data": ai_data.get(brand, {})}
+
+    # 汇总所有品牌
+    summary = {}
+    for b, d in ai_data.items():
+        shown = d.get("shown_count", 0)
+        total = d.get("total_checks", 0)
+        summary[b] = {
+            "total_checks": total,
+            "shown_count": shown,
+            "show_rate": f"{shown/total*100:.0f}%" if total > 0 else "N/A",
+            "last_check": d.get("last_check", ""),
+            "first_seen": d.get("first_seen", ""),
+        }
+    return {"ok": True, "brands": summary, "total_brands_tracked": len(summary)}
+
+
+# ═══════════════════════════════════════════════════════════
+#  综合 3 雷达一键扫描
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/radar/full-scan")
+@app.post("/api/radar/full-scan")
+def api_radar_full_scan(limit: int = 50, domains: str = ""):
+    """一键运行 3 大雷达扫描：
+    1. 新品雷达：Shopify 产品接口 diff + 评分
+    2. 放量雷达：从 8000 端口读广告活跃度
+    3. AI购物雷达：生成检测 prompt 模板
+    """
+    now = datetime.now().isoformat()
+
+    # 雷达 1: 新品扫描
+    product_scan = api_radar_scan(domains=domains, limit=limit)
+
+    # 雷达 2: 放量信号（从 8000 端口获取广告活跃品牌）
+    ad_signals = []
+    try:
+        import urllib.request
+        url = "http://127.0.0.1:8000/brands?limit=100"
+        req = urllib.request.Request(url)
+        with _LOCAL_OPENER.open(req, timeout=8) as resp:
+            brands_data = json.loads(resp.read())
+        for b in (brands_data if isinstance(brands_data, list) else []):
+            appear = b.get("appearance_count", 0)
+            orbit = b.get("orbit_score", 0)
+            ai = b.get("ai_score", 0)
+            if appear > 100 or orbit >= 80:
+                ad_signals.append({
+                    "domain": b.get("domain", ""),
+                    "brand": b.get("canonical_name", ""),
+                    "appearance_count": appear,
+                    "orbit_score": orbit,
+                    "ai_score": ai,
+                    "grade": b.get("grade", ""),
+                    "signal": "🔥 正在放量" if appear > 500 else "🟡 测试中" if appear > 100 else "🟢 有投放",
+                })
+        ad_signals.sort(key=lambda x: -x["appearance_count"])
+    except: pass
+
+    # 雷达 3: AI 购物监控提示
+    top_new = product_scan.get("top_picks", [])[:5]
+    ai_reminders = []
+    for np_item in top_new:
+        p_title = np_item.get("product_title", "")
+        ai_reminders.append({
+            "message": "请用 ChatGPT/Perplexity 搜索 '" + p_title + "'，记录是否出现在 AI 推荐中",
+            "product": p_title,
+            "domain": np_item.get("domain", ""),
+            "score": np_item.get("score", 0),
+        })
+
+    return {
+        "ok": True,
+        "generated_at": now,
+        "radar_1_products": {
+            "new_products_found": product_scan.get("total_new_products", 0),
+            "domains_checked": product_scan.get("total_domains_checked", 0),
+            "tier_summary": product_scan.get("tier_summary", {}),
+            "top_picks": product_scan.get("top_picks", [])[:10],
+        },
+        "radar_2_ads": {
+            "active_ad_brands": len(ad_signals),
+            "top_signals": ad_signals[:20],
+        },
+        "radar_3_ai_shopping": {
+            "reminders": ai_reminders,
+            "prompt_templates": AI_SHOPPING_PROMPTS[:5],
+            "instruction": "在 ChatGPT / Perplexity / Gemini 中执行上述 prompt，通过 /api/radar/ai-shopping/log 记录结果",
+        },
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+#  放量雷达 (Ad Scale Radar) — 直接调用 8000 端口数据
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/radar/ad-signals")
+def api_radar_ad_signals(limit: int = 100, min_appearances: int = 50):
+    """从 8000 端口获取正在投放广告的活跃品牌"""
+    try:
+        import urllib.request
+        url = f"http://127.0.0.1:8000/brands?limit={max(limit, 1000)}"
+        req = urllib.request.Request(url)
+        with _LOCAL_OPENER.open(req, timeout=10) as resp:
+            brands_data = json.loads(resp.read())
+    except Exception as e:
+        return {"ok": False, "error": f"无法连接 8000 端口: {e}"}
+
+    active = []
+    for b in (brands_data if isinstance(brands_data, list) else []):
+        appear = b.get("appearance_count", 0)
+        if appear >= min_appearances:
+            # 判断放量阶段
+            if appear > 1000: stage = "🔥🔥🔥 大规模放量"
+            elif appear > 500: stage = "🔥🔥 放量中"
+            elif appear > 200: stage = "🔥 起量中"
+            elif appear > 100: stage = "🟡 测试放量"
+            else: stage = "🟢 初测"
+
+            active.append({
+                "domain": b.get("domain", ""),
+                "brand": b.get("canonical_name", ""),
+                "appearances": appear,
+                "orbit": b.get("orbit_score", 0),
+                "ai_score": b.get("ai_score", 0),
+                "grade": b.get("grade", ""),
+                "stage": stage,
+                # 关联本地快照
+                "has_snapshot": os.path.exists(MONITOR_DIR / f"{b.get('domain','')}_snapshot.json"),
+            })
+
+    active.sort(key=lambda x: -x["appearances"])
+    stages = {}
+    for a in active:
+        s = a["stage"]
+        stages[s] = stages.get(s, 0) + 1
+
+    return {
+        "ok": True,
+        "total_active": len(active),
+        "stage_summary": stages,
+        "brands": active[:limit],
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+#  V2 — 实战选品台 + 趋势验证 + 跟品决策
+# ═══════════════════════════════════════════════════════════
+
+V2_CACHE_FILE = MONITOR_DIR / "v2_today_cache.json"
+V2_SYNC_FILE = MONITOR_DIR / "v2_domain_sync.json"
+
+_v2_cache = None
+_v2_cache_ts = 0
+_v2_vertical_sites_cache = None
+_v2_vertical_sites_cache_signature = ""
+# Multi-range cache: key = (min_skus, max_skus); value = (signature, payload)
+_v2_vertical_sites_range_cache = {}
+_V2_CACHE_TTL = 120  # 2 分钟内存缓存
+
+# Scan presets for the "vertical sites / novelty" classification buttons.
+# Each preset maps to a SKU range and optional filters (novelty/demo/price).
+V2_VERTICAL_PRESETS = {
+    "tiny":      {"min_skus": 1,  "max_skus": 4,   "label": "极简站 1-4"},
+    "small":     {"min_skus": 5,  "max_skus": 15,  "label": "小垂直 5-15"},
+    "medium":    {"min_skus": 15, "max_skus": 30,  "label": "中型 15-30"},
+    "novelty":   {"min_skus": 1,  "max_skus": 30,  "label": "新奇特优先", "novelty_only": True},
+    "demo":      {"min_skus": 1,  "max_skus": 30,  "label": "演示友好型", "demo_only": True},
+    "highprice": {"min_skus": 1,  "max_skus": 30,  "label": "高客单 $50+", "min_avg_price": 50.0},
+}
+V2_VERTICAL_DEFAULT_KIND = "small"
+
+def _v2_save_cache(payload):
+    V2_CACHE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _v2_load_cache():
+    if V2_CACHE_FILE.exists():
+        try:
+            return json.loads(V2_CACHE_FILE.read_text(encoding="utf-8"))
+        except: pass
+    return None
+
+
+def _v2_snapshot_files_signature() -> str:
+    """Build a stable signature for all local snapshot files."""
+
+    digest = hashlib.sha256()
+    for fp in sorted(glob.glob(str(MONITOR_DIR / "*_snapshot.json"))):
+        path = Path(fp)
+        try:
+            stat = path.stat()
+            digest.update(path.name.encode("utf-8"))
+            digest.update(str(stat.st_mtime_ns).encode("utf-8"))
+            digest.update(str(stat.st_size).encode("utf-8"))
+        except OSError:
+            continue
+    return digest.hexdigest()
+
+
+def _v2_product_url(domain: str, handle: str, url: str = "") -> str:
+    domain = str(domain or "").replace("www.", "").strip()
+    handle = str(handle or "").strip()
+    url = str(url or "").strip()
+    if url.startswith(("http://", "https://")):
+        return url
+    if domain and handle:
+        return f"https://{domain}/products/{handle}"
+    if domain:
+        return f"https://{domain}"
+    return "#"
+
+
+_DEDUPE_VARIANT_WORDS = {
+    "black", "white", "blue", "red", "green", "yellow", "pink", "purple", "orange", "brown", "grey", "gray",
+    "gold", "silver", "clear", "transparent", "beige", "navy", "ivory", "khaki", "small", "medium", "large",
+    "xl", "xxl", "xs", "s", "m", "l", "standard", "regular", "mini", "max", "plus", "single", "double",
+    "triple", "bundle", "bundles", "combo", "set", "pack", "packs", "pc", "pcs", "piece", "pieces",
+}
+
+
+def _normalize_product_title_for_dedupe(title: str) -> str:
+    """Normalize variant/bundle product titles without erasing the core product identity."""
+
+    text = html.unescape(str(title or "")).lower()
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("&", " and ")
+    text = re.sub(r"\b(?:pack\s*of\s*\d+|set\s*of\s*\d+|\d+\s*(?:x|pk|pack|packs|pc|pcs|piece|pieces))\b", " ", text)
+    text = re.sub(r"\b(?:bundle|bundles|combo|multipack|multi\s*pack|value\s*pack|gift\s*set)\b", " ", text)
+
+    chunks = [c.strip() for c in re.split(r"\s*(?:\||/| - |:)\s*", text) if c.strip()]
+    if len(chunks) > 1:
+        kept = [chunks[0]]
+        for chunk in chunks[1:]:
+            words = [w for w in re.split(r"[^a-z0-9]+", chunk) if w]
+            if words and len(words) <= 4 and all(
+                w in _DEDUPE_VARIANT_WORDS or re.fullmatch(r"\d+(?:ml|oz|cm|mm|in|inch|pack|packs|pc|pcs)?", w)
+                for w in words
+            ):
+                continue
+            kept.append(chunk)
+        text = " ".join(kept)
+
+    text = re.sub(r"\b(?:new|sale|official|limited|edition|free|shipping|best\s*seller|bestseller)\b", " ", text)
+    words = [w for w in re.split(r"[^a-z0-9]+", text) if w]
+    return " ".join(words)[:160]
+
+
+def _v2_title_has_variant_marker(title: str) -> bool:
+    text = html.unescape(str(title or "")).lower()
+    if re.search(r"\b(?:pack\s*of\s*\d+|set\s*of\s*\d+|\d+\s*(?:x|pk|pack|packs|pc|pcs|piece|pieces))\b", text):
+        return True
+    if re.search(r"\b(?:bundle|bundles|combo|multipack|multi\s*pack|value\s*pack|gift\s*set)\b", text):
+        return True
+    chunks = [c.strip() for c in re.split(r"\s*(?:\||/| - |:)\s*", text) if c.strip()]
+    if len(chunks) <= 1:
+        return False
+    tail_words = [w for w in re.split(r"[^a-z0-9]+", chunks[-1]) if w]
+    return bool(tail_words) and len(tail_words) <= 4 and all(w in _DEDUPE_VARIANT_WORDS for w in tail_words)
+
+
+def _v2_normalize_product_handle(handle: str = "", url: str = "") -> str:
+    raw = str(handle or "").strip()
+    if not raw and url:
+        try:
+            parsed = urllib.parse.urlparse(str(url or ""))
+            parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
+            if "products" in parts:
+                idx = parts.index("products")
+                if idx + 1 < len(parts):
+                    raw = parts[idx + 1]
+        except Exception:
+            raw = ""
+    raw = urllib.parse.unquote(str(raw or "")).lower().strip()
+    raw = re.sub(r"\.(?:html?|php)$", "", raw)
+    raw = re.sub(r"[^a-z0-9/_-]+", "-", raw).strip("-/")
+    return raw[:180]
+
+
+def _v2_safe_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _v2_extract_product_price(raw: dict) -> float:
+    if not isinstance(raw, dict):
+        return 0
+    price = _valid_price(raw.get("price") or raw.get("价格"))
+    if price is None:
+        variants = raw.get("variants", [])
+        if isinstance(variants, list):
+            for variant in variants:
+                if isinstance(variant, dict):
+                    price = _valid_price(variant.get("price") or variant.get("compare_at_price"))
+                    if price is not None:
+                        break
+    return round(float(price or 0), 2)
+
+
+def _v2_product_dedupe_keys(product: dict) -> list[str]:
+    if not isinstance(product, dict):
+        return []
+    domain = su.normalize_domain(product.get("domain", "")) or str(product.get("domain", "")).replace("www.", "").strip()
+    if not domain:
+        return []
+    title = str(product.get("title") or product.get("product_title") or "").strip()
+    handle = _v2_normalize_product_handle(product.get("handle", ""), product.get("url") or product.get("product_url") or "")
+    normalized_title = _normalize_product_title_for_dedupe(title)
+    title_words = normalized_title.split()
+    keys = []
+    if handle:
+        keys.append(f"{domain}|handle|{handle}")
+    if len(normalized_title) >= 8 and len(title_words) >= 2:
+        price = _valid_price(product.get("price"))
+        has_variant_marker = _v2_title_has_variant_marker(title)
+        if price is not None:
+            keys.append(f"{domain}|title_price|{normalized_title}|{round(float(price), 2)}")
+        if has_variant_marker or (len(title_words) >= 3 and len(normalized_title) >= 14) or price is None:
+            keys.append(f"{domain}|title|{normalized_title}")
+    return list(dict.fromkeys(keys))
+
+
+def _v2_product_dedupe_key(product: dict) -> str:
+    keys = _v2_product_dedupe_keys(product)
+    return keys[0] if keys else ""
+
+
+def _v2_product_quality_tuple(product: dict) -> tuple:
+    description = product.get("description") or product.get("body_html") or product.get("描述摘要")
+    tags = product.get("tags") if isinstance(product.get("tags"), list) else []
+    price = _valid_price(product.get("price")) or 0
+    return (
+        int(product.get("extraction_score") or 0),
+        1 if description else 0,
+        int(product.get("image_count") or 0),
+        int(product.get("variant_count") or product.get("variants_count") or 0),
+        int(product.get("category_confidence") or 0),
+        len(tags),
+        1 if product.get("url") or product.get("product_url") else 0,
+        float(price or 0),
+    )
+
+
+def _v2_merge_dedupe_products(existing: dict, incoming: dict) -> dict:
+    keep, other = (existing, incoming)
+    if _v2_product_quality_tuple(incoming) > _v2_product_quality_tuple(existing):
+        keep, other = (incoming, existing)
+    merged = dict(keep)
+    for field in ("description", "body_html", "vendor", "source", "platform", "url", "product_url", "handle", "created_at", "updated_at", "published_at"):
+        if not merged.get(field) and other.get(field):
+            merged[field] = other.get(field)
+    for field in ("image_count", "variant_count", "variants_count", "category_confidence", "extraction_score"):
+        try:
+            merged[field] = max(int(merged.get(field) or 0), int(other.get(field) or 0))
+        except Exception:
+            pass
+    if not _valid_price(merged.get("price")) and _valid_price(other.get("price")):
+        merged["price"] = other.get("price")
+    if isinstance(merged.get("tags"), list) or isinstance(other.get("tags"), list):
+        tags = []
+        for source in (merged.get("tags"), other.get("tags")):
+            if isinstance(source, list):
+                tags.extend(str(t).strip() for t in source if str(t).strip())
+        merged["tags"] = list(dict.fromkeys(tags))
+    group_count = int(existing.get("duplicate_group_count") or 1) + int(incoming.get("duplicate_group_count") or 1)
+    titles = []
+    for source in (existing, incoming):
+        titles.extend(source.get("duplicate_titles") or [source.get("title", "")])
+    merged["duplicate_group_count"] = group_count
+    merged["duplicate_products_removed"] = max(0, group_count - 1)
+    merged["duplicate_titles"] = [t for t in dict.fromkeys(str(t).strip() for t in titles) if t][:8]
+    merged["dedupe_key"] = _v2_product_dedupe_key(merged)
+    return merged
+
+
+def _v2_dedupe_products(products: list[dict]) -> tuple[list[dict], int]:
+    """Conservatively dedupe products within the same store before category and follow analysis."""
+
+    deduped = []
+    key_to_index = {}
+    for raw in products or []:
+        if not isinstance(raw, dict):
+            continue
+        product = dict(raw)
+        keys = _v2_product_dedupe_keys(product)
+        match_idx = None
+        for key in keys:
+            if key in key_to_index:
+                match_idx = key_to_index[key]
+                break
+        if match_idx is None:
+            product.setdefault("duplicate_group_count", 1)
+            product.setdefault("duplicate_products_removed", 0)
+            product.setdefault("duplicate_titles", [product.get("title", "")])
+            product.setdefault("dedupe_key", keys[0] if keys else "")
+            match_idx = len(deduped)
+            deduped.append(product)
+        else:
+            deduped[match_idx] = _v2_merge_dedupe_products(deduped[match_idx], product)
+        for key in list(dict.fromkeys(keys + _v2_product_dedupe_keys(deduped[match_idx]))):
+            key_to_index[key] = match_idx
+    return deduped, max(0, len([p for p in products or [] if isinstance(p, dict)]) - len(deduped))
+
+
+def _v2_enrich_product_taxonomy(entry: dict) -> dict:
+    """Attach specific category, use-case, pain and follow playbook to a product row."""
+
+    if not isinstance(entry, dict):
+        return {}
+    raw_type = str(entry.get("product_type_raw") or entry.get("product_type") or "未分类").strip() or "未分类"
+    entry["product_type_raw"] = raw_type
+    tags = entry.get("tags", [])
+    if isinstance(tags, str):
+        entry["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    elif not isinstance(tags, list):
+        entry["tags"] = []
+    if not entry.get("image_count") and isinstance(entry.get("images"), list):
+        entry["image_count"] = len(entry.get("images") or [])
+    if not entry.get("variant_count") and isinstance(entry.get("variants"), list):
+        entry["variant_count"] = len(entry.get("variants") or [])
+    if not entry.get("description") and entry.get("body_html"):
+        entry["description"] = entry.get("body_html")
+    if not entry.get("body_html") and entry.get("description"):
+        entry["body_html"] = entry.get("description")
+    taxonomy = _infer_product_taxonomy(entry)
+    entry.update(taxonomy)
+    entry["product_type"] = taxonomy.get("specific_category") or raw_type
+    return entry
+
+
+def _v2_load_snapshot_products(min_skus: int = 5, max_skus: int = 15):
+    """Load qualifying micro-vertical products from local snapshot files.
+
+    ``min_skus`` / ``max_skus`` define the SKU range used to classify a store as
+    "micro-vertical". Defaults match the historical 5-15 behaviour.
+    """
+
+    min_skus = max(1, int(min_skus or 1))
+    max_skus = max(min_skus, int(max_skus or min_skus))
+
+    products = []
+    domain_counts = {}
+    domain_activity = []
+    category_counter = Counter()
+    vendor_counter = Counter()
+    prices = []
+    scanned_snapshots = 0
+    failed_snapshots = 0
+    total_snapshot_products = 0
+    duplicate_products_removed = 0
+    site_dedupe_meta = {}
+
+    for fp in sorted(glob.glob(str(MONITOR_DIR / "*_snapshot.json"))):
+        scanned_snapshots += 1
+        try:
+            data = json.loads(Path(fp).read_text(encoding="utf-8"))
+        except Exception:
+            failed_snapshots += 1
+            continue
+
+        domain = su.normalize_domain(data.get("domain", Path(fp).stem.replace("_snapshot", "")))
+        if not domain:
+            failed_snapshots += 1
+            continue
+
+        raw_products = data.get("products", {})
+        if isinstance(raw_products, dict):
+            iterable = raw_products.values()
+            total_products = int(data.get("product_count") or len(raw_products) or 0)
+            total_products = max(total_products, len(raw_products))
+        elif isinstance(raw_products, list):
+            iterable = raw_products
+            total_products = int(data.get("product_count") or len(raw_products) or 0)
+            total_products = max(total_products, len(raw_products))
+        else:
+            continue
+
+        total_snapshot_products += total_products
+        domain_counts[domain] = total_products
+        # This endpoint is for micro-vertical/new-novelty sources. Do not spend
+        # taxonomy CPU on large stores; they belong to the broader today/workbench views.
+        if not (min_skus <= total_products <= max_skus):
+            continue
+
+        domain_entries = []
+        for raw in iterable:
+            if not isinstance(raw, dict):
+                continue
+            title = str(raw.get("title") or raw.get("product_title") or "").strip()
+            handle = str(raw.get("handle") or "").strip()
+            if not title:
+                continue
+            price = _v2_extract_product_price(raw)
+            raw_product_type = str(raw.get("product_type") or raw.get("productType") or "未分类").strip() or "未分类"
+            vendor = str(raw.get("vendor") or "").strip()
+            tags = raw.get("tags", [])
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+            elif not isinstance(tags, list):
+                tags = []
+            description = raw.get("description") or raw.get("body_html") or raw.get("描述摘要") or ""
+            entry = {
+                "domain": domain,
+                "title": title,
+                "handle": handle,
+                "price": price,
+                "product_type": raw_product_type,
+                "product_type_raw": raw_product_type,
+                "vendor": vendor,
+                "tags": tags,
+                "description": description,
+                "body_html": description,
+                "created_at": raw.get("created_at") or raw.get("createdAt") or "",
+                "updated_at": raw.get("updated_at") or raw.get("updatedAt") or "",
+                "published_at": raw.get("published_at") or raw.get("publishedAt") or "",
+                "url": raw.get("url") or raw.get("product_url") or "",
+                "source": raw.get("source") or "",
+                "platform": raw.get("platform") or "",
+                "images": raw.get("images", []) if isinstance(raw.get("images"), list) else [],
+                "variants": raw.get("variants", []) if isinstance(raw.get("variants"), list) else [],
+                "image_count": _v2_safe_int(raw.get("image_count") or raw.get("图片数") or len(raw.get("images", []) if isinstance(raw.get("images"), list) else [])),
+                "variant_count": _v2_safe_int(raw.get("variant_count") or raw.get("variants_count") or raw.get("变体数") or len(raw.get("variants", []) if isinstance(raw.get("variants"), list) else [])),
+            }
+            domain_entries.append(entry)
+
+        enriched_entries = [_v2_enrich_product_taxonomy(entry) for entry in domain_entries]
+        domain_items, removed = _v2_dedupe_products(enriched_entries)
+        duplicate_products_removed += removed
+        site_dedupe_meta[domain] = {
+            "raw_products_before_dedupe": len(domain_entries),
+            "deduped_products": len(domain_items),
+            "duplicate_products_removed": removed,
+        }
+
+        domain_categories = Counter()
+        for entry in domain_items:
+            products.append(entry)
+            category_counter[entry["product_type"]] += 1
+            vendor = str(entry.get("vendor") or "").strip()
+            if vendor:
+                vendor_counter[vendor] += 1
+            price = _valid_price(entry.get("price")) or 0
+            if price:
+                prices.append(price)
+            domain_categories[entry["product_type"]] += 1
+
+        dominant_category = domain_categories.most_common(1)[0][0] if domain_categories else "未分类"
+        domain_activity.append({
+            "domain": domain,
+            "today_count": len(domain_items),
+            "yesterday_count": 0,
+            "total_products": total_products,
+            "raw_products_before_dedupe": len(domain_entries),
+            "deduped_products": len(domain_items),
+            "duplicate_products_removed": removed,
+            "dominant_category": dominant_category,
+            "dominant_specific_category": dominant_category,
+        })
+
+    products.sort(key=lambda p: (p["price"], p["domain"], p["title"]), reverse=True)
+    domain_activity.sort(key=lambda d: (-int(d.get("total_products") or 0), d["domain"]))
+    prices.sort()
+
+    def _price_stats(values):
+        if not values:
+            return {"min": 0, "max": 0, "avg": 0, "median": 0, "q25": 0, "q75": 0}
+        n = len(values)
+        return {
+            "min": round(values[0], 2),
+            "max": round(values[-1], 2),
+            "avg": round(sum(values) / n, 2),
+            "median": _median_sorted(values),
+            "q25": _quantile_sorted(values, 0.25),
+            "q75": _quantile_sorted(values, 0.75),
+        }
+
+    site_groups = defaultdict(list)
+    for product in products:
+        site_groups[product["domain"]].append(product)
+
+    vertical_sites = []
+    for domain, items in site_groups.items():
+        total_products = int(domain_counts.get(domain, len(items)) or len(items))
+        if not (min_skus <= total_products <= max_skus):
+            continue
+        meta = site_dedupe_meta.get(domain, {})
+        raw_products_before_dedupe = int(meta.get("raw_products_before_dedupe") or len(items))
+        domain_removed = int(meta.get("duplicate_products_removed") or 0)
+        deduped_products = int(meta.get("deduped_products") or len(items))
+        categories = Counter((p.get("specific_category") or p.get("product_type") or "未分类") for p in items)
+        category_groups = Counter((p.get("category_group") or "Other DTC") for p in items)
+        use_cases = Counter((p.get("use_case") or "用途待补") for p in items)
+        examples = sorted(items, key=lambda p: (p["price"], p["title"]), reverse=True)
+        dominant_specific = categories.most_common(1)[0][0] if categories else "未分类"
+        dominant_group = category_groups.most_common(1)[0][0] if category_groups else "Other DTC"
+        dominant_use_case = use_cases.most_common(1)[0][0] if use_cases else "用途待补"
+        demo_count = sum(1 for p in items if p.get("demo_friendly"))
+        low_conf_count = sum(1 for p in items if int(p.get("category_confidence") or 0) < 35)
+        novelty_count = sum(1 for p in items if p.get("novelty_signal") and "待补" not in str(p.get("novelty_signal")))
+        avg_price = round(sum(float(p.get("price") or 0) for p in items) / max(len(items), 1), 2)
+        vertical_sites.append({
+            "domain": domain,
+            "total_products": total_products,
+            "new_products": len(items),
+            "raw_products_before_dedupe": raw_products_before_dedupe,
+            "deduped_products": deduped_products,
+            "duplicate_products_removed": domain_removed,
+            "dominant_category": dominant_specific,
+            "dominant_specific_category": dominant_specific,
+            "dominant_category_group": dominant_group,
+            "dominant_use_case": dominant_use_case,
+            "category_groups": dict(category_groups.most_common(5)),
+            "specific_categories": dict(categories.most_common(8)),
+            "category_count": len(categories),
+            "demo_friendly_count": demo_count,
+            "novelty_count": novelty_count,
+            "low_confidence_count": low_conf_count,
+            "avg_price": avg_price,
+            "sku_range": f"{min_skus}-{max_skus}",
+            "why": f"{min_skus}-{max_skus}个SKU的小垂直站；主线是{dominant_specific}，适合拆新品、价格锚点和素材角度",
+            "follow_strategy": f"先跟需求：{dominant_use_case}；选最高价/最可演示SKU做素材拆解，低置信产品自动补描述/图片/标签。",
+            "products": [
+                {
+                    "title": p.get("title", ""),
+                    "price": p.get("price", 0),
+                    "product_type": p.get("product_type", ""),
+                    "product_type_raw": p.get("product_type_raw", ""),
+                    "specific_category": p.get("specific_category", ""),
+                    "micro_category": p.get("micro_category", ""),
+                    "category_group": p.get("category_group", ""),
+                    "product_shape": p.get("product_shape", ""),
+                    "core_mechanism": p.get("core_mechanism", ""),
+                    "demo_scene": p.get("demo_scene", ""),
+                    "use_case": p.get("use_case", ""),
+                    "pain_point": p.get("pain_point", ""),
+                    "target_audience": p.get("target_audience", ""),
+                    "novelty_signal": p.get("novelty_signal", ""),
+                    "creative_angle": p.get("creative_angle", ""),
+                    "follow_playbook": p.get("follow_playbook", ""),
+                    "how_to_follow": p.get("how_to_follow", ""),
+                    "follow_intensity": p.get("follow_intensity", ""),
+                    "monitoring_reason": p.get("monitoring_reason", ""),
+                    "monitoring_focus_fields": p.get("monitoring_focus_fields", []),
+                    "next_data_action": p.get("next_data_action", ""),
+                    "fulfillment_risk": p.get("fulfillment_risk", ""),
+                    "category_confidence": p.get("category_confidence", 0),
+                    "matched_keywords": p.get("matched_keywords", []),
+                    "micro_matched_keywords": p.get("micro_matched_keywords", []),
+                    "extraction_depth": p.get("extraction_depth", ""),
+                    "missing_fields": p.get("missing_fields", []),
+                    "duplicate_group_count": p.get("duplicate_group_count", 1),
+                    "duplicate_products_removed": p.get("duplicate_products_removed", 0),
+                    "duplicate_titles": p.get("duplicate_titles", []),
+                    "product_url": _v2_product_url(domain, p.get("handle", ""), p.get("url", "")),
+                }
+                for p in examples
+            ],
+        })
+
+    vertical_sites.sort(key=lambda s: (-int(s.get("total_products") or 0), -int(s.get("new_products") or 0), s["domain"]))
+
+    trend_signals = []
+    if products:
+        trend_signals.append(f"全量快照站点 {len(domain_counts)} 个")
+        trend_signals.append(f"全库产品 {total_snapshot_products:,} 个")
+        trend_signals.append(f"小垂直站产品 {len(products):,} 个 (范围 {min_skus}-{max_skus} SKU)")
+        if duplicate_products_removed:
+            trend_signals.append(f"小垂直站已去重 {duplicate_products_removed:,} 个重复变体/套装")
+        trend_signals.append("小垂直站按 snapshot 深度聚合；大站只计数不做分类，保证接口可用")
+
+    return {
+        "ok": True,
+        "scan_date": datetime.now().strftime("%Y-%m-%d"),
+        "scan_time": datetime.now().isoformat(),
+        "method": "disk-vertical",
+        "cached": True,
+        "from_disk": True,
+        "min_skus": min_skus,
+        "max_skus": max_skus,
+        "sku_range": f"{min_skus}-{max_skus}",
+        "scanned_snapshots": scanned_snapshots,
+        "failed_snapshots": failed_snapshots,
+        "domain_count": len(domain_counts),
+        "total_snapshot_products": total_snapshot_products,
+        "qualified_vertical_products": len(products),
+        "raw_vertical_products_before_dedupe": len(products) + duplicate_products_removed,
+        "duplicate_products_removed": duplicate_products_removed,
+        "total_products": len(products),
+        "domain_activity": domain_activity,
+        "vertical_micro_sites": vertical_sites,
+        "category_breakdown": dict(category_counter.most_common(8)),
+        "vendor_breakdown": dict(vendor_counter.most_common(10)),
+        "price_stats": _price_stats(prices),
+        "trend_signals": trend_signals,
+    }
+
+
+def _v2_vertical_sites_payload(
+    limit: int = 0,
+    kind: str = V2_VERTICAL_DEFAULT_KIND,
+    min_skus: int = None,
+    max_skus: int = None,
+    novelty_only: bool = False,
+    demo_only: bool = False,
+    min_avg_price: float = 0.0,
+) -> dict:
+    """Return cached micro-vertical site aggregation built from local snapshots.
+
+    Supports preset ``kind`` (tiny/small/medium/novelty/demo/highprice) or explicit
+    ``min_skus``/``max_skus`` overrides plus on-the-fly filtering by novelty/demo
+    flags and minimum average price.
+    """
+
+    global _v2_vertical_sites_cache, _v2_vertical_sites_cache_signature, _v2_vertical_sites_range_cache
+
+    preset = V2_VERTICAL_PRESETS.get(str(kind or "").lower()) or V2_VERTICAL_PRESETS[V2_VERTICAL_DEFAULT_KIND]
+    eff_min = int(min_skus) if min_skus is not None else int(preset["min_skus"])
+    eff_max = int(max_skus) if max_skus is not None else int(preset["max_skus"])
+    if eff_max < eff_min:
+        eff_max = eff_min
+    if novelty_only is None:
+        novelty_only = bool(preset.get("novelty_only"))
+    if demo_only is None:
+        demo_only = bool(preset.get("demo_only"))
+    min_avg_price = float(min_avg_price or preset.get("min_avg_price") or 0.0)
+
+    snapshot_signature = _v2_snapshot_files_signature()
+    cache_key = (eff_min, eff_max)
+    cached_entry = _v2_vertical_sites_range_cache.get(cache_key)
+    if cached_entry and cached_entry[0] == snapshot_signature:
+        base_payload = cached_entry[1]
+    else:
+        base_payload = _v2_load_snapshot_products(min_skus=eff_min, max_skus=eff_max)
+        _v2_vertical_sites_range_cache[cache_key] = (snapshot_signature, base_payload)
+
+    # Keep the historical 5-15 cache hot for legacy callers
+    if (eff_min, eff_max) == (5, 15):
+        _v2_vertical_sites_cache = base_payload
+        _v2_vertical_sites_cache_signature = snapshot_signature
+
+    payload = dict(base_payload or {})
+    sites = list(payload.get("vertical_micro_sites") or [])
+
+    if novelty_only:
+        sites = [s for s in sites if int(s.get("novelty_count") or 0) > 0]
+    if demo_only:
+        sites = [s for s in sites if int(s.get("demo_friendly_count") or 0) > 0]
+    if min_avg_price > 0:
+        sites = [s for s in sites if float(s.get("avg_price") or 0) >= min_avg_price]
+
+    total_sites = len(sites)
+    if limit and limit > 0:
+        sites = sites[:limit]
+    payload["vertical_micro_sites"] = sites
+    payload["vertical_micro_sites_total"] = total_sites
+    payload["kind"] = str(kind or V2_VERTICAL_DEFAULT_KIND).lower()
+    payload["kind_label"] = preset.get("label", payload["kind"])
+    payload["min_skus"] = eff_min
+    payload["max_skus"] = eff_max
+    payload["sku_range"] = f"{eff_min}-{eff_max}"
+    payload["filters"] = {
+        "novelty_only": bool(novelty_only),
+        "demo_only": bool(demo_only),
+        "min_avg_price": min_avg_price,
+    }
+    payload["cached"] = True
+    payload["from_disk"] = True
+    payload["snapshot_signature"] = snapshot_signature
+    return payload
+
+def _v2_fetch_ad_signals():
+    """从 8000 端口获取全量广告信号，返回 domain->signals 映射"""
+    ad_map = {}
+    try:
+        all_brands = []
+        offset = 0
+        while True:
+            url = f"http://127.0.0.1:8000/brands?limit=5000&offset={offset}"
+            req = urllib.request.Request(url)
+            with _LOCAL_OPENER.open(req, timeout=15) as resp:
+                batch = json.loads(resp.read())
+            if not batch:
+                break
+            all_brands.extend(batch)
+            if len(batch) < 5000:
+                break
+            offset += 5000
+        for b in all_brands:
+            domain = b.get("domain", "").replace("www.", "")
+            ad_map[domain] = {
+                "has_recent_ads": (b.get("appearance_count", 0) > 0),
+                "ad_creative_count": b.get("appearance_count", 0),
+                "ai_score": b.get("ai_score", 0),
+                "orbit_score": b.get("orbit_score", 0),
+                "grade": b.get("grade", ""),
+            }
+    except: pass
+    return ad_map
+
+def _v2_score_all_products(products_list):
+    """对所有产品进行评分（价格信号 + 8000 广告信号）"""
+    ad_map = _v2_fetch_ad_signals()
+    scored = []
+    for p in products_list:
+        p = _v2_enrich_product_taxonomy(dict(p))
+        domain = p.get("domain", "").replace("www.", "")
+        ad_info = ad_map.get(domain, {})
+        extra = {
+            "has_recent_ads": ad_info.get("has_recent_ads", False),
+            "ad_creative_count": ad_info.get("ad_creative_count", 0),
+            "ai_score": ad_info.get("ai_score", 0),
+            "orbit_score": ad_info.get("orbit_score", 0),
+            "grade": ad_info.get("grade", ""),
+        }
+        result = _score_new_product(
+            {
+                "price": p.get("price", 0),
+                "title": p.get("title", ""),
+                "product_type": p.get("product_type", ""),
+                "product_type_raw": p.get("product_type_raw", ""),
+                "vendor": p.get("vendor", ""),
+                "tags": p.get("tags", []),
+                "description": p.get("description", ""),
+                "body_html": p.get("body_html", ""),
+                "source": p.get("source", ""),
+                "platform": p.get("platform", ""),
+                "url": p.get("url") or p.get("product_url", ""),
+                "image_count": p.get("image_count", 0),
+                "variant_count": p.get("variant_count", 0),
+            },
+            domain, extra
+        )
+        result["product_title"] = p.get("title", "")
+        result["handle"] = p.get("handle", "")
+        result["domain"] = domain
+        result["product_type"] = result.get("specific_category") or p.get("product_type", "未分类")
+        result["product_type_raw"] = p.get("product_type_raw", "未分类")
+        result["product_url"] = _v2_product_url(domain, p.get("handle", ""), p.get("url") or p.get("product_url", ""))
+        result["vendor"] = p.get("vendor", "")
+        result["ad_grade"] = ad_info.get("grade", "")
+        result["ad_appearances"] = ad_info.get("ad_creative_count", 0)
+        result["store_product_count"] = p.get("store_product_count", 0)
+        platform_validation = build_platform_validation_evidence({
+            "domain": domain,
+            "title": p.get("title", ""),
+            "handle": p.get("handle", ""),
+            "price": p.get("price", 0),
+            "product_type": p.get("product_type", "未分类"),
+            "vendor": p.get("vendor", ""),
+            "tags": p.get("tags", []),
+            "store_product_count": p.get("store_product_count", 0),
+            "specific_category": p.get("specific_category", ""),
+            "category_group": p.get("category_group", ""),
+            "use_case": p.get("use_case", ""),
+            "pain_point": p.get("pain_point", ""),
+        })
+        result["platform_validation"] = platform_validation
+        platform_score = int(platform_validation.get("score") or 0)
+        if platform_score >= 48:
+            result["score"] = min(100, result["score"] + 10)
+            result["reasons"].append("Reddit/GT/小垂直站外部验证强 (+10)")
+        elif platform_score >= 22:
+            result["score"] = min(100, result["score"] + 6)
+            result["reasons"].append("已有部分外部验证缓存 (+6)")
+        if (platform_validation.get("store_context") or {}).get("is_micro_vertical"):
+            result["score"] = min(100, result["score"] + 5)
+            result["reasons"].append("约10个产品的小垂直站，可重点拆解 (+5)")
+        result["fb_signal"] = {
+            "ad_creative_count": ad_info.get("ad_creative_count", 0),
+            "appearance_count": ad_info.get("ad_creative_count", 0),
+            "ai_score": ad_info.get("ai_score", 0),
+            "orbit_score": ad_info.get("orbit_score", 0),
+            "grade": ad_info.get("grade", ""),
+            "fb_verified_by_8000": bool(ad_info),
+            "fb_verification_status": "matched" if ad_info else "not_found",
+        }
+        result["platform_ai"] = build_platform_ai_profit_engine({
+            "title": p.get("title", ""),
+            "domain": domain,
+            "handle": p.get("handle", ""),
+            "price": p.get("price", 0),
+            "product_type": p.get("product_type", "未分类"),
+            "vendor": p.get("vendor", ""),
+            "tags": p.get("tags", []),
+            "image_count": p.get("image_count", 0),
+            "variant_count": p.get("variant_count", 0),
+            "specific_category": result.get("specific_category", ""),
+            "category_group": result.get("category_group", ""),
+            "use_case": result.get("use_case", ""),
+            "pain_point": result.get("pain_point", ""),
+            "creative_angle": result.get("creative_angle", ""),
+            "risk_flags": result.get("risk_flags", []),
+            "conversion_angles": result.get("conversion_angles", []),
+            "platform_validation": platform_validation,
+            "fb_signal": result["fb_signal"],
+            "score": result.get("score", 0),
+            "decision": result.get("tier", ""),
+        })
+        ai_ready = result["platform_ai"].get("readiness")
+        ai_score = int(result["platform_ai"].get("automation_score") or 0)
+        if ai_ready == "ai_ready":
+            result["score"] = min(100, result["score"] + 8)
+            result["reasons"].append(f"平台AI可投性强 {ai_score}/100 (+8)")
+        elif ai_ready == "asset_gap":
+            result["score"] = min(100, result["score"] + 3)
+            result["reasons"].append(f"平台AI可投性中等 {ai_score}/100，需补素材/PDP (+3)")
+        scored.append(result)
+
+    scored.sort(key=lambda x: -x["score"])
+    return scored
+
+def _v2_follow_decision(scored_product, port8k_note=""):
+    """根据评分生成跟品决策 + 实操建议"""
+    score = scored_product.get("score", 0)
+    tier = scored_product.get("tier", "")
+    price = scored_product.get("price", 0)
+    product_type = scored_product.get("product_type", "")
+    ad_grade = scored_product.get("ad_grade", "")
+    risks = scored_product.get("risk_flags", [])
+    angles = scored_product.get("conversion_angles", [])
+    ad_heat = scored_product.get("ad_heat", "")
+    platform_ai = scored_product.get("platform_ai") if isinstance(scored_product.get("platform_ai"), dict) else {}
+
+    if score >= 82 and len(risks) == 0:
+        decision = "立即测款"
+        urgency = "high"
+        action_items = [
+            "24h内确认1688/速卖通同款成本、重量、发货时效",
+            "拆6条平台AI素材包：3条UGC演示 + 2条痛点/结果 + 1条Offer堆叠",
+            "Shopify先做单品LP：痛点Hero + GIF演示 + 评论证明 + Bundle",
+            "首测3组素材 × 2个角度 × $20/组/天，48h看ATC和CPA",
+        ]
+    elif score >= 65:
+        decision = "素材验证"
+        urgency = "medium"
+        action_items = [
+            "先不囤货，做素材和落地页烟雾测试",
+            "补齐平台AI缺口：素材角度、PDP图片/GIF、趋势/UGC证据",
+            "观察3天内FB素材数是否继续增加",
+            "供应链成本低于售价35%再进入实测",
+        ]
+    elif score >= 45:
+        decision = "加入观察"
+        urgency = "low"
+        action_items = [
+            "加入观察列表，每日看广告数/竞品上新是否继续增长",
+            "只记录素材钩子，不立即建站投放",
+            "等出现5条以上素材或多竞品同步上架再复评",
+        ]
+    else:
+        decision = "暂不跟品"
+        urgency = "none"
+        action_items = ["仅记录归档，除非后续广告数快速增长否则不行动"]
+
+    port8k_notes = []
+    if ad_grade == "WATCH":
+        port8k_notes.append("FB管线评级WATCH——值得重点关注")
+    elif ad_grade == "HOT":
+        port8k_notes.append("FB管线评级HOT——热门放量中")
+    elif ad_grade == "SOLID":
+        port8k_notes.append("FB管线评级SOLID——稳定投放")
+
+    return {
+        "decision": decision,
+        "urgency": urgency,
+        "action_items": action_items,
+        "rationale": "出单概率{0}分，价格${1:.0f}，品类'{2}'，广告热度'{3}'".format(score, price, product_type, ad_heat),
+        "go_kill_rule": {
+            "go": "48h内 CTR>1.5%、ATC率>4%、CPA低于售价35% 可继续加预算",
+            "kill": "花费达到售价2倍仍无ATC，或CPA高于售价50%，立即停测",
+        },
+        "conversion_angles": angles,
+        "platform_ai": platform_ai,
+        "risk_flags": risks,
+        "port8k_notes": port8k_notes,
+        "scored": scored_product,
+    }
+
+
+def _v2_vertical_micro_sites(products, domain_activity):
+    """List focused small stores with roughly 10 products as separate follow targets."""
+    activity_by_domain = {
+        str(item.get("domain", "")).replace("www.", ""): item
+        for item in (domain_activity or [])
+        if isinstance(item, dict)
+    }
+    grouped = defaultdict(list)
+    for product in products or []:
+        domain = str(product.get("domain", "")).replace("www.", "")
+        if domain:
+            grouped[domain].append(product)
+
+    sites = []
+    for domain, items in grouped.items():
+        activity = activity_by_domain.get(domain, {})
+        total_products = int(activity.get("total_products", 0) or 0)
+        if not (5 <= total_products <= 15):
+            continue
+        enriched_items = [_v2_enrich_product_taxonomy(dict(p)) for p in items]
+        deduped_items, removed = _v2_dedupe_products(enriched_items)
+        raw_products_before_dedupe = int(activity.get("raw_products_before_dedupe") or len(enriched_items))
+        if not activity.get("raw_products_before_dedupe"):
+            raw_products_before_dedupe = len(enriched_items)
+        removed = max(int(activity.get("duplicate_products_removed") or 0), removed)
+        deduped_count = int(activity.get("deduped_products") or len(deduped_items))
+        categories = Counter((p.get("specific_category") or p.get("product_type") or "未分类") for p in deduped_items)
+        category_groups = Counter((p.get("category_group") or "Other DTC") for p in deduped_items)
+        use_cases = Counter((p.get("use_case") or "用途待补") for p in deduped_items)
+        examples = sorted(deduped_items, key=lambda p: float(p.get("price", 0) or 0), reverse=True)[:5]
+        dominant_specific = categories.most_common(1)[0][0] if categories else "未分类"
+        dominant_group = category_groups.most_common(1)[0][0] if category_groups else "Other DTC"
+        dominant_use_case = use_cases.most_common(1)[0][0] if use_cases else "用途待补"
+        sites.append({
+            "domain": domain,
+            "total_products": total_products,
+            "new_products": len(deduped_items),
+            "raw_products_before_dedupe": raw_products_before_dedupe,
+            "deduped_products": deduped_count,
+            "duplicate_products_removed": removed,
+            "dominant_category": dominant_specific,
+            "dominant_specific_category": dominant_specific,
+            "dominant_category_group": dominant_group,
+            "dominant_use_case": dominant_use_case,
+            "category_groups": dict(category_groups.most_common(5)),
+            "specific_categories": dict(categories.most_common(8)),
+            "category_count": len(categories),
+            "demo_friendly_count": sum(1 for p in deduped_items if p.get("demo_friendly")),
+            "novelty_count": sum(1 for p in deduped_items if p.get("novelty_signal") and "待补" not in str(p.get("novelty_signal"))),
+            "low_confidence_count": sum(1 for p in deduped_items if int(p.get("category_confidence") or 0) < 35),
+            "why": f"约10个SKU的小垂直站；主线是{dominant_specific}，适合找新奇特单品、拆定价和上新节奏",
+            "follow_strategy": f"先跟需求：{dominant_use_case}；优先测最高价/最可演示SKU，低置信产品自动补抓描述/图片/标签。",
+            "products": [
+                {
+                    "title": p.get("title", ""),
+                    "price": p.get("price", 0),
+                    "product_type": p.get("product_type", ""),
+                    "product_type_raw": p.get("product_type_raw", ""),
+                    "specific_category": p.get("specific_category", ""),
+                    "micro_category": p.get("micro_category", ""),
+                    "category_group": p.get("category_group", ""),
+                    "product_shape": p.get("product_shape", ""),
+                    "core_mechanism": p.get("core_mechanism", ""),
+                    "demo_scene": p.get("demo_scene", ""),
+                    "use_case": p.get("use_case", ""),
+                    "pain_point": p.get("pain_point", ""),
+                    "target_audience": p.get("target_audience", ""),
+                    "novelty_signal": p.get("novelty_signal", ""),
+                    "creative_angle": p.get("creative_angle", ""),
+                    "follow_playbook": p.get("follow_playbook", ""),
+                    "how_to_follow": p.get("how_to_follow", ""),
+                    "follow_intensity": p.get("follow_intensity", ""),
+                    "monitoring_reason": p.get("monitoring_reason", ""),
+                    "monitoring_focus_fields": p.get("monitoring_focus_fields", []),
+                    "next_data_action": p.get("next_data_action", ""),
+                    "fulfillment_risk": p.get("fulfillment_risk", ""),
+                    "category_confidence": p.get("category_confidence", 0),
+                    "matched_keywords": p.get("matched_keywords", []),
+                    "micro_matched_keywords": p.get("micro_matched_keywords", []),
+                    "extraction_depth": p.get("extraction_depth", ""),
+                    "missing_fields": p.get("missing_fields", []),
+                    "duplicate_group_count": p.get("duplicate_group_count", 1),
+                    "duplicate_products_removed": p.get("duplicate_products_removed", 0),
+                    "duplicate_titles": p.get("duplicate_titles", []),
+                    "product_url": _v2_product_url(domain, p.get("handle", ""), p.get("url") or p.get("product_url", "")),
+                }
+                for p in examples
+            ],
+        })
+    sites.sort(key=lambda s: (-s["new_products"], s["total_products"], s["domain"]))
+    return sites[:30]
+
+
+@app.post("/api/v2/today-scan")
+def api_v2_today_scan(limit: int = 0, min_price: float = 1, max_price: float = 5000):
+    """全量扫描所有监控域名，提取今天新上架的产品（created_at / published_at = 今天）。
+    limit=0 表示扫描全部域名"""
+    global _v2_cache, _v2_cache_ts
+
+    now_ts = time.time()
+    if _v2_cache is not None and (now_ts - _v2_cache_ts) < _V2_CACHE_TTL:
+        return {**_v2_cache, "cached": True}
+
+    import urllib.request, ssl, concurrent.futures
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    d = _load_all()
+    all_stores = d["stores"]
+    all_domains = [s["domain"] for s in (all_stores[:limit] if limit > 0 else all_stores)]
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    def scan_one(domain):
+        try:
+            url = "https://" + domain + "/products.json?limit=250"
+            req = urllib.request.Request(url, headers={"User-Agent": su.USER_AGENT})
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                data = json.loads(resp.read())
+            products = data.get("products", [])
+
+            today_products = []
+            yesterday_products = []
+
+            for p in products:
+                ca = (p.get("created_at") or "")[:10]
+                pa = (p.get("published_at") or "")[:10]
+                ua = (p.get("updated_at") or "")[:10]
+                is_today = (ca == today or pa == today)
+                is_yesterday = (ca == yesterday or pa == yesterday)
+
+                if is_today or is_yesterday:
+                    entry = {
+                        "title": p.get("title", ""),
+                        "handle": p.get("handle", ""),
+                        "price": float(p.get("variants", [{}])[0].get("price", 0) or 0) if p.get("variants") else 0,
+                        "created_at": p.get("created_at", ""),
+                        "published_at": p.get("published_at", ""),
+                        "updated_at": p.get("updated_at", ""),
+                        "product_type": p.get("product_type", "") or "未分类",
+                        "product_type_raw": p.get("product_type", "") or "未分类",
+                        "vendor": p.get("vendor", ""),
+                        "tags": p.get("tags", []) if isinstance(p.get("tags"), list) else [],
+                        "description": p.get("body_html", "") or "",
+                        "body_html": p.get("body_html", "") or "",
+                        "url": f"https://{domain}/products/{p.get('handle', '')}" if p.get("handle") else f"https://{domain}",
+                        "source": "products.json",
+                        "platform": "shopify",
+                        "image_count": len(p.get("images", [])),
+                        "domain": domain,
+                        "store_product_count": len(products),
+                        "variant_count": len(p.get("variants", [])),
+                    }
+                    entry = _v2_enrich_product_taxonomy(entry)
+                    if is_today:
+                        today_products.append(entry)
+                    if is_yesterday:
+                        yesterday_products.append(entry)
+
+            return {
+                "domain": domain,
+                "ok": True,
+                "total_products": len(products),
+                "today_count": len(today_products),
+                "yesterday_count": len(yesterday_products),
+                "today_products": today_products,
+                "yesterday_products": yesterday_products,
+            }
+        except Exception as e:
+            return {"domain": domain, "ok": False, "error": str(e)[:120]}
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        futures = {executor.submit(scan_one, d): d for d in all_domains}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results.append(future.result(timeout=20))
+            except Exception as e:
+                results.append({"domain": futures[future], "ok": False, "error": str(e)[:120]})
+
+    # 汇总
+    all_today = []
+    all_yesterday = []
+    category_counter = Counter()
+    vendor_counter = Counter()
+    domain_activity = []
+    prices_today = []
+    prices_yesterday = []
+
+    for r in results:
+        if not r.get("ok"):
+            continue
+        for p in r.get("today_products", []):
+            pr = p.get("price", 0)
+            if min_price <= pr <= max_price:
+                all_today.append(p)
+                prices_today.append(pr)
+                category_counter[p.get("specific_category") or p.get("product_type", "未分类")] += 1
+                vendor_counter[p.get("vendor", "")] += 1
+        for p in r.get("yesterday_products", []):
+            pr = p.get("price", 0)
+            if min_price <= pr <= max_price:
+                all_yesterday.append(p)
+                prices_yesterday.append(pr)
+        if r.get("today_count", 0) > 0:
+            domain_activity.append({
+                "domain": r["domain"],
+                "today_count": r["today_count"],
+                "yesterday_count": r.get("yesterday_count", 0),
+                "total_products": r.get("total_products", 0),
+            })
+
+    # 排序
+    all_today.sort(key=lambda x: -x["price"])
+    domain_activity.sort(key=lambda x: -x["today_count"])
+
+    # 价格统计
+    def price_stats(prices):
+        if not prices:
+            return {"min": 0, "max": 0, "avg": 0, "median": 0, "q25": 0, "q75": 0}
+        sp = sorted(prices)
+        n = len(sp)
+        return {
+            "min": round(sp[0], 2), "max": round(sp[-1], 2),
+            "avg": round(sum(sp) / n, 2), "median": round(sp[n // 2], 2),
+            "q25": round(sp[n // 4], 2), "q75": round(sp[3 * n // 4], 2),
+        }
+
+    # 价格带
+    bands = {"$0-25": 0, "$25-50": 0, "$50-100": 0, "$100-200": 0, "$200-500": 0, "$500+": 0}
+    for pr in prices_today:
+        if pr <= 25: bands["$0-25"] += 1
+        elif pr <= 50: bands["$25-50"] += 1
+        elif pr <= 100: bands["$50-100"] += 1
+        elif pr <= 200: bands["$100-200"] += 1
+        elif pr <= 500: bands["$200-500"] += 1
+        else: bands["$500+"] += 1
+
+    # 趋势信号
+    trend_signals = []
+    if len(prices_today) > 0 and len(prices_yesterday) > 0:
+        avg_today = sum(prices_today) / len(prices_today)
+        avg_yesterday = sum(prices_yesterday) / len(prices_yesterday)
+        if avg_today > avg_yesterday * 1.1:
+            trend_signals.append("客单价上升 (+{:.0f}%)".format((avg_today / avg_yesterday - 1) * 100))
+        elif avg_today < avg_yesterday * 0.9:
+            trend_signals.append("客单价下降 (-{:.0f}%)".format((1 - avg_today / avg_yesterday) * 100))
+        else:
+            trend_signals.append("客单价稳定")
+
+    top_cats = category_counter.most_common(8)
+    if top_cats:
+        trend_signals.append("热门品类: " + " · ".join([c for c, _ in top_cats[:3]]))
+
+    # 高价值新品（价格 > $100 且有图片）
+    high_value = [p for p in all_today if p["price"] >= 100 and p["image_count"] > 0]
+    high_value.sort(key=lambda x: -x["price"])
+
+    ok_domains = [r for r in results if r.get("ok")]
+    fail_domains = [r for r in results if not r.get("ok")]
+
+    payload = {
+        "ok": True,
+        "scan_date": today,
+        "scan_time": datetime.now().isoformat(),
+        "scanned_domains": len(ok_domains),
+        "failed_domains": len(fail_domains),
+        "total_new_today": len(all_today),
+        "total_new_yesterday": len(all_yesterday),
+        "domains_with_new": len(domain_activity),
+        "products": all_today[:500],
+        "high_value_products": high_value[:30],
+        "category_breakdown": dict(top_cats),
+        "vendor_breakdown": dict(vendor_counter.most_common(10)),
+        "price_stats": price_stats(prices_today),
+        "yesterday_price_stats": price_stats(prices_yesterday),
+        "price_bands": bands,
+        "domain_activity": domain_activity[:30],
+        "vertical_micro_sites": _v2_vertical_micro_sites(all_today, domain_activity),
+        "trend_signals": trend_signals,
+        "cached": False,
+    }
+
+    # 评分 + 跟品决策
+    scored = _v2_score_all_products(all_today)
+    tier_counts = Counter(s["tier"] for s in scored)
+    payload["scored_products"] = scored
+    payload["tier_summary"] = dict(tier_counts)
+    payload["top_decisions"] = []
+    payload["top_decisions_deprecated"] = True
+
+    _v2_cache = payload
+    _v2_cache_ts = now_ts
+    _v2_save_cache(payload)  # 持久化到磁盘
+    return payload
+
+
+@app.get("/api/v2/today-results")
+def api_v2_today_results():
+    """返回缓存的 V2 扫描结果（内存 → 磁盘 fallback）"""
+    if _v2_cache is not None:
+        return {**_v2_cache, "cached": True}
+    disk = _v2_load_cache()
+    if disk:
+        return {**disk, "cached": True, "from_disk": True}
+    return {"ok": False, "error": "尚无扫描数据，请先 POST /api/v2/today-scan"}
+
+
+@app.get("/api/v2/today-fast")
+def api_v2_today_fast(max_snapshot_age_days: int = 3, product_limit: int = 500, score_limit: int = 500):
+    """瞬时快扫：从本地 snapshot 文件读取今日新品（无需 HTTP）"""
+    global _v2_cache, _v2_cache_ts
+
+    max_snapshot_age_days = max(1, min(int(max_snapshot_age_days), 14))
+    product_limit = max(1, min(int(product_limit), 2000))
+    score_limit = max(1, min(int(score_limit), 3000))
+    now_ts = time.time()
+    if _v2_cache is not None and (now_ts - _v2_cache_ts) < _V2_CACHE_TTL:
+        cached_meta = _v2_cache.get("scan_meta", {})
+        cached_products = _v2_cache.get("scored_products") or []
+        cache_has_platform_ai = not cached_products or isinstance(cached_products[0].get("platform_ai"), dict)
+        cached_product_limit = int(cached_meta.get("product_limit") or 0)
+        cached_score_limit = int(cached_meta.get("score_limit") or 0)
+        if (
+            cached_meta.get("max_snapshot_age_days") == max_snapshot_age_days
+            and cached_product_limit >= product_limit
+            and cached_score_limit >= score_limit
+            and cache_has_platform_ai
+        ):
+            return {**_v2_cache, "cached": True}
+
+    now = datetime.now()
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    valid_snapshot_dates = {
+        (now - timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in range(max_snapshot_age_days)
+    }
+
+    all_today = []
+    all_yesterday = []
+    category_counter = Counter()
+    vendor_counter = Counter()
+    domain_activity = []
+    prices_today = []
+    prices_yesterday = []
+    scanned_snapshots = 0
+    skipped_old_snapshots = 0
+    failed_snapshots = 0
+
+    for fp in sorted(glob.glob(str(MONITOR_DIR / "*_snapshot.json"))):
+        try:
+            snapshot_date = datetime.fromtimestamp(Path(fp).stat().st_mtime).strftime("%Y-%m-%d")
+        except OSError:
+            failed_snapshots += 1
+            continue
+        if snapshot_date not in valid_snapshot_dates:
+            skipped_old_snapshots += 1
+            continue
+        scanned_snapshots += 1
+        try:
+            data = json.loads(Path(fp).read_text(encoding="utf-8"))
+            domain = data.get("domain", "")
+            prods = data.get("products", {})
+            plist = list(prods.values()) if isinstance(prods, dict) else (prods if isinstance(prods, list) else [])
+            today_count = 0
+            yesterday_count = 0
+
+            for p in plist:
+                ua = (p.get("updated_at") or "")[:10]
+                ca = (p.get("created_at") or "")[:10]
+                pa = (p.get("published_at") or "")[:10]
+                is_today = (ua == today or ca == today or pa == today)
+                is_yesterday = (ua == yesterday or ca == yesterday or pa == yesterday)
+                if not is_today and not is_yesterday:
+                    continue
+
+                price = float(p.get("price", 0) or 0)
+                entry = {
+                    "title": p.get("title", ""),
+                    "handle": p.get("handle", ""),
+                    "price": price,
+                    "product_type": p.get("product_type", "") or "未分类",
+                    "product_type_raw": p.get("product_type", "") or "未分类",
+                    "vendor": p.get("vendor", ""),
+                    "domain": domain,
+                    "store_product_count": len(plist),
+                    "created_at": p.get("created_at", ""),
+                    "updated_at": p.get("updated_at", ""),
+                    "published_at": p.get("published_at", ""),
+                    "tags": p.get("tags", []) if isinstance(p.get("tags"), list) else [],
+                    "description": p.get("description") or p.get("body_html") or p.get("描述摘要") or "",
+                    "body_html": p.get("body_html") or p.get("description") or p.get("描述摘要") or "",
+                    "url": p.get("url") or p.get("product_url") or "",
+                    "source": p.get("source") or "",
+                    "platform": p.get("platform") or "",
+                    "image_count": int(p.get("image_count") or p.get("图片数") or 0),
+                    "variant_count": int(p.get("variant_count") or p.get("variants_count") or p.get("变体数") or 0),
+                }
+                if is_today:
+                    all_today.append(entry)
+                    prices_today.append(price)
+                    vendor_counter[p.get("vendor", "")] += 1
+                    today_count += 1
+                if is_yesterday:
+                    all_yesterday.append(entry)
+                    prices_yesterday.append(price)
+                    yesterday_count += 1
+
+            if today_count > 0:
+                domain_activity.append({
+                    "domain": domain, "today_count": today_count,
+                    "yesterday_count": yesterday_count, "total_products": len(plist),
+                })
+        except:
+            failed_snapshots += 1
+            continue
+
+    all_today.sort(key=lambda x: -x["price"])
+    domain_activity.sort(key=lambda x: -x["today_count"])
+
+    def product_key(product):
+        return (
+            str(product.get("domain", "")),
+            str(product.get("handle", "")),
+            str(product.get("title", "")),
+        )
+
+    enrich_limit = min(len(all_today), max(product_limit, score_limit, 120))
+    enriched_products = [_v2_enrich_product_taxonomy(dict(p)) for p in all_today[:enrich_limit]]
+    enriched_by_key = {product_key(p): p for p in enriched_products}
+
+    def enriched_product(product):
+        key = product_key(product)
+        if key not in enriched_by_key:
+            enriched_by_key[key] = _v2_enrich_product_taxonomy(dict(product))
+        return enriched_by_key[key]
+
+    products_out = [enriched_product(p) for p in all_today[:product_limit]]
+    score_products = [enriched_product(p) for p in all_today[:score_limit]]
+    for p in enriched_products:
+        category_counter[p.get("specific_category") or p.get("product_type", "未分类")] += 1
+
+    def ps(prices):
+        if not prices: return {"min": 0, "max": 0, "avg": 0, "median": 0, "q25": 0, "q75": 0}
+        sp = sorted(prices); n = len(sp)
+        return {"min": round(sp[0], 2), "max": round(sp[-1], 2), "avg": round(sum(sp) / n, 2),
+                "median": round(sp[n // 2], 2), "q25": round(sp[n // 4], 2), "q75": round(sp[3 * n // 4], 2)}
+
+    bands = {"$0-25": 0, "$25-50": 0, "$50-100": 0, "$100-200": 0, "$200-500": 0, "$500+": 0}
+    for pr in prices_today:
+        if pr <= 25: bands["$0-25"] += 1
+        elif pr <= 50: bands["$25-50"] += 1
+        elif pr <= 100: bands["$50-100"] += 1
+        elif pr <= 200: bands["$100-200"] += 1
+        elif pr <= 500: bands["$200-500"] += 1
+        else: bands["$500+"] += 1
+
+    trend_signals = []
+    if prices_today and prices_yesterday:
+        at = sum(prices_today) / len(prices_today)
+        ay = sum(prices_yesterday) / len(prices_yesterday)
+        if at > ay * 1.1: trend_signals.append("客单价上升 (+{:.0f}%)".format((at / ay - 1) * 100))
+        elif at < ay * 0.9: trend_signals.append("客单价下降 (-{:.0f}%)".format((1 - at / ay) * 100))
+        else: trend_signals.append("客单价稳定")
+
+    top_cats = category_counter.most_common(8)
+    if top_cats: trend_signals.append("热门品类: " + " · ".join([c for c, _ in top_cats[:3]]))
+
+    high_value = []
+    for p in all_today:
+        if p["price"] < 100:
+            break
+        high_value.append(enriched_product(p))
+        if len(high_value) >= 30:
+            break
+    high_value.sort(key=lambda x: -x["price"])
+    vertical_source = [
+        p for p in products_out
+        if 5 <= int(p.get("store_product_count") or 0) <= 15
+    ]
+
+    payload = {
+        "ok": True, "scan_date": today, "scan_time": datetime.now().isoformat(),
+        "method": "disk-fast", "scanned_domains": len(domain_activity), "failed_domains": failed_snapshots,
+        "total_new_today": len(all_today), "total_new_yesterday": len(all_yesterday),
+        "domains_with_new": len(domain_activity),
+        "products": products_out, "high_value_products": high_value,
+        "category_breakdown": dict(top_cats), "vendor_breakdown": dict(vendor_counter.most_common(10)),
+        "price_stats": ps(prices_today), "yesterday_price_stats": ps(prices_yesterday),
+        "price_bands": bands, "domain_activity": domain_activity[:30],
+        "vertical_micro_sites": _v2_vertical_micro_sites(vertical_source, domain_activity),
+        "trend_signals": trend_signals, "cached": True, "from_disk": True,
+        "scan_meta": {
+            "snapshot_files_scanned": scanned_snapshots,
+            "snapshot_files_skipped_old": skipped_old_snapshots,
+            "max_snapshot_age_days": max_snapshot_age_days,
+            "product_limit": product_limit,
+            "score_limit": score_limit,
+            "deep_classified_products": len(enriched_products),
+        },
+    }
+
+    # 评分 + 决策
+    if all_today:
+        scored = _v2_score_all_products(score_products)
+        tier_counts = Counter(s["tier"] for s in scored)
+        payload["scored_products"] = scored
+        payload["tier_summary"] = dict(tier_counts)
+        payload["top_decisions"] = []
+        payload["top_decisions_deprecated"] = True
+    else:
+        payload["scored_products"] = []
+        payload["tier_summary"] = {}
+        payload["top_decisions"] = []
+        payload["top_decisions_deprecated"] = True
+
+    _v2_cache = payload
+    _v2_cache_ts = time.time()
+    _v2_save_cache(payload)
+    return payload
+
+
+@app.get("/api/v2/vertical-sites")
+def api_v2_vertical_sites(
+    limit: int = 0,
+    kind: str = V2_VERTICAL_DEFAULT_KIND,
+    min_skus: int = None,
+    max_skus: int = None,
+    novelty_only: bool = False,
+    demo_only: bool = False,
+    min_avg_price: float = 0.0,
+):
+    """Return micro-vertical sites discovered from local snapshots.
+
+    ``kind`` selects a preset (tiny/small/medium/novelty/demo/highprice).
+    Optional ``min_skus``/``max_skus`` override the preset range; ``novelty_only``,
+    ``demo_only`` and ``min_avg_price`` apply additional filters.
+    """
+
+    limit = max(0, int(limit or 0))
+    return _v2_vertical_sites_payload(
+        limit=limit,
+        kind=kind,
+        min_skus=min_skus,
+        max_skus=max_skus,
+        novelty_only=bool(novelty_only),
+        demo_only=bool(demo_only),
+        min_avg_price=float(min_avg_price or 0.0),
+    )
+
+
+@app.get("/api/v2/vertical-presets")
+def api_v2_vertical_presets():
+    """List the available vertical-sites scan presets."""
+    presets = []
+    for key, conf in V2_VERTICAL_PRESETS.items():
+        presets.append({
+            "key": key,
+            "label": conf.get("label", key),
+            "min_skus": conf.get("min_skus"),
+            "max_skus": conf.get("max_skus"),
+            "novelty_only": bool(conf.get("novelty_only")),
+            "demo_only": bool(conf.get("demo_only")),
+            "min_avg_price": float(conf.get("min_avg_price") or 0.0),
+        })
+    return {"ok": True, "presets": presets, "default": V2_VERTICAL_DEFAULT_KIND}
+
+
+def _v2_html_report_css() -> str:
+    """Inline CSS shared by all checkbox-enabled offline reports."""
+    return """
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:#f6f7f4; color:#18201f; padding:20px 16px 80px; font-size:14px; line-height:1.55; }
+.report-title { font-size:22px; font-weight:700; color:#b7791f; margin-bottom:4px; }
+.report-meta { font-size:12px; color:#66716f; margin-bottom:12px; }
+.toolbar { background:#fff; border:1px solid #dfe5df; border-radius:10px; padding:12px 14px;
+           margin-bottom:14px; display:flex; gap:10px; flex-wrap:wrap; align-items:center; position:sticky; top:8px; z-index:10;
+           box-shadow:0 6px 18px rgba(24,32,31,.06); }
+.toolbar input[type="search"] { padding:6px 10px; border:1px solid #d5ded5; border-radius:6px; min-width:220px; font-size:13px; }
+.toolbar .stat { font-size:12px; color:#33413d; }
+.toolbar .stat strong { color:#12805c; font-weight:700; }
+.btn { padding:6px 14px; border-radius:6px; border:1px solid #d5ded5; background:#eef2ec; color:#18201f;
+       cursor:pointer; font-size:12.5px; transition:.15s; }
+.btn:hover { background:#dfe5df; }
+.btn-primary { background:#12805c; border-color:#12805c; color:#fff; }
+.btn-primary:hover { background:#0f6a4d; }
+.btn-warning { background:#c2413a; border-color:#c2413a; color:#fff; }
+.btn-warning:hover { background:#a23029; }
+.kpi-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-bottom:14px; }
+.kpi { background:#fff; border:1px solid #dfe5df; border-radius:8px; padding:10px 14px; }
+.kpi .lbl { font-size:11px; color:#66716f; letter-spacing:.4px; margin-bottom:4px; }
+.kpi .val { font-size:20px; font-weight:700; color:#18201f; line-height:1.2; }
+.kpi .sub { font-size:11px; color:#66716f; margin-top:2px; }
+
+.site-card { background:#fff; border:1px solid #dfe5df; border-radius:10px; margin-bottom:14px; overflow:hidden; }
+.site-card.checked { background:#f3f7f2; border-color:#12805c; }
+.site-head { padding:12px 14px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; border-bottom:1px solid #dfe5df; }
+.site-head .check-cell { display:flex; align-items:center; gap:6px; }
+.site-head .check-cell input { transform:scale(1.4); cursor:pointer; }
+.site-head .domain { font-size:14px; font-weight:700; color:#0f766e; }
+.site-head .tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:11px;
+                  background:rgba(18,128,92,.12); color:#0f766e; }
+.site-head .tag.warn { background:rgba(245,158,11,.14); color:#b7791f; }
+.site-head .tag.bad { background:rgba(194,65,58,.14); color:#c2413a; }
+.site-head .why { width:100%; font-size:11.5px; color:#66716f; line-height:1.45; }
+.site-head .strategy { width:100%; font-size:11.5px; color:#33413d; line-height:1.45; }
+.note-row { padding:8px 14px; background:#fbfcfa; border-bottom:1px solid #dfe5df; font-size:11.5px; color:#33413d; }
+.note-row textarea { width:100%; min-height:42px; padding:6px 8px; border:1px solid #d5ded5; border-radius:5px;
+                     background:#fff; font-family:inherit; font-size:12px; resize:vertical; }
+
+.prod-table { width:100%; border-collapse:collapse; font-size:12px; }
+.prod-table th { text-align:left; padding:8px 10px; border-bottom:1px solid #d5ded5; color:#66716f;
+                 font-weight:600; font-size:11px; letter-spacing:.4px; background:#fafbfa; }
+.prod-table td { padding:8px 10px; border-bottom:1px solid rgba(223,229,223,.7); color:#33413d; vertical-align:top; }
+.prod-table tr.checked-row td { background:rgba(18,128,92,.05); }
+.prod-table .num { text-align:right; font-variant-numeric:tabular-nums; }
+.prod-table .highlight { color:#b7791f; font-weight:700; }
+.prod-table a.product-link { color:#0f766e; text-decoration:none; }
+.prod-table a.product-link:hover { text-decoration:underline; }
+.prod-table input.row-check { transform:scale(1.25); cursor:pointer; }
+.prod-table input.row-note { width:100%; padding:4px 6px; border:1px solid #d5ded5; border-radius:4px;
+                             font-size:11px; background:#fff; }
+.prod-table input.row-note:focus { border-color:#12805c; outline:none; }
+.muted { color:#66716f; font-size:10.5px; line-height:1.4; }
+.hidden { display:none !important; }
+.footer-note { text-align:center; color:#66716f; font-size:11px; margin-top:20px; }
+"""
+
+
+def _v2_html_report_js() -> str:
+    """Inline JavaScript for checkbox state + notes + CSV export."""
+    return """
+const STORE_KEY = 'v2-offline-report::' + REPORT_ID;
+const state = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+function save() { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
+
+function getRowState(id) { return state[id] || {}; }
+function setRowState(id, patch) { state[id] = Object.assign({}, state[id] || {}, patch); save(); }
+
+function applySavedState() {
+  document.querySelectorAll('[data-row-id]').forEach(row => {
+    const id = row.getAttribute('data-row-id');
+    const s = getRowState(id);
+    const cb = row.querySelector('input.row-check') || row.querySelector('input.site-check');
+    if (cb) cb.checked = !!s.checked;
+    if (cb && cb.checked) row.classList.add('checked-row', 'checked');
+    const note = row.querySelector('input.row-note, textarea.note-input');
+    if (note && s.note) note.value = s.note;
+  });
+  updateCounter();
+}
+
+function bindRow(row) {
+  const id = row.getAttribute('data-row-id');
+  const cb = row.querySelector('input.row-check') || row.querySelector('input.site-check');
+  if (cb) {
+    cb.addEventListener('change', () => {
+      setRowState(id, {checked: cb.checked});
+      row.classList.toggle('checked-row', cb.checked);
+      row.classList.toggle('checked', cb.checked);
+      updateCounter();
+    });
+  }
+  const note = row.querySelector('input.row-note, textarea.note-input');
+  if (note) {
+    note.addEventListener('input', () => setRowState(id, {note: note.value}));
+  }
+}
+
+function updateCounter() {
+  let total = 0, checked = 0;
+  document.querySelectorAll('[data-row-id]').forEach(row => {
+    if (row.classList.contains('product-row')) {
+      total++;
+      const s = getRowState(row.getAttribute('data-row-id'));
+      if (s.checked) checked++;
+    }
+  });
+  const el = document.getElementById('count-stat');
+  if (el) el.innerHTML = '已勾选 <strong>' + checked + '</strong> / ' + total + ' 个产品';
+}
+
+function checkAll(value) {
+  document.querySelectorAll('[data-row-id]').forEach(row => {
+    if (!isVisible(row)) return;
+    const id = row.getAttribute('data-row-id');
+    const cb = row.querySelector('input.row-check') || row.querySelector('input.site-check');
+    if (cb) {
+      cb.checked = value;
+      setRowState(id, {checked: value});
+      row.classList.toggle('checked-row', value);
+      row.classList.toggle('checked', value);
+    }
+  });
+  updateCounter();
+}
+
+function invertAll() {
+  document.querySelectorAll('[data-row-id]').forEach(row => {
+    if (!isVisible(row)) return;
+    const id = row.getAttribute('data-row-id');
+    const cb = row.querySelector('input.row-check') || row.querySelector('input.site-check');
+    if (cb) {
+      cb.checked = !cb.checked;
+      setRowState(id, {checked: cb.checked});
+      row.classList.toggle('checked-row', cb.checked);
+      row.classList.toggle('checked', cb.checked);
+    }
+  });
+  updateCounter();
+}
+
+function clearAll() {
+  if (!confirm('确认清空所有勾选与备注?(仅本机本浏览器)')) return;
+  localStorage.removeItem(STORE_KEY);
+  for (const k in state) delete state[k];
+  document.querySelectorAll('input.row-check, input.site-check').forEach(cb => { cb.checked = false; });
+  document.querySelectorAll('[data-row-id]').forEach(row => row.classList.remove('checked-row', 'checked'));
+  document.querySelectorAll('input.row-note, textarea.note-input').forEach(n => { n.value = ''; });
+  updateCounter();
+}
+
+function exportCSV() {
+  const rows = [['domain','product_title','price','category','product_url','note']];
+  document.querySelectorAll('.product-row').forEach(row => {
+    const id = row.getAttribute('data-row-id');
+    const s = getRowState(id);
+    if (!s.checked) return;
+    rows.push([
+      row.getAttribute('data-domain') || '',
+      row.getAttribute('data-title') || '',
+      row.getAttribute('data-price') || '',
+      row.getAttribute('data-category') || '',
+      row.getAttribute('data-url') || '',
+      (s.note || '').replace(/"/g, '""')
+    ]);
+  });
+  if (rows.length === 1) { alert('当前没有勾选任何产品'); return; }
+  const csv = rows.map(r => r.map(c => '"' + String(c == null ? '' : c).replace(/"/g, '""') + '"').join(',')).join('\\n');
+  const blob = new Blob(['\\uFEFF' + csv], {type: 'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = REPORT_ID + '_checked_' + new Date().toISOString().slice(0,10) + '.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function filterRows() {
+  const q = (document.getElementById('search-box').value || '').trim().toLowerCase();
+  const showOnlyChecked = document.getElementById('only-checked').checked;
+  document.querySelectorAll('.site-card').forEach(card => {
+    let anyVisible = false;
+    card.querySelectorAll('.product-row').forEach(row => {
+      const text = (row.getAttribute('data-search') || '').toLowerCase();
+      const id = row.getAttribute('data-row-id');
+      const checked = !!(state[id] && state[id].checked);
+      const matchQ = !q || text.includes(q);
+      const matchC = !showOnlyChecked || checked;
+      const visible = matchQ && matchC;
+      row.classList.toggle('hidden', !visible);
+      if (visible) anyVisible = true;
+    });
+    const siteRowId = card.getAttribute('data-row-id');
+    const siteSearch = (card.getAttribute('data-search') || '').toLowerCase();
+    const matchSite = !q || siteSearch.includes(q) || anyVisible;
+    const siteChecked = !!(state[siteRowId] && state[siteRowId].checked);
+    const matchC = !showOnlyChecked || siteChecked || anyVisible;
+    card.classList.toggle('hidden', !(matchSite && matchC));
+  });
+}
+
+function isVisible(el) {
+  while (el) {
+    if (el.classList && el.classList.contains('hidden')) return false;
+    el = el.parentElement;
+  }
+  return true;
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('[data-row-id]').forEach(bindRow);
+  applySavedState();
+  const sb = document.getElementById('search-box');
+  if (sb) sb.addEventListener('input', filterRows);
+  const oc = document.getElementById('only-checked');
+  if (oc) oc.addEventListener('change', filterRows);
+});
+"""
+
+
+def _v2_format_money(value) -> str:
+    try:
+        v = float(value or 0)
+        return f"${v:,.2f}" if v else "—"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _v2_safe_join(values, limit=3, sep=" / "):
+    if not values:
+        return ""
+    if isinstance(values, str):
+        return values
+    try:
+        items = [str(v) for v in list(values)[:limit] if v is not None and str(v).strip()]
+    except TypeError:
+        return ""
+    return sep.join(items)
+
+
+def _v2_render_vertical_html(payload: dict, report_id: str = "vertical") -> str:
+    """Render an offline self-contained HTML report for vertical sites."""
+
+    sites = payload.get("vertical_micro_sites") or []
+    total_sites = int(payload.get("vertical_micro_sites_total") or len(sites))
+    scan_time = payload.get("scan_time") or datetime.now().isoformat()
+    kind = payload.get("kind", "small")
+    kind_label = payload.get("kind_label", kind)
+    sku_range = payload.get("sku_range", f"{payload.get('min_skus', 5)}-{payload.get('max_skus', 15)}")
+    filters = payload.get("filters") or {}
+    total_products = sum(len(s.get("products") or []) for s in sites)
+    scanned_snapshots = int(payload.get("scanned_snapshots") or 0)
+    domain_count = int(payload.get("domain_count") or 0)
+    duplicate_products_removed = int(payload.get("duplicate_products_removed") or 0)
+
+    css = _v2_html_report_css()
+    js = _v2_html_report_js()
+
+    def esc(value) -> str:
+        return html.escape("" if value is None else str(value), quote=True)
+
+    site_blocks = []
+    for idx, site in enumerate(sites, 1):
+        domain = site.get("domain", "")
+        site_row_id = f"site::{domain}"
+        prod_rows_html = []
+        for p_idx, p in enumerate(site.get("products") or [], 1):
+            title = p.get("title", "")
+            price = float(p.get("price", 0) or 0)
+            product_url = p.get("product_url") or (f"https://{domain}/products/{p.get('handle', '')}" if domain else "")
+            category = p.get("specific_category") or p.get("micro_category") or p.get("product_type") or "未分类"
+            use_case = p.get("use_case") or ""
+            pain = p.get("pain_point") or ""
+            mech = p.get("core_mechanism") or ""
+            demo_scene = p.get("demo_scene") or ""
+            angle = p.get("how_to_follow") or p.get("follow_playbook") or p.get("creative_angle") or ""
+            novelty = p.get("novelty_signal") or ""
+            kw = _v2_safe_join(p.get("micro_matched_keywords") or p.get("matched_keywords") or [], 4)
+            row_id = f"prod::{domain}::{title}"
+            search_blob = " ".join([title, domain, category, use_case, pain, mech, novelty, kw])
+            prod_rows_html.append(f"""
+      <tr class="product-row" data-row-id="{esc(row_id)}"
+          data-domain="{esc(domain)}" data-title="{esc(title)}"
+          data-price="{price:.2f}" data-category="{esc(category)}"
+          data-url="{esc(product_url)}" data-search="{esc(search_blob)}">
+        <td><input type="checkbox" class="row-check"></td>
+        <td>{p_idx}</td>
+        <td><a class="product-link" href="{esc(product_url)}" target="_blank" rel="noopener">{esc(title)}</a>
+            <div class="muted">关键词: {esc(kw or '--')}</div>
+            {('<div class="muted">新奇特: ' + esc(novelty) + '</div>') if novelty else ''}
+        </td>
+        <td class="num highlight">{_v2_format_money(price)}</td>
+        <td>{esc(category)}
+            <div class="muted">机制: {esc(mech or '--')}</div>
+        </td>
+        <td>{esc(use_case or '--')}<div class="muted">{esc(pain or '')}</div></td>
+        <td>{esc(demo_scene or '--')}<div class="muted">{esc(angle or '')}</div></td>
+        <td><input type="text" class="row-note" placeholder="备注/标签..."></td>
+      </tr>
+""")
+
+        raw_count = int(site.get("raw_products_before_dedupe") or site.get("total_products") or 0)
+        deduped = int(site.get("deduped_products") or site.get("new_products") or 0)
+        removed = int(site.get("duplicate_products_removed") or max(0, raw_count - deduped))
+        novelty_count = int(site.get("novelty_count") or 0)
+        demo_count = int(site.get("demo_friendly_count") or 0)
+        low_conf = int(site.get("low_confidence_count") or 0)
+        avg_price = float(site.get("avg_price") or 0)
+        site_search = " ".join([
+            domain,
+            site.get("dominant_specific_category") or "",
+            site.get("dominant_category_group") or "",
+            site.get("dominant_use_case") or "",
+            site.get("why") or "",
+            site.get("follow_strategy") or "",
+        ])
+
+        site_blocks.append(f"""
+<section class="site-card" data-row-id="{esc(site_row_id)}" data-search="{esc(site_search)}">
+  <div class="site-head">
+    <div class="check-cell"><input type="checkbox" class="site-check" title="标记本站已看"><span class="muted">#{idx}</span></div>
+    <span class="domain"><a class="product-link" href="https://{esc(domain)}" target="_blank" rel="noopener">{esc(domain)}</a></span>
+    <span class="tag">总SKU {site.get("total_products", 0)}</span>
+    <span class="tag">原始 {raw_count}</span>
+    <span class="tag">有效 {deduped}</span>
+    <span class="tag">去重 {removed}</span>
+    <span class="tag">{esc(site.get("dominant_specific_category") or "未分类")}</span>
+    <span class="tag">{esc(site.get("dominant_category_group") or "Other DTC")}</span>
+    <span class="tag">均价 {_v2_format_money(avg_price)}</span>
+    <span class="tag {'warn' if novelty_count else ''}">新奇特 {novelty_count}</span>
+    <span class="tag {'warn' if demo_count else ''}">演示 {demo_count}</span>
+    {f'<span class="tag bad">低置信 {low_conf}</span>' if low_conf else ''}
+    <div class="why">{esc(site.get("why") or "")}</div>
+    <div class="strategy">{esc(site.get("follow_strategy") or "")}</div>
+  </div>
+  <div class="note-row"><textarea class="note-input" placeholder="本站备注:跟法/差异化/规避点..."></textarea></div>
+  <table class="prod-table">
+    <thead><tr>
+      <th style="width:32px">看</th><th style="width:32px">#</th><th>产品</th><th class="num">价格</th>
+      <th>分类/机制</th><th>用途/痛点</th><th>演示/跟法</th><th style="width:200px">备注</th>
+    </tr></thead>
+    <tbody>{''.join(prod_rows_html) or '<tr><td colspan="8" class="muted">该站点暂无样本</td></tr>'}</tbody>
+  </table>
+</section>
+""")
+
+    body = "".join(site_blocks) or '<div class="kpi" style="text-align:center">该范围内当前没有匹配的小垂直站。请尝试切换其他扫描分类后再下载。</div>'
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>小垂直站 / 新奇特报告 · {esc(kind_label)} · {esc(scan_time[:19])}</title>
+<style>{css}</style>
+</head>
+<body>
+<h1 class="report-title">小垂直站 / 新奇特扫描报告 · {esc(kind_label)}</h1>
+<div class="report-meta">
+  生成时间 {esc(scan_time[:19])} · 范围 {esc(sku_range)} SKU ·
+  扫描 snapshot {scanned_snapshots} 个 · 覆盖站点 {domain_count} 个 ·
+  本报告站点 {total_sites} 个 · 样本产品 {total_products} 条
+  {f' · 去重 {duplicate_products_removed} 个变体/套装' if duplicate_products_removed else ''}
+  {' · 仅新奇特' if filters.get('novelty_only') else ''}
+  {' · 仅演示友好' if filters.get('demo_only') else ''}
+  {f' · 均价 ≥ ${filters.get("min_avg_price"):.0f}' if filters.get('min_avg_price') else ''}
+</div>
+
+<div class="toolbar">
+  <input id="search-box" type="search" placeholder="搜索域名/产品/分类/关键词..." />
+  <label class="muted" style="display:flex;align-items:center;gap:4px"><input id="only-checked" type="checkbox"> 仅看已勾选</label>
+  <button class="btn" onclick="checkAll(true)">全选可见</button>
+  <button class="btn" onclick="invertAll()">反选可见</button>
+  <button class="btn-warning btn" onclick="clearAll()">清空全部</button>
+  <button class="btn-primary btn" onclick="exportCSV()">导出已勾选 CSV</button>
+  <span class="stat" id="count-stat" style="margin-left:auto">已勾选 <strong>0</strong> / {total_products} 个产品</span>
+</div>
+
+<div class="kpi-row">
+  <div class="kpi"><div class="lbl">扫描分类</div><div class="val">{esc(kind_label)}</div><div class="sub">范围 {esc(sku_range)} SKU</div></div>
+  <div class="kpi"><div class="lbl">小垂直站</div><div class="val">{total_sites}</div><div class="sub">snapshot {scanned_snapshots} · 站点 {domain_count}</div></div>
+  <div class="kpi"><div class="lbl">样本产品</div><div class="val">{total_products}</div><div class="sub">每站 Top SKU 抽样</div></div>
+  <div class="kpi"><div class="lbl">原始扫到</div><div class="val">{int(payload.get("raw_vertical_products_before_dedupe") or 0)}</div><div class="sub">去重前</div></div>
+  <div class="kpi"><div class="lbl">去重</div><div class="val">{duplicate_products_removed}</div><div class="sub">变体 / 套装合并</div></div>
+</div>
+
+{body}
+
+<div class="footer-note">勾选与备注本地保存于浏览器 localStorage(key: <code>{esc("v2-offline-report::" + report_id)}</code>),与服务端无关。清浏览数据会丢失。</div>
+<script>const REPORT_ID = {json.dumps(report_id)};{js}</script>
+</body>
+</html>
+"""
+
+
+def _v2_render_today_html(payload: dict, report_id: str = "today") -> str:
+    """Render an offline self-contained HTML report for today's new products."""
+
+    products = payload.get("products") or payload.get("scored_products") or []
+    scan_time = payload.get("scan_time") or datetime.now().isoformat()
+    scan_date = payload.get("scan_date") or scan_time[:10]
+    total_today = int(payload.get("total_new_today") or len(products))
+    domains_with_new = int(payload.get("domains_with_new") or 0)
+    scanned_domains = int(payload.get("scanned_domains") or 0)
+    cats = payload.get("category_breakdown") or {}
+
+    css = _v2_html_report_css()
+    js = _v2_html_report_js()
+
+    def esc(value) -> str:
+        return html.escape("" if value is None else str(value), quote=True)
+
+    # Group products by domain for a clean look
+    grouped = defaultdict(list)
+    for p in products:
+        d = (p.get("domain") or "").replace("www.", "")
+        grouped[d].append(p)
+
+    site_blocks = []
+    for idx, (domain, items) in enumerate(sorted(grouped.items(), key=lambda kv: (-len(kv[1]), kv[0])), 1):
+        site_row_id = f"site::{domain}"
+        site_search = " ".join([domain, *(p.get("title", "") for p in items)])
+        prod_rows_html = []
+        for p_idx, p in enumerate(items, 1):
+            title = p.get("title", "")
+            price = float(p.get("price", 0) or 0)
+            product_url = p.get("url") or p.get("product_url") or (f"https://{domain}/products/{p.get('handle', '')}" if domain else "")
+            category = p.get("specific_category") or p.get("product_type") or "未分类"
+            created = (p.get("created_at") or "")[:10]
+            published = (p.get("published_at") or "")[:10]
+            tags = _v2_safe_join(p.get("tags") or [], 5, sep=", ")
+            row_id = f"prod::{domain}::{title}"
+            search_blob = " ".join([title, domain, category, tags, p.get("vendor", "") or ""])
+            prod_rows_html.append(f"""
+      <tr class="product-row" data-row-id="{esc(row_id)}"
+          data-domain="{esc(domain)}" data-title="{esc(title)}"
+          data-price="{price:.2f}" data-category="{esc(category)}"
+          data-url="{esc(product_url)}" data-search="{esc(search_blob)}">
+        <td><input type="checkbox" class="row-check"></td>
+        <td>{p_idx}</td>
+        <td><a class="product-link" href="{esc(product_url)}" target="_blank" rel="noopener">{esc(title)}</a>
+            <div class="muted">{esc(p.get("vendor", "") or "")}</div>
+            {('<div class="muted">tags: ' + esc(tags) + '</div>') if tags else ''}
+        </td>
+        <td class="num highlight">{_v2_format_money(price)}</td>
+        <td>{esc(category)}</td>
+        <td>{esc(created or '--')}<div class="muted">发布 {esc(published or '--')}</div></td>
+        <td><input type="text" class="row-note" placeholder="备注/标签..."></td>
+      </tr>
+""")
+        site_blocks.append(f"""
+<section class="site-card" data-row-id="{esc(site_row_id)}" data-search="{esc(site_search)}">
+  <div class="site-head">
+    <div class="check-cell"><input type="checkbox" class="site-check" title="标记本站已看"><span class="muted">#{idx}</span></div>
+    <span class="domain"><a class="product-link" href="https://{esc(domain)}" target="_blank" rel="noopener">{esc(domain)}</a></span>
+    <span class="tag">今日 {len(items)} 个</span>
+  </div>
+  <div class="note-row"><textarea class="note-input" placeholder="本站备注..."></textarea></div>
+  <table class="prod-table">
+    <thead><tr>
+      <th style="width:32px">看</th><th style="width:32px">#</th><th>产品</th><th class="num">价格</th>
+      <th>分类</th><th>创建/发布</th><th style="width:200px">备注</th>
+    </tr></thead>
+    <tbody>{''.join(prod_rows_html)}</tbody>
+  </table>
+</section>
+""")
+
+    body = "".join(site_blocks) or '<div class="kpi" style="text-align:center">暂无今日新品数据,请先在 V2 仪表盘点"刷新扫描"或"快速加载新品"。</div>'
+
+    cat_pills = "".join(
+        f'<span class="tag">{esc(name)} {count}</span>'
+        for name, count in list(cats.items())[:10]
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>今日新品池报告 · {esc(scan_date)}</title>
+<style>{css}</style>
+</head>
+<body>
+<h1 class="report-title">今日新品池 · {esc(scan_date)}</h1>
+<div class="report-meta">
+  生成时间 {esc(scan_time[:19])} · 扫描站点 {scanned_domains} · 有新品站点 {domains_with_new} · 新品总数 {total_today}
+</div>
+
+<div class="toolbar">
+  <input id="search-box" type="search" placeholder="搜索域名/产品/分类..." />
+  <label class="muted" style="display:flex;align-items:center;gap:4px"><input id="only-checked" type="checkbox"> 仅看已勾选</label>
+  <button class="btn" onclick="checkAll(true)">全选可见</button>
+  <button class="btn" onclick="invertAll()">反选可见</button>
+  <button class="btn-warning btn" onclick="clearAll()">清空全部</button>
+  <button class="btn-primary btn" onclick="exportCSV()">导出已勾选 CSV</button>
+  <span class="stat" id="count-stat" style="margin-left:auto">已勾选 <strong>0</strong> / {len(products)} 个产品</span>
+</div>
+
+<div class="kpi-row">
+  <div class="kpi"><div class="lbl">今日新品</div><div class="val">{total_today}</div><div class="sub">本报告样本 {len(products)}</div></div>
+  <div class="kpi"><div class="lbl">扫描站点</div><div class="val">{scanned_domains}</div><div class="sub">有新品 {domains_with_new}</div></div>
+  <div class="kpi"><div class="lbl">价格中位</div><div class="val">{_v2_format_money((payload.get("price_stats") or {}).get("median"))}</div><div class="sub">均价 {_v2_format_money((payload.get("price_stats") or {}).get("avg"))}</div></div>
+  <div class="kpi" style="grid-column:span 2"><div class="lbl">品类 Top</div><div style="margin-top:4px">{cat_pills or '<span class="muted">--</span>'}</div></div>
+</div>
+
+{body}
+
+<div class="footer-note">勾选与备注本地保存于浏览器 localStorage(key: <code>{esc("v2-offline-report::" + report_id)}</code>),与服务端无关。清浏览数据会丢失。</div>
+<script>const REPORT_ID = {json.dumps(report_id)};{js}</script>
+</body>
+</html>
+"""
+
+
+@app.get("/api/v2/vertical-sites/download")
+def api_v2_vertical_sites_download(
+    kind: str = V2_VERTICAL_DEFAULT_KIND,
+    min_skus: int = None,
+    max_skus: int = None,
+    novelty_only: bool = False,
+    demo_only: bool = False,
+    min_avg_price: float = 0.0,
+    limit: int = 0,
+):
+    """Return a downloadable HTML report (with checkboxes + notes) for vertical sites."""
+    payload = _v2_vertical_sites_payload(
+        limit=limit,
+        kind=kind,
+        min_skus=min_skus,
+        max_skus=max_skus,
+        novelty_only=bool(novelty_only),
+        demo_only=bool(demo_only),
+        min_avg_price=float(min_avg_price or 0.0),
+    )
+    report_id = f"vertical-{payload.get('kind', 'small')}"
+    html_text = _v2_render_vertical_html(payload, report_id=report_id)
+    today_str = datetime.now().strftime("%Y%m%d-%H%M")
+    filename = f"vertical-{payload.get('kind', 'small')}-{today_str}.html"
+    return Response(
+        content=html_text,
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/v2/today-products/download")
+def api_v2_today_products_download(use_disk: bool = True):
+    """Return a downloadable HTML report (with checkboxes + notes) for today's new products."""
+    payload = None
+    if use_disk:
+        try:
+            payload = api_v2_today_fast()
+        except Exception:
+            payload = None
+    if not payload or not (payload.get("products") or payload.get("scored_products")):
+        # Fallback to cached scan results, if any
+        if _v2_cache:
+            payload = _v2_cache
+        elif _v2_load_cache():
+            payload = _v2_load_cache()
+        else:
+            payload = {"scan_date": datetime.now().strftime("%Y-%m-%d"), "products": []}
+    report_id = "today"
+    html_text = _v2_render_today_html(payload, report_id=report_id)
+    today_str = datetime.now().strftime("%Y%m%d-%H%M")
+    filename = f"today-products-{today_str}.html"
+    return Response(
+        content=html_text,
+        media_type="text/html; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/v2/decisions")
+def api_v2_decisions():
+    """旧评分跟品接口已禁用；跟品结论必须走 /api/v2/workbench。"""
+    latest = get_latest_profit_pipeline()
+    return {
+        "ok": True,
+        "deprecated": True,
+        "message": "旧评分决策已禁用。请使用 /api/v2/workbench/latest 或 /api/v2/workbench/run；未达到2类严格平台验真不能叫可跟。",
+        "workbench": latest.get("workbench", {}) if isinstance(latest, dict) and latest.get("ok") else {},
+        "stats": latest.get("stats", {}) if isinstance(latest, dict) and latest.get("ok") else {},
+    }
+
+def _v2_trend_direction_label(trend):
+    status = str((trend or {}).get("trend_status") or "unverified")
+    direction = str((trend or {}).get("trend_direction") or "unverified")
+    if status == "proxy":
+        return "代理信号"
+    if status == "unverified":
+        return "未验证"
+    if direction == "up":
+        return "上升↗"
+    if direction == "down":
+        return "下降↘"
+    return "平稳→"
+
+
+def _v2_trend_number(value, default=0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _v2_trend_for_index(records, index, reason="not_checked"):
+    if 0 <= index < len(records) and isinstance(records[index], dict):
+        return records[index]
+    return empty_trend_signal(reason)
+
+
+@app.get("/api/v2/followable-products")
+def api_v2_followable_products(
+    min_score: int = 60,
+    limit: int = 100,
+    trend_top_n: int = Query(50, ge=0, le=100),
+    trend_geo: str = Query("US", min_length=0, max_length=8),
+):
+    """旧可跟品评分接口已禁用；严格跟品请走 /api/v2/workbench。"""
+    latest = get_latest_profit_pipeline()
+    return {
+        "ok": True,
+        "deprecated": True,
+        "message": "旧可跟品评分列表已禁用。可跟品必须来自 /api/v2/workbench 的2类严格平台验真。",
+        "products": [],
+        "workbench": latest.get("workbench", {}) if isinstance(latest, dict) and latest.get("ok") else {},
+        "stats": latest.get("stats", {}) if isinstance(latest, dict) and latest.get("ok") else {},
+    }
+    # 优先使用 today-fast 的数据（从 snapshot 文件读取）
+    fast_data = api_v2_today_fast()
+    if fast_data and fast_data.get("scored_products"):
+        cache = fast_data
+    else:
+        # Fallback 到缓存
+        cache = _v2_cache or _v2_load_cache()
+        if not cache:
+            return {"ok": False, "error": "No scan data, please run /api/v2/today-scan or ensure snapshot files exist"}
+
+    scored = cache.get("scored_products", [])
+    followable = [s for s in scored if s.get("score", 0) >= min_score][:limit]
+    trend_records = []
+    trend_stats = {
+        "requested_products": 0,
+        "matched_products": 0,
+        "verified_products": 0,
+        "proxy_products": 0,
+        "hot_products": 0,
+        "status_breakdown": {},
+        "provider": "disabled",
+    }
+    trend_warnings = []
+    if trend_top_n > 0 and followable:
+        trend_scope = followable[: min(trend_top_n, len(followable))]
+        try:
+            trend_records, trend_stats, trend_warnings = enrich_top_products_with_trends(
+                trend_scope,
+                (trend_geo or "US").upper(),
+                max(3, min(80, trend_top_n * 3)),
+            )
+        except Exception as exc:
+            trend_records = [None for _ in trend_scope]
+            trend_stats = {
+                **trend_stats,
+                "requested_products": len(trend_scope),
+                "provider": "failed",
+            }
+            trend_warnings = [f"followable_trends_failed:{exc.__class__.__name__}:{exc}"]
+
+    # 为每个产品添加完整链接和增强数据
+    enriched = []
+    for idx, p in enumerate(followable):
+        domain = p.get("domain", "")
+        handle = p.get("handle", "")
+        product_url = f"https://{domain}/products/{handle}" if domain and handle else ""
+        score = p.get("score", 0)
+        trend = _v2_trend_for_index(
+            trend_records,
+            idx,
+            "not_checked" if idx >= trend_top_n else "cache_missing",
+        )
+        trends_score = round(_v2_trend_number(trend.get("trend_score")), 2)
+        trend_direction = _v2_trend_direction_label(trend)
+        trend_momentum = _v2_trend_number(trend.get("trend_yoy_change"), None)
+        if trend_momentum is None:
+            trend_momentum = _v2_trend_number(trend.get("trend_momentum_pct"))
+        yoy_growth = int(round(trend_momentum))
+        seasonality = "未知"
+
+        enriched.append({
+            # 核心字段
+            "product_url": product_url,
+            "product_title": p.get("product_title", ""),
+            "product_image": f"https://{domain}/cdn/shop/products/{handle}_300x.jpg" if domain and handle else "",
+            "price": p.get("price", 0),
+            "domain": domain,
+            "handle": handle,
+
+            # Google Trends 数据
+            "trends_score": trends_score,
+            "trend_direction": trend_direction,
+            "yoy_growth": yoy_growth,
+            "seasonality": seasonality,
+            "trend_status": trend.get("trend_status", "unverified"),
+            "trend_verified": bool(trend.get("trend_verified")),
+            "trend_query": trend.get("trend_query", ""),
+            "trend_current": trend.get("trend_current", 0),
+            "trend_momentum_pct": trend.get("trend_momentum_pct", 0),
+            "trend_data_quality": trend.get("trend_data_quality", "未验证"),
+            "trend_source": trend.get("trend_source", ""),
+            "trend_confidence": trend.get("trend_confidence", ""),
+            "trend_data_points": trend.get("trend_data_points", 0),
+            "trend_decision": trend.get("trend_decision", ""),
+            "trend_risk": trend.get("trend_risk", ""),
+            "trend_signal": trend,
+            "platform_validation": p.get("platform_validation", {}),
+
+            # FB 广告数据
+            "active_ads_count": p.get("ad_appearances", 0),
+            "ad_duration": 30 if p.get("ad_appearances", 0) > 5 else 15,  # 模拟
+            "unique_domains": 1,  # 当前域名
+            "creative_type": "视频" if p.get("ad_appearances", 0) > 10 else "图片",
+
+            # AI 智能判断
+            "ai_score": p.get("score", 0),
+            "sellability_score": p.get("sellability_score", p.get("score", 0)),
+            "follow_decision": "🟢立即跟" if score >= 80 else "🟡观察",
+            "risk_level": "低" if score >= 70 else "中",
+            "profit_margin": "高 (>60%)" if p.get("price", 0) > 50 else "中 (40-60%)",
+            "market_saturation": "低" if p.get("ad_appearances", 0) < 10 else "中",
+            "supply_chain": "易" if p.get("price", 0) < 100 else "中",
+            "ad_heat": p.get("ad_heat", ""),
+            "shopify_fit": p.get("shopify_fit", ""),
+            "fb_ads_fit": p.get("fb_ads_fit", ""),
+            "platform_ai": p.get("platform_ai", {}),
+            "conversion_angles": p.get("conversion_angles", []),
+            "risk_flags": p.get("risk_flags", []),
+            "score_reasons": p.get("reasons", []),
+
+            # 增强字段
+            "product_type": p.get("product_type", "未分类"),
+            "vendor": p.get("vendor", ""),
+            "tier": p.get("tier", ""),
+            "ad_grade": p.get("ad_grade", ""),
+            "first_seen": cache.get("scan_date", ""),
+
+            "price_range_low": round(p.get("price", 0) * 0.8, 2),
+            "price_range_high": round(p.get("price", 0) * 1.3, 2),
+        })
+
+    return {
+        "ok": True,
+        "scan_date": cache.get("scan_date"),
+        "total_followable": len(enriched),
+        "min_score": min_score,
+        "trend_top_n": trend_top_n,
+        "trend_geo": (trend_geo or "US").upper(),
+        "trend_summary": trend_stats,
+        "warnings": trend_warnings,
+        "products": enriched,
+    }
+
+
+@app.post("/api/auto-intel/run")
+def api_auto_intel_run(
+    limit: int = Query(20, ge=1, le=100),
+    min_score: int = Query(60, ge=0, le=100),
+    lookback_days: int = Query(2, ge=1, le=14),
+    fb_limit: int = Query(5000, ge=1, le=20000),
+    fb_exact_verify_limit: int = Query(300, ge=0, le=1000),
+    enable_trends: bool = Query(True),
+    trend_top_n: int = Query(50, ge=0, le=100),
+    trend_geo: str = Query("US", min_length=0, max_length=8),
+    trend_max_keywords: int = Query(150, ge=1, le=150),
+    max_per_domain: int = Query(3, ge=1, le=20),
+    max_per_family: int = Query(1, ge=1, le=5),
+    research_min_score: int = Query(45, ge=0, le=100),
+    watchlist_limit: int = Query(30, ge=0, le=200),
+):
+    """Run the 8001 auto-intelligence loop and write review-only artifacts."""
+
+    try:
+        config = AutoIntelConfig(
+            limit=limit,
+            min_score=min_score,
+            lookback_days=lookback_days,
+            fb_limit=fb_limit,
+            fb_exact_verify_limit=fb_exact_verify_limit,
+            enable_trends=enable_trends,
+            trend_top_n=trend_top_n,
+            trend_geo=(trend_geo or "US").upper(),
+            trend_max_keywords=trend_max_keywords,
+            max_per_domain=max_per_domain,
+            max_per_family=max_per_family,
+            research_min_score=research_min_score,
+            watchlist_limit=watchlist_limit,
+        )
+        return run_auto_intelligence(config)
+    except AutoIntelRunLocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Auto intelligence run failed: {exc}") from exc
+
+
+@app.get("/api/auto-intel/latest")
+def api_auto_intel_latest():
+    """Return the latest auto-intelligence run summary."""
+
+    return get_latest_run_summary()
+
+
+@app.post("/api/auto-intel/trends/run")
+def api_auto_intel_trends_run(
+    trend_top_n: int = Query(50, ge=1, le=100),
+    trend_geo: str = Query("US", min_length=0, max_length=8),
+    trend_max_keywords: int = Query(150, ge=1, le=150),
+    timeframe: str = Query("today 12-m", min_length=1, max_length=32),
+    workers: int = Query(2, ge=1, le=4),
+    ttl_days: int = Query(7, ge=0, le=30),
+    timeout_seconds: int = Query(180, ge=30, le=900),
+):
+    """Run the local gtrends-bulk skill for the latest auto-intel Top products."""
+
+    try:
+        return run_latest_auto_intel_trends(
+            geo=(trend_geo or "US").upper(),
+            top_n=trend_top_n,
+            max_keywords=trend_max_keywords,
+            timeframe=timeframe,
+            workers=workers,
+            ttl_days=ttl_days,
+            timeout_seconds=timeout_seconds,
+        )
+    except AutoIntelRunLocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Google Trends run failed: {exc}") from exc
+
+
+class ProfitMetricsRequest(BaseModel):
+    product_id: str = ""
+    title: str = ""
+    price: Optional[float] = None
+    spend: float = 0
+    impressions: int = 0
+    clicks: int = 0
+    link_clicks: int = 0
+    add_to_cart: int = 0
+    atc: int = 0
+    checkout: int = 0
+    initiate_checkout: int = 0
+    purchases: int = 0
+    orders: int = 0
+    revenue: float = 0
+    sales: float = 0
+
+
+SHOPIFY_REPLICA_OUTPUT_DIR = Path(os.getenv("V2_SHOPIFY_REPLICA_DIR", "/Users/doi/Desktop/reports/v2_shopify_replica_drafts"))
+SHOPIFY_BULK_UPLOAD_SCRIPT = Path(
+    os.getenv(
+        "SHOPIFY_BULK_UPLOAD_SCRIPT",
+        "/Users/doi/.codex/skills/shopify-admin-bulk-upload/scripts/shopify_bulk_upload.py",
+    )
+)
+
+
+def _replica_text(value, default: str = "") -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text or default
+
+
+def _replica_money(value, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        return float(str(value).replace("$", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _replica_money_str(value, default: float = 0.0) -> str:
+    return f"{max(0.0, _replica_money(value, default)):.2f}"
+
+
+def _replica_slug(text: str, fallback: str = "product") -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(text or "").lower()).strip("-")
+    return re.sub(r"-{2,}", "-", slug) or fallback
+
+
+def _replica_unique(items, limit: int = 8) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items or []:
+        text = _replica_text(item)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _replica_html_list(items, empty: str = "Human review required.") -> str:
+    values = _replica_unique(items, 12)
+    if not values:
+        values = [empty]
+    return "<ul>" + "".join(f"<li>{html.escape(value)}</li>" for value in values) + "</ul>"
+
+
+def _replica_product_type(action: dict) -> str:
+    raw = _replica_text(action.get("product_type"))
+    if not raw or raw.lower() in {"product", "products", "default", "uncategorized", "未分类"}:
+        return "General Product"
+    raw = re.sub(r"[_/-]+", " ", raw)
+    return re.sub(r"\s+", " ", raw).strip().title() or "General Product"
+
+
+def _strip_competitor_terms(text: str, domain: str) -> str:
+    cleaned = re.sub(r"\([^)]*\)", " ", _replica_text(text))
+    cleaned = re.sub(r"[™®©]", "", cleaned)
+    cleaned = re.sub(
+        r"\b(official|original|limited|edition|sale|discount|clearance|welcome|gift|luxe)\b",
+        " ",
+        cleaned,
+        flags=re.I,
+    )
+    domain_root = (domain or "").split(".")[0]
+    for token in re.split(r"[-_\s]+", domain_root):
+        if len(token) >= 4:
+            cleaned = re.sub(rf"\b{re.escape(token)}\b", " ", cleaned, flags=re.I)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _safe_replica_title(action: dict) -> str:
+    product_type = _replica_product_type(action)
+    if product_type != "General Product":
+        return f"Unbranded {product_type} Draft"
+    pareto = action.get("pareto") or {}
+    supply = pareto.get("supply_chain") if isinstance(pareto.get("supply_chain"), dict) else {}
+    source = supply.get("keyword") or action.get("title") or "Product"
+    cleaned = _strip_competitor_terms(source, _replica_text(action.get("domain")))
+    words = re.findall(r"[A-Za-z0-9]+", cleaned)[:5]
+    base = " ".join(words).title() if words else "Product"
+    return f"Unbranded {base} Draft"
+
+
+def _replica_public_safe_text(value, action: dict, replacement: str = "this product concept") -> str:
+    text = _replica_text(value)
+    needles = [
+        _replica_text(action.get("title")),
+        _replica_text(action.get("handle")),
+        _replica_text(action.get("product_url")),
+    ]
+    pareto = action.get("pareto") or {}
+    copy_target = pareto.get("copy_target") if isinstance(pareto.get("copy_target"), dict) else {}
+    needles.extend([_replica_text(action.get("domain")), _replica_text(copy_target.get("product_url"))])
+    for needle in sorted((n for n in needles if len(n) >= 4), key=len, reverse=True):
+        text = re.sub(re.escape(needle), replacement, text, flags=re.I)
+    return text
+
+
+def _replica_gate(action: dict) -> tuple[bool, list[str]]:
+    pareto = action.get("pareto") or {}
+    gate = action.get("operator_gate") or {}
+    triage = pareto.get("launch_triage") if isinstance(pareto.get("launch_triage"), dict) else {}
+    required = int(_replica_money(pareto.get("required_validation_count"), 2))
+    real = int(_replica_money(pareto.get("real_validation_count"), 0))
+    reasons: list[str] = []
+
+    if triage and triage.get("level") != "launch_now":
+        reasons.append(f"三档判断为「{triage.get('label', '观察跟进')}」：{triage.get('one_line', '未达到立即上架门槛')}。")
+    if real < required:
+        reasons.append(f"严格平台验真不足：{real}/{required}，不能复刻到 Shopify 草稿。")
+    if pareto.get("lane") == "skip" or gate.get("status") == "blocked":
+        reasons.append("该品被门禁拦截：风险、毛利或证据不成立。")
+    if (pareto.get("truth_check") or {}).get("passed") is False:
+        missing = (pareto.get("truth_check") or {}).get("missing") or []
+        reasons.extend(_replica_unique(missing, 3))
+    return (not reasons, reasons)
+
+
+def _find_replica_actions(latest: dict, product_url: str = "", rank: Optional[int] = None, limit: int = 1, allow_unverified: bool = False) -> tuple[list[dict], list[dict]]:
+    actions = latest.get("actions") if isinstance(latest, dict) else []
+    actions = actions if isinstance(actions, list) else []
+    product_url_norm = _replica_text(product_url).rstrip("/")
+
+    if product_url_norm or rank:
+        candidates = []
+        for action in actions:
+            action_url = _replica_text(action.get("product_url")).rstrip("/")
+            if product_url_norm and action_url == product_url_norm:
+                candidates.append(action)
+            elif rank and int(_replica_money(action.get("rank"), 0)) == int(rank):
+                candidates.append(action)
+        selected = candidates[:1]
+    else:
+        selected = actions[: max(1, min(int(limit or 1), 10))]
+
+    allowed: list[dict] = []
+    blocked: list[dict] = []
+    for action in selected:
+        eligible, reasons = _replica_gate(action)
+        if eligible or allow_unverified:
+            allowed.append(action)
+        else:
+            blocked.append(
+                {
+                    "rank": action.get("rank"),
+                    "title": action.get("title", ""),
+                    "product_url": action.get("product_url", ""),
+                    "domain": action.get("domain", ""),
+                    "reasons": reasons,
+                    "launch_triage": (action.get("pareto") or {}).get("launch_triage", {}),
+                    "missing_evidence": (action.get("pareto") or {}).get("evidence_gaps", []),
+                }
+            )
+
+    if not product_url_norm and not rank and not allow_unverified:
+        allowed = []
+        blocked = []
+        for action in actions:
+            eligible, reasons = _replica_gate(action)
+            if eligible:
+                allowed.append(action)
+            else:
+                blocked.append(
+                    {
+                        "rank": action.get("rank"),
+                        "title": action.get("title", ""),
+                        "product_url": action.get("product_url", ""),
+                        "domain": action.get("domain", ""),
+                        "reasons": reasons,
+                        "launch_triage": (action.get("pareto") or {}).get("launch_triage", {}),
+                        "missing_evidence": (action.get("pareto") or {}).get("evidence_gaps", []),
+                    }
+                )
+            if len(allowed) >= max(1, min(int(limit or 1), 10)):
+                break
+    return allowed[: max(1, min(int(limit or 1), 10))], blocked
+
+
+def _build_replica_description(action: dict) -> str:
+    pareto = action.get("pareto") or {}
+    clone = pareto.get("landing_page_clone") if isinstance(pareto.get("landing_page_clone"), dict) else {}
+    creative = action.get("creative_pack") or {}
+    launch = action.get("launch_test_order") or {}
+    unit = action.get("unit_economics") or {}
+    learn_points = pareto.get("learn_points") or []
+    structure = [
+        _replica_public_safe_text(f"{item.get('section', '')}: {item.get('task', '')}", action)
+        for item in (clone.get("copy_structure") or [])
+        if isinstance(item, dict)
+    ]
+    scripts = [
+        _replica_public_safe_text(f"{item.get('angle', '')}: {item.get('hook_0_3s', '')}", action)
+        for item in (creative.get("scripts") or [])
+        if isinstance(item, dict)
+    ]
+    do_not_copy = _replica_unique(
+        [
+            *(pareto.get("do_not_copy") or []),
+            *(clone.get("never_copy") or []),
+            *(creative.get("negative_controls") or []),
+            "Replace all photos, videos, reviews, claims, and brand terms with your own assets before publishing.",
+        ],
+        8,
+    )
+    html_parts = [
+        "<p><strong>Draft only. Human review required before publishing.</strong></p>",
+        "<p>This Shopify draft is generated from the V2 28-follow workbench as a structure-only product scaffold. It does not include competitor images, copied reviews, copied claims, logos, brand terms, or private data.</p>",
+        "<h3>Customer Angle</h3>",
+        _replica_html_list(learn_points or creative.get("angles"), "Define the customer pain point and use case."),
+        "<h3>Page Structure To Build</h3>",
+        _replica_html_list(structure, "Build hero, offer, proof, objections, trust, and upsell sections with original assets."),
+        "<h3>Original Creative Pack</h3>",
+        _replica_html_list(scripts, "Create at least 6 original ad cuts before testing."),
+        "<h3>PDP Review Checklist</h3>",
+        _replica_html_list(launch.get("shopify_pdp_tasks"), "Add hero media, FAQ, trust, shipping, returns, bundle, and compliance wording."),
+        "<h3>Economics Gate</h3>",
+        _replica_html_list(
+            [
+                f"Estimated price: ${_replica_money_str(unit.get('price') or action.get('price'))}",
+                f"Break-even CPA: ${_replica_money_str(unit.get('break_even_cpa'))}",
+                f"Target CPA: ${_replica_money_str(unit.get('target_cpa'))}",
+                "Confirm real COGS, fulfillment time, refund reserve, and supplier before running ads.",
+            ]
+        ),
+        "<h3>Do Not Copy</h3>",
+        _replica_html_list(do_not_copy),
+    ]
+    return "".join(html_parts)
+
+
+def _build_shopify_replica_product(action: dict) -> dict:
+    pareto = action.get("pareto") or {}
+    unit = action.get("unit_economics") or {}
+    title = _safe_replica_title(action)
+    rank = int(_replica_money(action.get("rank"), 0))
+    domain = _replica_text(action.get("domain"), "unknown-domain")
+    real = int(_replica_money(pareto.get("real_validation_count"), 0))
+    required = int(_replica_money(pareto.get("required_validation_count"), 2))
+    price = _replica_money(unit.get("price") or action.get("price"), 0)
+    handle = f"v2-replica-{rank or int(time.time())}-{_replica_slug(title)}"
+    tags = _replica_unique(
+        [
+            "v2-replica-draft",
+            "structure-only",
+            "needs-human-review",
+            "needs-original-media",
+            "needs-cogs",
+            "needs-compliance",
+            f"source-domain-{_replica_slug(domain)}",
+            f"validation-{real}-of-{required}",
+        ],
+        20,
+    )
+    traffic_sources = [
+        _replica_text(item.get("source"))
+        for item in (pareto.get("traffic_sources") or [])
+        if isinstance(item, dict)
+    ]
+    supply = pareto.get("supply_chain") if isinstance(pareto.get("supply_chain"), dict) else {}
+    metafields = [
+        {"namespace": "custom", "key": "v2_source_domain", "type": "single_line_text_field", "value": domain},
+        {"namespace": "custom", "key": "v2_source_product_url", "type": "multi_line_text_field", "value": _replica_text(action.get("product_url"))},
+        {"namespace": "custom", "key": "v2_validation_count", "type": "single_line_text_field", "value": f"{real}/{required}"},
+        {"namespace": "custom", "key": "v2_traffic_sources", "type": "multi_line_text_field", "value": "\n".join(_replica_unique(traffic_sources, 8))},
+        {"namespace": "custom", "key": "v2_supply_keyword", "type": "single_line_text_field", "value": _replica_text(supply.get("keyword"))},
+        {"namespace": "custom", "key": "v2_next_action", "type": "multi_line_text_field", "value": _replica_text(pareto.get("one_action") or action.get("next_action"))},
+        {"namespace": "custom", "key": "v2_evidence_gaps", "type": "multi_line_text_field", "value": "\n".join(_replica_unique(pareto.get("evidence_gaps"), 8))},
+    ]
+    return {
+        "title": title,
+        "handle": handle,
+        "descriptionHtml": _build_replica_description(action),
+        "vendor": os.getenv("SHOPIFY_VENDOR", "V2 Operator Draft"),
+        "productType": _replica_product_type(action),
+        "status": "DRAFT",
+        "tags": tags,
+        "seo": {
+            "title": title,
+            "description": "Draft-only product scaffold. Original assets, verified claims, COGS, fulfillment, and compliance review required before publishing.",
+        },
+        "metafields": metafields,
+        "variants": [
+            {
+                "sku": f"V2-DRAFT-{rank or 'X'}-{_replica_slug(domain)[:24].upper()}",
+                "price": _replica_money_str(price),
+                "compareAtPrice": _replica_money_str(price * 1.25) if price > 0 else None,
+                "inventoryPolicy": "DENY",
+                "taxable": True,
+                "optionValues": [],
+            }
+        ],
+    }
+
+
+def _write_replica_catalog(actions: list[dict], mode: str) -> dict:
+    SHOPIFY_REPLICA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    products = [_build_shopify_replica_product(action) for action in actions]
+    catalog = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "mode": mode,
+        "safety": {
+            "status": "DRAFT",
+            "rule": "Only structure and operator notes are replicated. Competitor media, copied text, brand terms, logos, reviews, and claims are excluded.",
+            "human_review_required": True,
+        },
+        "products": products,
+    }
+    catalog_path = SHOPIFY_REPLICA_OUTPUT_DIR / f"replica_catalog_{ts}.json"
+    normalized_path = SHOPIFY_REPLICA_OUTPUT_DIR / f"replica_catalog_{ts}.normalized.json"
+    report_path = SHOPIFY_REPLICA_OUTPUT_DIR / f"replica_upload_report_{ts}.json"
+    manifest_path = SHOPIFY_REPLICA_OUTPUT_DIR / f"replica_manifest_{ts}.json"
+    catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest = {
+        "ok": True,
+        "generated_at": catalog["generated_at"],
+        "mode": mode,
+        "catalog_path": str(catalog_path),
+        "normalized_path": str(normalized_path),
+        "report_path": str(report_path),
+        "products": [
+            {
+                "title": product.get("title"),
+                "handle": product.get("handle"),
+                "status": product.get("status"),
+                "price": ((product.get("variants") or [{}])[0] or {}).get("price"),
+            }
+            for product in products
+        ],
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    (SHOPIFY_REPLICA_OUTPUT_DIR / "replica_latest.json").write_text(
+        json.dumps({**manifest, "manifest_path": str(manifest_path)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return {**manifest, "catalog": catalog, "manifest_path": str(manifest_path)}
+
+
+def _redact_shopify_output(text: str) -> str:
+    safe = text or ""
+    for key in ("SHOPIFY_ADMIN_TOKEN", "SHOPIFY_ACCESS_TOKEN"):
+        token = os.getenv(key)
+        if token:
+            safe = safe.replace(token, "[redacted]")
+    return safe[-5000:]
+
+
+def _run_shopify_bulk_upload(catalog_path: str, normalized_path: str, report_path: str, apply: bool = False) -> dict:
+    if not SHOPIFY_BULK_UPLOAD_SCRIPT.exists():
+        return {"ok": False, "error": f"Shopify uploader missing: {SHOPIFY_BULK_UPLOAD_SCRIPT}"}
+
+    cmd = [
+        sys.executable,
+        str(SHOPIFY_BULK_UPLOAD_SCRIPT),
+        "--source",
+        catalog_path,
+        "--dump-normalized",
+        normalized_path,
+        "--report-json",
+        report_path,
+        "--strict",
+    ]
+    shop = _replica_text(os.getenv("SHOPIFY_SHOP_DOMAIN"))
+    if shop:
+        cmd.extend(["--shop", shop])
+    if apply:
+        cmd.append("--apply")
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "error": "Shopify uploader timed out", "stdout": _redact_shopify_output(exc.stdout or ""), "stderr": _redact_shopify_output(exc.stderr or "")}
+
+    report = {}
+    try:
+        path = Path(report_path)
+        if path.exists():
+            report = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        report = {}
+    return {
+        "ok": proc.returncode == 0,
+        "returncode": proc.returncode,
+        "mode": "apply" if apply else "preview",
+        "stdout": _redact_shopify_output(proc.stdout),
+        "stderr": _redact_shopify_output(proc.stderr),
+        "report": report,
+    }
+
+
+def _run_v2_operator_workbench(
+    limit: int,
+    trend_top_n: int,
+    fb_limit: int,
+    fb_exact_verify_limit: int,
+    trend_geo: str,
+):
+    config = AutoIntelConfig(
+        lookback_days=7,
+        fb_limit=fb_limit,
+        fb_exact_verify_limit=fb_exact_verify_limit,
+        trend_geo=(trend_geo or "US").upper(),
+        trend_top_n=trend_top_n,
+        trend_max_keywords=max(1, min(max(trend_top_n or 1, limit or 1) * 3, 150)),
+        max_per_domain=3,
+        max_per_family=1,
+    )
+    return run_profit_pipeline(config, limit=limit, trend_top_n=trend_top_n)
+
+
+@app.post("/api/v2/workbench/run")
+def api_v2_workbench_run(
+    limit: int = Query(50, ge=1, le=100),
+    trend_top_n: int = Query(50, ge=0, le=100),
+    fb_limit: int = Query(5000, ge=1, le=20000),
+    fb_exact_verify_limit: int = Query(300, ge=0, le=1000),
+    trend_geo: str = Query("US", min_length=0, max_length=8),
+):
+    """Run the V2 80/20 follow-product workbench: competitor, traffic, supply, one action."""
+
+    try:
+        return _run_v2_operator_workbench(limit, trend_top_n, fb_limit, fb_exact_verify_limit, trend_geo)
+    except AutoIntelRunLocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"V2 workbench run failed: {exc}") from exc
+
+
+@app.get("/api/v2/workbench/latest")
+def api_v2_workbench_latest():
+    return get_latest_profit_pipeline()
+
+
+def _closed_loop_num(value, default: float = 0.0) -> float:
+    try:
+        return _replica_money(value, default)
+    except Exception:
+        return default
+
+
+def _closed_loop_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def _closed_loop_list(value) -> list:
+    return value if isinstance(value, list) else []
+
+
+def _closed_loop_ad_heat(ad_count: int) -> str:
+    if ad_count >= 300:
+        return "过热放量"
+    if ad_count >= 80:
+        return "规模放量"
+    if ad_count >= 5:
+        return "已验证投放"
+    if ad_count > 0:
+        return "初测投放"
+    return "未命中广告"
+
+
+def _closed_loop_validation_keyword(action: dict, pareto: dict, validation: dict) -> str:
+    platform_proof = validation.get("platform_proof") if isinstance(validation.get("platform_proof"), dict) else {}
+    trend = validation.get("google_trends") if isinstance(validation.get("google_trends"), dict) else {}
+    for value in (
+        platform_proof.get("primary_keyword"),
+        trend.get("query"),
+        trend.get("trend_query"),
+        action.get("title"),
+        action.get("domain"),
+        pareto.get("supply_keyword"),
+    ):
+        text = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        if text:
+            return text[:90]
+    return "product"
+
+
+def _closed_loop_validation_links(keyword: str) -> list[dict]:
+    query = re.sub(r"\s+", " ", str(keyword or "product").strip().lower()) or "product"
+    encoded = urllib.parse.quote_plus(query)
+    return [
+        {"platform": "Reddit", "url": f"https://www.reddit.com/search/?q={encoded}%20recommendations%20review", "purpose": "真实需求/推荐/吐槽"},
+        {"platform": "X", "url": f"https://x.com/search?q={encoded}%20review%20ad%20product&src=typed_query", "purpose": "实时讨论/达人/品牌投放线索"},
+        {"platform": "YouTube", "url": f"https://www.youtube.com/results?search_query={encoded}%20review%20unboxing%20demo", "purpose": "开箱/演示/评测素材"},
+        {"platform": "TikTok", "url": f"https://www.tiktok.com/search?q={encoded}%20review", "purpose": "UGC密度/视频钩子"},
+        {"platform": "Meta Ad Library", "url": f"https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=US&is_targeted_country=false&media_type=all&q={encoded}&search_type=keyword_unordered", "purpose": "竞品是否真的在买量"},
+        {"platform": "Google Trends", "url": f"https://trends.google.com/trends/explore?geo=US&q={encoded}", "purpose": "真实时间序列/动量"},
+        {"platform": "Google Shopping", "url": f"https://www.google.com/search?tbm=shop&q={encoded}", "purpose": "同类卖家/价格带"},
+        {"platform": "Amazon", "url": f"https://www.amazon.com/s?k={encoded}", "purpose": "评论痛点/价格锚点"},
+    ]
+
+
+def _closed_loop_supply_links(keyword: str) -> list[dict]:
+    query = re.sub(r"\s+", " ", str(keyword or "product").strip().lower()) or "product"
+    encoded = urllib.parse.quote_plus(query)
+    return [
+        {"platform": "Google Shopping", "url": f"https://www.google.com/search?tbm=shop&q={encoded}", "purpose": "同款/近似款卖家和价格带"},
+        {"platform": "Amazon", "url": f"https://www.amazon.com/s?k={encoded}", "purpose": "评论痛点和价格锚点"},
+        {"platform": "AliExpress", "url": f"https://www.aliexpress.com/wholesale?SearchText={encoded}", "purpose": "小单测试货源"},
+        {"platform": "Alibaba", "url": f"https://www.alibaba.com/trade/search?SearchText={encoded}", "purpose": "工厂/MOQ/定制空间"},
+        {"platform": "1688", "url": f"https://s.1688.com/selloffer/offer_search.htm?keywords={encoded}", "purpose": "源头价和替代供应"},
+    ]
+
+
+def _closed_loop_pick_links(links: list, tokens: list[str], limit: int = 4) -> list[dict]:
+    out: list[dict] = []
+    needles = [str(token or "").lower() for token in tokens if str(token or "").strip()]
+    for link in links if isinstance(links, list) else []:
+        if not isinstance(link, dict):
+            continue
+        text = " ".join(str(link.get(key, "")) for key in ("platform", "name", "purpose", "url")).lower()
+        if needles and not any(needle in text for needle in needles):
+            continue
+        if not link.get("url"):
+            continue
+        out.append({
+            "platform": link.get("platform") or link.get("name") or "Search",
+            "url": str(link.get("url")),
+            "purpose": link.get("purpose") or "补验证据",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _closed_loop_validation_slot(
+    key: str,
+    label: str,
+    status: str,
+    evidence: str,
+    next_action: str,
+    search_query: str,
+    search_links: list,
+    *,
+    why_not_verified: str = "",
+    blocking: bool = False,
+    fallback_links: list | None = None,
+) -> dict:
+    allowed = {"verified", "pending", "failed", "lead_only"}
+    state = status if status in allowed else "pending"
+    verified = state == "verified"
+    query = re.sub(r"\s+", " ", str(search_query or label).strip().lower()) or label
+    links = _closed_loop_pick_links(search_links, [], 4)
+    fallback = _closed_loop_pick_links(fallback_links or [], [], 4)
+    if not links and not fallback:
+        links = _closed_loop_pick_links(_closed_loop_validation_links(query), [], 4)
+    return {
+        "key": key,
+        "label": label,
+        "status": state,
+        "verified": verified,
+        "blocking": bool(blocking and not verified),
+        "blocks_follow": bool(blocking and not verified),
+        "blocks_publish": bool(blocking and not verified),
+        "evidence": evidence or "未找到可验证证据",
+        "why_not_verified": "" if verified else (why_not_verified or evidence or "尚未拿到可验证证据"),
+        "next_action": next_action or f"用「{query}」补 {label} 验证",
+        "search_query": query,
+        "search_links": links,
+        "fallback_links": fallback,
+    }
+
+
+def _closed_loop_domain(value: str) -> str:
+    try:
+        normalized = su.normalize_domain(str(value or ""))
+    except Exception:
+        normalized = str(value or "")
+    normalized = re.sub(r"^https?://", "", normalized.lower()).split("/")[0].strip()
+    return normalized[4:] if normalized.startswith("www.") else normalized
+
+
+def _closed_loop_fb_db_paths() -> list[Path]:
+    paths: list[Path] = []
+    if FB_PIPELINE_DB.exists():
+        paths.append(FB_PIPELINE_DB)
+    if FB_PIPELINE_SHARDS_DIR.exists():
+        paths.extend(sorted(FB_PIPELINE_SHARDS_DIR.glob("pipeline-*.db"), reverse=True))
+    seen: set[str] = set()
+    out: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key not in seen and path.exists():
+            out.append(path)
+            seen.add(key)
+    return out
+
+
+def _closed_loop_sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (table,),
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def _closed_loop_fb_db_signal(domain: str) -> dict:
+    normalized = _closed_loop_domain(domain)
+    if not normalized:
+        return {}
+    best: dict = {}
+    for path in _closed_loop_fb_db_paths():
+        try:
+            conn = sqlite3.connect(str(path), timeout=3)
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            continue
+        try:
+            brand: dict = {}
+            if _closed_loop_sqlite_table_exists(conn, "brands"):
+                row = conn.execute(
+                    """
+                    SELECT domain, canonical_name, appearance_count, total_ads_across_scans,
+                           highest_likes, orbit_score, last_seen
+                    FROM brands
+                    WHERE lower(domain)=lower(?) OR lower(domain)=lower(?)
+                    ORDER BY last_seen DESC
+                    LIMIT 1
+                    """,
+                    (normalized, f"www.{normalized}"),
+                ).fetchone()
+                if row:
+                    brand = dict(row)
+
+            archive_count = 0
+            active_count = 0
+            archive_last_seen = ""
+            if _closed_loop_sqlite_table_exists(conn, "ad_archive"):
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS archive_count,
+                           SUM(CASE WHEN is_active=1 THEN 1 ELSE 0 END) AS active_count,
+                           MAX(COALESCE(scan_date, inserted_at, updated_at)) AS archive_last_seen
+                    FROM ad_archive
+                    WHERE lower(domain)=lower(?) OR lower(domain)=lower(?)
+                    """,
+                    (normalized, f"www.{normalized}"),
+                ).fetchone()
+                if row:
+                    archive_count = int(_closed_loop_num(row["archive_count"], 0))
+                    active_count = int(_closed_loop_num(row["active_count"], 0))
+                    archive_last_seen = str(row["archive_last_seen"] or "")
+
+            if not brand and archive_count <= 0:
+                continue
+
+            appearance = int(_closed_loop_num(brand.get("appearance_count"), 0))
+            total_ads = int(_closed_loop_num(brand.get("total_ads_across_scans"), 0))
+            count = max(appearance, total_ads, archive_count, active_count)
+            candidate = {
+                "domain": normalized,
+                "brand": brand.get("canonical_name") or normalized,
+                "ad_creative_count": count,
+                "appearance_count": appearance,
+                "total_ads_across_scans": total_ads,
+                "archive_count": archive_count,
+                "active_archive_count": active_count,
+                "orbit_score": _closed_loop_num(brand.get("orbit_score"), 0),
+                "highest_likes": int(_closed_loop_num(brand.get("highest_likes"), 0)),
+                "last_seen": archive_last_seen or str(brand.get("last_seen") or ""),
+                "fb_verified_by_8000": count > 0,
+                "fb_verification_status": "matched" if count > 0 else "not_found",
+                "fb_verification_source": "8000_sqlite_fallback",
+                "source_db": str(path),
+            }
+            if count > int(_closed_loop_num(best.get("ad_creative_count"), 0)):
+                best = candidate
+        except sqlite3.Error:
+            continue
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return best
+
+
+def _closed_loop_gt_status_from_record(record: dict) -> str:
+    direction = str(record.get("trend_dir") or "").lower()
+    avg = _closed_loop_num(record.get("avg_score"), 0)
+    last_30d = _closed_loop_num(record.get("last_30d"), avg)
+    peak = _closed_loop_num(record.get("peak"), 0)
+    if direction in {"breakout", "rising", "up", "hot"} or last_30d >= 60 or avg >= 45:
+        return "hot"
+    if direction in {"watch", "emerging"} or last_30d >= 20 or avg >= 15 or peak >= 60:
+        return "watch"
+    if last_30d > 0 or avg > 0 or int(_closed_loop_num(record.get("data_points"), 0)) > 0:
+        return "weak"
+    return "unverified"
+
+
+def _closed_loop_gtrends_signal(action: dict, keyword: str, trend: dict) -> dict:
+    candidates: list[str] = []
+    for value in (
+        trend.get("query") if isinstance(trend, dict) else "",
+        trend.get("trend_query") if isinstance(trend, dict) else "",
+        keyword,
+        action.get("title"),
+    ):
+        normalized = _gtrends_normalize_keyword(str(value or ""))
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    try:
+        for value in _gtrends_keywords_from_product(action)[:8]:
+            if value and value not in candidates:
+                candidates.append(value)
+    except Exception:
+        pass
+    if not candidates:
+        return {}
+    for record in _gtrends_read_records(candidates[:12], "US", "today 12-m"):
+        if not isinstance(record, dict) or record.get("status") != "ok":
+            continue
+        points = int(_closed_loop_num(record.get("data_points"), 0))
+        source = str(record.get("source") or "gtrends_bulk_cache")
+        if points <= 0:
+            continue
+        status = _closed_loop_gt_status_from_record(record)
+        score = max(
+            _closed_loop_num(record.get("last_30d"), 0),
+            _closed_loop_num(record.get("avg_score"), 0),
+        )
+        strict = status in {"hot", "watch", "emerging"}
+        return {
+            "query": record.get("keyword") or candidates[0],
+            "status": status,
+            "score": round(score, 2),
+            "verified": True,
+            "trend_verified": True,
+            "strict_trend": strict,
+            "avg_score": round(_closed_loop_num(record.get("avg_score"), 0), 2),
+            "last_30d": round(_closed_loop_num(record.get("last_30d"), 0), 2),
+            "peak": round(_closed_loop_num(record.get("peak"), 0), 2),
+            "trend_dir": record.get("trend_dir") or "",
+            "confidence": record.get("confidence") or "",
+            "data_points": points,
+            "source": source,
+            "cached_at": record.get("cached_at") or "",
+        }
+    return {}
+
+
+def _closed_loop_patch_slot(slots: list[dict], key: str, updates: dict) -> None:
+    for slot in slots:
+        if isinstance(slot, dict) and str(slot.get("key") or "") == key:
+            slot.update(updates)
+            return
+
+
+def _closed_loop_repair_required_validation(
+    required_validation: dict,
+    *,
+    keyword: str,
+    domain: str,
+    ad_signal: dict,
+    trend_signal: dict,
+    needs_more_strict: bool,
+) -> dict:
+    if not isinstance(required_validation, dict):
+        return required_validation
+    slots = [dict(slot) for slot in required_validation.get("slots", []) if isinstance(slot, dict)]
+    links = _closed_loop_validation_links(keyword)
+    if ad_signal:
+        ad_count = int(_closed_loop_num(ad_signal.get("ad_creative_count"), 0))
+        if ad_count > 0:
+            archive = int(_closed_loop_num(ad_signal.get("archive_count"), 0))
+            active = int(_closed_loop_num(ad_signal.get("active_archive_count"), 0))
+            total_ads = int(_closed_loop_num(ad_signal.get("total_ads_across_scans"), 0))
+            appearance = int(_closed_loop_num(ad_signal.get("appearance_count"), 0))
+            last_seen = ad_signal.get("last_seen") or "unknown"
+            pieces = [
+                f"8000 SQLite 已验真：广告/投放信号 {ad_count} 条",
+                f"appearance {appearance}",
+                f"total_ads {total_ads}",
+            ]
+            if archive:
+                pieces.append(f"archive素材 {archive} 条")
+            if active:
+                pieces.append(f"active素材 {active} 条")
+            pieces.append(f"orbit {int(_closed_loop_num(ad_signal.get('orbit_score'), 0))}")
+            pieces.append(f"last_seen {last_seen}")
+            _closed_loop_patch_slot(slots, "meta_ads", {
+                "status": "verified",
+                "verified": True,
+                "blocking": False,
+                "blocks_follow": False,
+                "blocks_publish": False,
+                "evidence": "；".join(pieces),
+                "why_not_verified": "",
+                "next_action": f"已由 8000 本地DB自动验真；下一轮只需监控 {domain or keyword} 的素材增减、落地页和首3秒钩子。",
+                "search_links": _closed_loop_pick_links(links, ["meta", "facebook"], 4),
+            })
+    else:
+        _closed_loop_patch_slot(slots, "meta_ads", {
+            "evidence": f"8000 HTTP/brands 异常时已查本地主库+分片，{domain or keyword} 当前未命中广告素材计数",
+            "why_not_verified": "本地8000主库和历史分片均未命中真实广告素材；系统会在下一轮自动扩大域名/品牌词扫描",
+            "blocking": bool(needs_more_strict),
+            "blocks_follow": bool(needs_more_strict),
+            "blocks_publish": bool(needs_more_strict),
+        })
+
+    if trend_signal:
+        strict = bool(trend_signal.get("strict_trend"))
+        status = "verified" if strict else "lead_only"
+        weak_reason = "真实时间序列已验证但趋势弱，不计入强需求；继续自动补 Meta/UGC/市场证据。"
+        evidence = (
+            f"真实Google Trends序列：{trend_signal.get('query')}；状态 {trend_signal.get('status')}；"
+            f"近30天 {trend_signal.get('last_30d')}；12月均值 {trend_signal.get('avg_score')}；"
+            f"方向 {trend_signal.get('trend_dir') or 'flat'}；点数 {trend_signal.get('data_points')}；"
+            f"source {trend_signal.get('source')}"
+        )
+        _closed_loop_patch_slot(slots, "google_trends", {
+            "status": status,
+            "verified": strict,
+            "blocking": False,
+            "blocks_follow": False,
+            "blocks_publish": False,
+            "evidence": evidence,
+            "why_not_verified": "" if strict else weak_reason,
+            "next_action": "趋势已自动验真；强趋势直接提高跟品优先级，弱趋势转由广告/社区/市场证据决定测试强度。",
+            "search_query": trend_signal.get("query") or keyword,
+            "search_links": _closed_loop_pick_links(links, ["trends"], 2),
+        })
+
+    return _closed_loop_normalize_required_validation({
+        "version": "required-validation-v2-auto-evidence-repaired",
+        "keyword": keyword,
+        "slots": slots,
+        "rule": "Meta Ads 从8000 API/SQLite双路验真；Google Trends 只承认真实时间序列，弱趋势不再误报缺序列。",
+    }, keyword) or required_validation
+
+
+def _closed_loop_slot_status(required_validation: dict, key: str) -> str:
+    for slot in required_validation.get("slots", []) if isinstance(required_validation, dict) else []:
+        if isinstance(slot, dict) and str(slot.get("key") or "") == key:
+            return str(slot.get("status") or "")
+    return ""
+
+
+def _closed_loop_strict_count(required_validation: dict, fallback: int) -> int:
+    strict_keys = {"meta_ads", "google_trends", "social_ugc", "marketplace"}
+    count = 0
+    for slot in required_validation.get("slots", []) if isinstance(required_validation, dict) else []:
+        if not isinstance(slot, dict) or str(slot.get("key") or "") not in strict_keys:
+            continue
+        if slot.get("status") == "verified":
+            count += 1
+    return max(int(fallback or 0), count)
+
+
+def _closed_loop_filter_resolved_gaps(gaps: list, required_validation: dict) -> list:
+    meta_status = _closed_loop_slot_status(required_validation, "meta_ads")
+    trends_status = _closed_loop_slot_status(required_validation, "google_trends")
+    out: list = []
+    for gap in gaps if isinstance(gaps, list) else []:
+        text = str(gap or "")
+        lower = text.lower()
+        if meta_status == "verified" and ("meta/facebook" in lower or "meta ads" in lower or "fb素材" in lower or "广告验真" in lower):
+            continue
+        if trends_status in {"verified", "lead_only"} and ("google trends" in lower or "真实时间序列" in lower or "proxy/suggest" in lower):
+            continue
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _closed_loop_normalize_required_validation(raw: dict, keyword: str) -> dict:
+    slots = raw.get("slots") if isinstance(raw.get("slots"), list) else []
+    if not slots:
+        return {}
+    links = _closed_loop_validation_links(keyword)
+    clean_slots: list[dict] = []
+    for slot in slots:
+        if not isinstance(slot, dict):
+            continue
+        status = str(slot.get("status") or ("verified" if slot.get("verified") else "pending"))
+        key = str(slot.get("key") or slot.get("label") or "validation").strip() or "validation"
+        label = str(slot.get("label") or key).strip() or key
+        clean_slots.append(_closed_loop_validation_slot(
+            key,
+            label,
+            status,
+            str(slot.get("evidence") or slot.get("signal") or ""),
+            str(slot.get("next_action") or ""),
+            str(slot.get("search_query") or keyword),
+            _closed_loop_pick_links(slot.get("search_links") or links, [], 4),
+            why_not_verified=str(slot.get("why_not_verified") or ""),
+            blocking=bool(slot.get("blocking") or slot.get("blocks_follow")),
+            fallback_links=slot.get("fallback_links") if isinstance(slot.get("fallback_links"), list) else [],
+        ))
+    if not clean_slots:
+        return {}
+    verified_count = sum(1 for slot in clean_slots if slot.get("status") == "verified")
+    pending_count = sum(1 for slot in clean_slots if slot.get("status") == "pending")
+    failed_count = sum(1 for slot in clean_slots if slot.get("status") == "failed")
+    lead_count = sum(1 for slot in clean_slots if slot.get("status") == "lead_only")
+    blocking_slots = [slot for slot in clean_slots if slot.get("blocking") and slot.get("status") != "verified"]
+    pending_tasks = [
+        slot.get("next_action")
+        for slot in clean_slots
+        if slot.get("status") != "verified" and slot.get("next_action")
+    ][:12]
+    return {
+        "version": raw.get("version") or "required-validation-v1-normalized",
+        "keyword": raw.get("keyword") or keyword,
+        "summary": {
+            "status": "failed" if failed_count else "blocked" if blocking_slots else "pending" if pending_count or lead_count else "verified",
+            "verified_count": verified_count,
+            "required_count": len(clean_slots),
+            "pending_count": pending_count,
+            "lead_only_count": lead_count,
+            "failed_count": failed_count,
+            "blocking_count": len(blocking_slots),
+            "next_action": (raw.get("summary") or {}).get("next_action") or (pending_tasks[0] if pending_tasks else "全部必验项已完成，发布前人工复核。"),
+        },
+        "slots": clean_slots,
+        "pending_tasks": pending_tasks,
+        "blocking_missing": [
+            f"{slot.get('label')}: {slot.get('why_not_verified') or slot.get('evidence')}"
+            for slot in blocking_slots[:10]
+        ],
+        "rule": raw.get("rule") or "所有必验项必须有状态、平台趋势、搜索入口和机会动作。",
+    }
+
+
+def _closed_loop_synthesize_required_validation(
+    *,
+    action: dict,
+    pareto: dict,
+    validation: dict,
+    gate: dict,
+    unit: dict,
+    creative_pack: dict,
+    keyword: str,
+    ad_count: int,
+    ad_status: str,
+    trend_status: str,
+    trend_score: float,
+    real: int,
+    required: int,
+    economics_ready: bool,
+    assets_ready: bool,
+    pdp_ready: bool,
+    blockers: list,
+    evidence_gaps: list,
+    supply_status: str,
+) -> dict:
+    links = _closed_loop_validation_links(keyword)
+    supply_links = _closed_loop_supply_links(keyword)
+    slots: list[dict] = []
+    needs_more_strict = real < required
+    trend_verified = trend_status in {"hot", "watch", "emerging"}
+    platform_proof = validation.get("platform_proof") if isinstance(validation.get("platform_proof"), dict) else {}
+    traffic_sources = _closed_loop_list(pareto.get("traffic_sources"))
+    source_text = " ".join(
+        " ".join(str(source.get(key, "")) for key in ("source", "platform", "url", "signal"))
+        for source in traffic_sources
+        if isinstance(source, dict)
+    ).lower()
+    marketplace_verified = supply_status == "marketplace_reference" or "amazon" in source_text or "shopping" in source_text
+    social_verified = any(token in source_text for token in ("reddit", "youtube", "tiktok", "instagram", "twitter", "x/"))
+    creative_count = int(_closed_loop_num((action.get("budget_rules") or {}).get("creative_count") if isinstance(action.get("budget_rules"), dict) else creative_pack.get("minimum_creatives"), 0))
+    image_count = int(_closed_loop_num(gate.get("image_count"), 0))
+    variant_count = int(_closed_loop_num(gate.get("variant_count"), 0))
+    needs_cogs = bool(unit.get("requires_real_cogs") or (pareto.get("money_check") or {}).get("requires_real_cogs") if isinstance(pareto.get("money_check"), dict) else unit.get("requires_real_cogs"))
+
+    slots.append(_closed_loop_validation_slot(
+        "meta_ads",
+        "Meta/Facebook Ads",
+        "verified" if ad_count > 0 and ad_status in {"matched", "cached", "verified"} else "lead_only" if ad_count > 0 else "pending",
+        f"8000广告素材 {ad_count} 条，状态 {ad_status or 'not_checked'}",
+        f"用「{keyword}」和竞品域名复查 Meta Ad Library/8000，记录素材数、落地页和是否持续投放。",
+        keyword,
+        _closed_loop_pick_links(links, ["meta", "facebook"], 4),
+        why_not_verified="缺 Meta/FB 真实广告素材或状态未命中",
+        blocking=needs_more_strict and ad_count <= 0,
+    ))
+    slots.append(_closed_loop_validation_slot(
+        "google_trends",
+        "Google Trends",
+        "verified" if trend_verified else "lead_only" if trend_score else "pending",
+        f"趋势状态 {trend_status or 'unverified'}，分数 {trend_score}",
+        f"用「{keyword}」跑 Google Trends US 时间序列，确认当前值、12个月均值、动量和季节性。",
+        keyword,
+        _closed_loop_pick_links(links, ["trends"], 2),
+        why_not_verified="缺真实时间序列；proxy/suggest不能当验真",
+        blocking=needs_more_strict and not trend_verified,
+    ))
+    slots.append(_closed_loop_validation_slot(
+        "social_ugc",
+        "Reddit/X/YouTube/TikTok UGC",
+        "verified" if social_verified else "lead_only" if _closed_loop_num(platform_proof.get("score"), 0) >= 22 else "pending",
+        f"平台验证分 {_closed_loop_num(platform_proof.get('score'), gate.get('platform_validation_score', 0))}",
+        f"用「{keyword}」查 Reddit/X/YouTube/TikTok，摘出购买理由、抱怨、替代品和可拍素材。",
+        keyword,
+        _closed_loop_pick_links(links, ["reddit", "youtube", "tiktok", "x"], 4),
+        why_not_verified="缺真实讨论、评测或 UGC 链接",
+        blocking=needs_more_strict and not social_verified,
+    ))
+    slots.append(_closed_loop_validation_slot(
+        "marketplace",
+        "Amazon/Google Shopping 市场证据",
+        "verified" if marketplace_verified else "pending",
+        "已有同类价格/评论/卖家证据" if marketplace_verified else "缺同类价格带、评论痛点或卖家密度证据",
+        f"用「{keyword}」查 Amazon 和 Google Shopping，记录3个价格锚点、评论痛点和卖家密度。",
+        keyword,
+        _closed_loop_pick_links(links, ["amazon", "shopping"], 4),
+        why_not_verified="缺 Amazon/Google Shopping 市场验证",
+        blocking=needs_more_strict and not marketplace_verified,
+    ))
+    slots.append(_closed_loop_validation_slot(
+        "supply_chain",
+        "供应链/到手成本",
+        "lead_only" if marketplace_verified else "pending",
+        "有市场参考，真实COGS/MOQ/时效仍待核" if marketplace_verified else "未拿到供应商报价/MOQ/时效",
+        f"用「{keyword}」找3个同源/近似供应商，记录到手成本、MOQ、时效和可改包装空间。",
+        keyword,
+        supply_links,
+        why_not_verified="必须拿到真实报价、MOQ、时效和可定制空间",
+        blocking=not marketplace_verified,
+    ))
+    slots.append(_closed_loop_validation_slot(
+        "unit_economics",
+        "单品经济性",
+        "lead_only" if economics_ready else "pending",
+        f"预估贡献 ${_closed_loop_num(unit.get('contribution_before_ads'), 0):.2f}，毛利 {_closed_loop_num(unit.get('contribution_margin_pct'), 0):.1f}%，真实COGS待核={needs_cogs}",
+        "接真实COGS、运费、退货率和支付费，重算 break-even CPA 与目标 CPA。",
+        keyword,
+        supply_links,
+        why_not_verified="纸面利润存在但真实 COGS/运费/退货率未验证" if economics_ready else "贡献毛利或价格不足以证明可买量",
+        blocking=not economics_ready,
+    ))
+    slots.append(_closed_loop_validation_slot(
+        "pdp_assets",
+        "PDP素材/变体承接",
+        "verified" if pdp_ready else "pending",
+        f"图片 {image_count} 张，变体 {variant_count} 个",
+        "补首屏实拍/演示图、场景图、FAQ 和主推 SKU；变体过多先收窄。",
+        keyword,
+        [{"platform": "Competitor PDP", "url": action.get("product_url", ""), "purpose": "核对首屏、图片、FAQ、变体"}] + _closed_loop_pick_links(links, ["shopping", "amazon"], 2),
+        why_not_verified="PDP 图片/演示素材不足或变体过多",
+        blocking=not pdp_ready,
+    ))
+    slots.append(_closed_loop_validation_slot(
+        "creative_pack",
+        "原创素材包",
+        "verified" if assets_ready and creative_count >= 6 else "pending",
+        f"素材齐={assets_ready}，脚本/素材数 {creative_count}",
+        "准备6条原创脚本：痛点演示、差评反打、before/after、bundle、FAQ objection、场景化UGC。",
+        keyword,
+        _closed_loop_pick_links(links, ["youtube", "tiktok", "meta"], 4),
+        why_not_verified="没有足够原创素材脚本，不能复用竞品素材",
+        blocking=not assets_ready or creative_count < 6,
+    ))
+    slots.append(_closed_loop_validation_slot(
+        "risk_compliance",
+        "合规/IP/履约风险",
+        "failed" if blockers else "pending" if evidence_gaps else "verified",
+        "；".join(str(x) for x in (blockers or evidence_gaps)[:3]) if (blockers or evidence_gaps) else "暂无硬风险；发布前仍需人工复核",
+        "人工检查品牌词、Logo、IP、医疗/安全宣称、配送退货限制；硬风险未解除不建DRAFT。",
+        keyword,
+        _closed_loop_pick_links(links, ["amazon", "reddit"], 3),
+        fallback_links=[
+            {"platform": "Shopify AUP", "url": "https://www.shopify.com/legal/aup", "purpose": "核平台禁售/限制类目"},
+            {"platform": "FTC Advertising", "url": "https://www.ftc.gov/business-guidance/advertising-marketing", "purpose": "核广告宣称边界"},
+        ],
+        why_not_verified="存在硬风险或待人工确认的合规/IP/履约风险",
+        blocking=bool(blockers),
+    ))
+    return _closed_loop_normalize_required_validation({
+        "version": "required-validation-v1-synthesized",
+        "keyword": keyword,
+        "slots": slots,
+    }, keyword)
+
+
+def _closed_loop_item(action: dict, rank: int, pareto_cutoff: int) -> dict:
+    pareto = action.get("pareto") if isinstance(action.get("pareto"), dict) else {}
+    gate = action.get("operator_gate") if isinstance(action.get("operator_gate"), dict) else {}
+    validation = action.get("validation") if isinstance(action.get("validation"), dict) else {}
+    fb_ads = validation.get("fb_ads") if isinstance(validation.get("fb_ads"), dict) else {}
+    trend = validation.get("google_trends") if isinstance(validation.get("google_trends"), dict) else {}
+    platform_proof = validation.get("platform_proof") if isinstance(validation.get("platform_proof"), dict) else {}
+    platform_ai_validation = validation.get("platform_ai") if isinstance(validation.get("platform_ai"), dict) else {}
+    triage = pareto.get("launch_triage") if isinstance(pareto.get("launch_triage"), dict) else {}
+    unit = action.get("unit_economics") if isinstance(action.get("unit_economics"), dict) else {}
+    platform_ai = action.get("platform_ai") if isinstance(action.get("platform_ai"), dict) else {}
+    creative_pack = action.get("creative_pack") if isinstance(action.get("creative_pack"), dict) else {}
+    launch_order = action.get("launch_test_order") if isinstance(action.get("launch_test_order"), dict) else {}
+    stop_scale = action.get("stop_scale_rules") if isinstance(action.get("stop_scale_rules"), dict) else {}
+    budget_rules = action.get("budget_rules") if isinstance(action.get("budget_rules"), dict) else {}
+    money_check = pareto.get("money_check") if isinstance(pareto.get("money_check"), dict) else {}
+
+    priority = int(_closed_loop_num(pareto.get("priority") or action.get("follow_priority_score") or action.get("score"), 0))
+    ad_count = int(_closed_loop_num(fb_ads.get("creative_count") or gate.get("fb_creative_count"), 0))
+    real = int(_closed_loop_num(pareto.get("real_validation_count"), 0))
+    required = int(_closed_loop_num(pareto.get("required_validation_count"), 2))
+    lane = str(pareto.get("lane") or "")
+    triage_level = str(triage.get("level") or "")
+    blockers = list(gate.get("blockers") or [])
+    evidence_gaps = list(pareto.get("evidence_gaps") or action.get("missing_evidence") or [])
+    missing = _closed_loop_list(gate.get("missing") or gate.get("missing_evidence") or action.get("missing_evidence"))
+    creative_gaps = _closed_loop_list(action.get("creative_gaps") or gate.get("creative_gaps") or platform_ai.get("asset_gaps"))
+    pdp_gaps = _closed_loop_list(action.get("pdp_gaps") or gate.get("pdp_gaps"))
+    economics_gaps = _closed_loop_list(action.get("economics_gaps") or gate.get("economics_gaps"))
+    proof_sources = _closed_loop_list(action.get("proof_sources") or gate.get("proof_sources"))
+    do_not_copy = _closed_loop_list(pareto.get("do_not_copy"))
+    learn_points = _closed_loop_list(pareto.get("learn_points"))
+    traffic_sources = _closed_loop_list(pareto.get("traffic_sources"))
+    economics_ready = bool(unit.get("economics_ready") or gate.get("economics_ready"))
+    important_20 = rank <= pareto_cutoff
+    draft_ready = triage_level == "launch_now" and triage.get("can_upload_draft") is True
+    assets_ready = bool(gate.get("assets_ready"))
+    pdp_ready = not pdp_gaps and int(_closed_loop_num(gate.get("image_count"), 0)) >= 2
+    ai_ready = bool(gate.get("ai_ready_enough") or platform_ai.get("readiness") == "ai_ready")
+    contribution = _closed_loop_num(unit.get("contribution_before_ads"), 0)
+    contribution_margin_pct = _closed_loop_num(unit.get("contribution_margin_pct"), 0)
+    cpa_room = max(0.0, _closed_loop_num(unit.get("break_even_cpa"), 0) - _closed_loop_num(unit.get("target_cpa"), 0))
+    supply = pareto.get("supply_chain") if isinstance(pareto.get("supply_chain"), dict) else {}
+    supply_status = str(supply.get("status") or action.get("supply_status") or "")
+    keyword = _closed_loop_validation_keyword(action, pareto, validation)
+    domain = _closed_loop_domain(action.get("domain", ""))
+    fb_db_signal = _closed_loop_fb_db_signal(domain)
+    if fb_db_signal:
+        db_ad_count = int(_closed_loop_num(fb_db_signal.get("ad_creative_count"), 0))
+        if db_ad_count > ad_count:
+            ad_count = db_ad_count
+            fb_ads = {
+                **fb_ads,
+                "creative_count": db_ad_count,
+                "appearance_count": fb_db_signal.get("appearance_count", 0),
+                "total_ads_across_scans": fb_db_signal.get("total_ads_across_scans", 0),
+                "status": "matched",
+                "grade": fb_ads.get("grade") or "8000-db",
+                "orbit_score": fb_db_signal.get("orbit_score", fb_ads.get("orbit_score", 0)),
+                "ai_score": fb_ads.get("ai_score", 0),
+                "fb_verification_source": fb_db_signal.get("fb_verification_source", "8000_sqlite_fallback"),
+            }
+    gtrends_signal = _closed_loop_gtrends_signal(action, keyword, trend)
+    if not gtrends_signal and isinstance(trend, dict) and (trend.get("verified") or trend.get("trend_verified")):
+        trend_status_value = str(trend.get("status") or trend.get("trend_status") or "weak")
+        trend_score_value = _closed_loop_num(trend.get("score") or trend.get("trend_score"), 0)
+        gtrends_signal = {
+            "query": trend.get("query") or trend.get("trend_query") or keyword,
+            "status": trend_status_value,
+            "score": round(trend_score_value, 2),
+            "verified": True,
+            "trend_verified": True,
+            "strict_trend": trend_status_value in {"hot", "watch", "emerging"},
+            "avg_score": round(_closed_loop_num(trend.get("avg_score"), trend_score_value), 2),
+            "last_30d": round(_closed_loop_num(trend.get("last_30d"), trend_score_value), 2),
+            "peak": round(_closed_loop_num(trend.get("peak"), trend_score_value), 2),
+            "trend_dir": trend.get("trend_dir") or trend_status_value,
+            "confidence": trend.get("confidence") or trend.get("data_quality") or "",
+            "data_points": int(_closed_loop_num(trend.get("data_points"), 1)),
+            "source": trend.get("source") or "money_evidence_google_trends",
+            "cached_at": trend.get("cached_at") or "",
+        }
+    if gtrends_signal:
+        trend = {
+            **trend,
+            "query": gtrends_signal.get("query") or trend.get("query") or keyword,
+            "status": gtrends_signal.get("status") or trend.get("status", "unverified"),
+            "score": gtrends_signal.get("score", trend.get("score", 0)),
+            "verified": True,
+            "trend_verified": True,
+            "source": gtrends_signal.get("source", trend.get("source", "")),
+            "data_points": gtrends_signal.get("data_points", trend.get("data_points", 0)),
+        }
+    required_validation_raw = (
+        action.get("required_validation")
+        if isinstance(action.get("required_validation"), dict)
+        else validation.get("required_matrix")
+        if isinstance(validation.get("required_matrix"), dict)
+        else pareto.get("required_validation")
+        if isinstance(pareto.get("required_validation"), dict)
+        else {}
+    )
+    required_validation = _closed_loop_normalize_required_validation(required_validation_raw, keyword) if required_validation_raw else {}
+    if not required_validation:
+        required_validation = _closed_loop_synthesize_required_validation(
+            action=action,
+            pareto=pareto,
+            validation=validation,
+            gate=gate,
+            unit=unit,
+            creative_pack=creative_pack,
+            keyword=keyword,
+            ad_count=ad_count,
+            ad_status=str(fb_ads.get("status", "")),
+            trend_status=str(trend.get("status", "unverified")),
+            trend_score=_closed_loop_num(trend.get("score"), 0),
+            real=real,
+            required=required,
+            economics_ready=economics_ready,
+            assets_ready=assets_ready,
+            pdp_ready=pdp_ready,
+            blockers=blockers,
+            evidence_gaps=evidence_gaps,
+            supply_status=supply_status,
+        )
+    required_validation = _closed_loop_repair_required_validation(
+        required_validation,
+        keyword=keyword,
+        domain=domain,
+        ad_signal=fb_db_signal if int(_closed_loop_num(fb_db_signal.get("ad_creative_count"), 0)) > 0 else {},
+        trend_signal=gtrends_signal,
+        needs_more_strict=real < required,
+    )
+    real = _closed_loop_strict_count(required_validation, real)
+    strict_pass = real >= required
+    has_ads = ad_count > 0
+    validation_summary = required_validation.get("summary") if isinstance(required_validation.get("summary"), dict) else {}
+    validation_tasks = _closed_loop_list(required_validation.get("pending_tasks"))[:6]
+    validation_blocking = _closed_loop_list(required_validation.get("blocking_missing"))[:6]
+    evidence_gaps = _closed_loop_filter_resolved_gaps(evidence_gaps, required_validation)
+    missing = _closed_loop_filter_resolved_gaps(missing, required_validation)
+    if validation_blocking:
+        evidence_gaps = [*validation_blocking, *evidence_gaps]
+    validation_blocked = bool(validation_blocking) or int(_closed_loop_num(validation_summary.get("blocking_count"), 0)) > 0
+
+    if important_20 and has_ads and strict_pass and lane == "copy_now" and not blockers and economics_ready and draft_ready and not validation_blocked:
+        follow_status = "马上跟"
+        follow_reason = "重要20% + 8000有广告 + 2类验真 + 经济性可测 + 可建DRAFT"
+    elif has_ads and important_20:
+        follow_status = "先拆素材"
+        follow_reason = (validation_blocking or ["8000确认在投广告，但还要补齐验真/供应链/素材/DRAFT条件"])[0]
+    elif important_20:
+        follow_status = "补证观察"
+        follow_reason = "进入重要20%，但8000未命中广告或证据不足"
+    elif lane == "skip" or triage_level == "avoid" or blockers:
+        follow_status = "不碰"
+        follow_reason = (blockers or evidence_gaps or ["风险/证据/经济性不成立"])[0]
+    else:
+        follow_status = "低优先"
+        follow_reason = "不属于当前最重要20%，只保留监控"
+
+    return {
+        "rank": rank,
+        "important_20": important_20,
+        "title": action.get("title", ""),
+        "domain": action.get("domain", ""),
+        "product_url": action.get("product_url", ""),
+        "price": action.get("price", 0),
+        "priority": priority,
+        "score": int(_closed_loop_num(action.get("score"), 0)),
+        "follow_priority_score": int(_closed_loop_num(action.get("follow_priority_score"), 0)),
+        "lane": lane,
+        "decision": pareto.get("decision") or action.get("decision", ""),
+        "triage": triage,
+        "has_ads": has_ads,
+        "ad_count": ad_count,
+        "ad_heat": _closed_loop_ad_heat(ad_count),
+        "ad_status": fb_ads.get("status", ""),
+        "ad_grade": fb_ads.get("grade", ""),
+        "orbit_score": fb_ads.get("orbit_score", 0),
+        "ai_score": fb_ads.get("ai_score", 0),
+        "strict_validation_count": real,
+        "required_validation_count": required,
+        "strict_pass": strict_pass,
+        "trend_status": trend.get("status", "unverified"),
+        "trend_score": trend.get("score", 0),
+        "economics_ready": economics_ready,
+        "draft_ready": draft_ready,
+        "break_even_cpa": unit.get("break_even_cpa", 0),
+        "target_cpa": unit.get("target_cpa", 0),
+        "economics": {
+            "price": unit.get("price", action.get("price", 0)),
+            "estimated_cogs": unit.get("estimated_cogs", 0),
+            "estimated_cogs_ratio": unit.get("estimated_cogs_ratio", 0),
+            "fulfillment_reserve": unit.get("fulfillment_reserve", 0),
+            "payment_fee_reserve": unit.get("payment_fee_reserve", 0),
+            "refund_reserve": unit.get("refund_reserve", 0),
+            "contribution_before_ads": contribution,
+            "contribution_margin_pct": contribution_margin_pct,
+            "break_even_cpa": unit.get("break_even_cpa", 0),
+            "target_cpa": unit.get("target_cpa", 0),
+            "cpa_room": round(cpa_room, 2),
+            "first_test_budget": unit.get("first_test_budget") or budget_rules.get("first_budget", 0),
+            "daily_budget": budget_rules.get("daily_budget", 0),
+            "kill_spend_without_atc": unit.get("kill_spend_without_atc", 0),
+            "kill_spend_without_purchase": unit.get("kill_spend_without_purchase", 0),
+            "requires_real_cogs": bool(unit.get("requires_real_cogs") or money_check.get("requires_real_cogs")),
+            "ready": economics_ready,
+        },
+        "demand": {
+            "strict_validation_count": real,
+            "required_validation_count": required,
+            "proof_source_count": int(_closed_loop_num(gate.get("proof_source_count"), len(proof_sources))),
+            "proof_sources": proof_sources[:6],
+            "traffic_validated": bool(pareto.get("traffic_validated")),
+            "market_ready": bool(gate.get("market_ready")),
+            "ad_count": ad_count,
+            "ad_status": fb_ads.get("status", ""),
+            "ad_grade": fb_ads.get("grade", ""),
+            "trend_status": trend.get("status", "unverified"),
+            "trend_score": trend.get("score", 0),
+            "trend_query": trend.get("query", ""),
+            "platform_validation_score": gate.get("platform_validation_score") or platform_proof.get("score", 0),
+            "traffic_sources": traffic_sources[:5],
+            "validation_status": validation_summary.get("status", ""),
+            "validation_verified_count": validation_summary.get("verified_count", 0),
+            "validation_required_count": validation_summary.get("required_count", 0),
+            "validation_blocking_count": validation_summary.get("blocking_count", 0),
+        },
+        "readiness": {
+            "assets_ready": assets_ready,
+            "pdp_ready": pdp_ready,
+            "ai_ready": ai_ready,
+            "draft_ready": draft_ready,
+            "image_count": int(_closed_loop_num(gate.get("image_count"), 0)),
+            "variant_count": int(_closed_loop_num(gate.get("variant_count"), 0)),
+            "platform_ai_score": platform_ai.get("automation_score") or platform_ai_validation.get("automation_score", 0),
+            "platform_ai_readiness": platform_ai.get("readiness") or platform_ai_validation.get("readiness", ""),
+            "best_channels": _closed_loop_list(platform_ai.get("best_channels") or budget_rules.get("best_channels"))[:4],
+            "creative_axes": _closed_loop_list(platform_ai.get("creative_axes") or creative_pack.get("angles"))[:5],
+            "minimum_creatives": creative_pack.get("minimum_creatives", 0),
+            "landing_page_must_haves": _closed_loop_list(creative_pack.get("landing_page_must_haves"))[:6],
+        },
+        "risk": {
+            "blockers": blockers[:5],
+            "missing": missing[:6],
+            "evidence_gaps": evidence_gaps[:6],
+            "creative_gaps": creative_gaps[:5],
+            "pdp_gaps": pdp_gaps[:5],
+            "economics_gaps": economics_gaps[:5],
+            "do_not_copy": do_not_copy[:5],
+            "next_gate": gate.get("next_gate_to_clear", ""),
+            "operator_rule": gate.get("operator_rule", ""),
+        },
+        "execution": {
+            "campaign_mode": budget_rules.get("campaign_mode") or platform_ai.get("launch_mode") or launch_order.get("status", ""),
+            "first_budget": budget_rules.get("first_budget") or unit.get("first_test_budget", 0),
+            "daily_budget": budget_rules.get("daily_budget", ""),
+            "channel": launch_order.get("channel", ""),
+            "creative_count": budget_rules.get("creative_count") or creative_pack.get("minimum_creatives", 0),
+            "kill": stop_scale.get("kill", ""),
+            "scale": stop_scale.get("scale", ""),
+            "kill_rules": _closed_loop_list(stop_scale.get("kill_rules"))[:3],
+            "scale_rules": _closed_loop_list(stop_scale.get("scale_rules"))[:3],
+            "review_window": stop_scale.get("review_window", ""),
+            "timing": action.get("timing", ""),
+            "learn_points": learn_points[:6],
+        },
+        "follow_status": follow_status,
+        "follow_reason": str(follow_reason),
+        "next_action": pareto.get("one_action") or action.get("next_action", ""),
+        "evidence_gaps": evidence_gaps[:4],
+        "proof_sources": proof_sources,
+        "required_validation": required_validation,
+        "validation_summary": validation_summary,
+        "validation_tasks": validation_tasks,
+        "validation_blocking": validation_blocking,
+    }
+
+
+def _build_v2_closed_loop(latest: dict, cycles: int = 3, limit: int = 50) -> dict:
+    if not isinstance(latest, dict) or not latest.get("ok"):
+        return latest if isinstance(latest, dict) else {"ok": False, "error": "No workbench payload"}
+
+    actions = latest.get("actions") if isinstance(latest.get("actions"), list) else []
+    actions = actions[: max(1, min(int(limit or 50), 100))]
+    pareto_cutoff = max(1, int(round(len(actions) * 0.2))) if actions else 0
+    items = [_closed_loop_item(action, index + 1, pareto_cutoff) for index, action in enumerate(actions)]
+
+    important = [item for item in items if item["important_20"]]
+    important_with_ads = [item for item in important if item["has_ads"]]
+    follow_now = [item for item in items if item["follow_status"] == "马上跟"]
+    teardown = [item for item in items if item["follow_status"] == "先拆素材"]
+    verify_first = [item for item in items if item["follow_status"] == "补证观察"]
+    avoid = [item for item in items if item["follow_status"] == "不碰"]
+
+    sorted_items = sorted(
+        items,
+        key=lambda item: (
+            0 if item["follow_status"] == "马上跟" else 1 if item["follow_status"] == "先拆素材" else 2 if item["important_20"] else 3,
+            -int(item["has_ads"]),
+            -item["ad_count"],
+            -item["priority"],
+            item["rank"],
+        ),
+    )
+
+    return {
+        "ok": True,
+        "version": "closed-loop-28-v1",
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "source_generated_at": latest.get("generated_at", ""),
+        "requested_cycles": max(1, min(int(cycles or 3), 3)),
+        "rule": "28定律闭环：8011只看最重要20%的竞品新品/机会；再用8000确认是否在投广告；最后只输出马上跟、先拆素材、补证观察、不碰。",
+        "summary": {
+            "source_products": len(actions),
+            "important_20": len(important),
+            "important_20_with_ads": len(important_with_ads),
+            "all_with_ads": sum(1 for item in items if item["has_ads"]),
+            "follow_now": len(follow_now),
+            "teardown_first": len(teardown),
+            "verify_first": len(verify_first),
+            "avoid": len(avoid),
+            "top_ad_count": max((item["ad_count"] for item in items), default=0),
+        },
+        "rounds": [
+            {
+                "round": 1,
+                "name": "8011竞品快照筛重要20%",
+                "input": len(actions),
+                "kept": len(important),
+                "rule": "按28优先级、价格带、新品窗口、可表达性和经济性，只看前20%。",
+            },
+            {
+                "round": 2,
+                "name": "8000广告投放验真",
+                "input": len(important),
+                "kept": len(important_with_ads),
+                "rule": "回查127.0.0.1:8000品牌库，广告数>0才算有投放证据。",
+            },
+            {
+                "round": 3,
+                "name": "跟品动作分流",
+                "input": len(important_with_ads),
+                "kept": len(follow_now),
+                "rule": "只有重要20% + 有广告 + 至少2类严格验真 + 无硬风险 + 经济性可测 + 可建DRAFT，才进马上跟。",
+            },
+        ],
+        "items": sorted_items,
+        "follow_now": follow_now,
+        "teardown_first": teardown,
+        "verify_first": verify_first,
+        "avoid": avoid,
+        "latest_stats": latest.get("stats", {}),
+        "warnings": latest.get("warnings", []),
+    }
+
+
+@app.get("/api/v2/workbench/closed-loop")
+def api_v2_workbench_closed_loop(
+    cycles: int = Query(3, ge=1, le=3),
+    limit: int = Query(50, ge=1, le=100),
+):
+    latest = get_latest_profit_pipeline()
+    return _build_v2_closed_loop(latest, cycles=cycles, limit=limit)
+
+
+@app.post("/api/v2/workbench/closed-loop/run")
+def api_v2_workbench_closed_loop_run(
+    cycles: int = Query(3, ge=1, le=3),
+    limit: int = Query(50, ge=1, le=100),
+    trend_top_n: int = Query(50, ge=0, le=100),
+    fb_limit: int = Query(5000, ge=1, le=20000),
+    fb_exact_verify_limit: int = Query(300, ge=0, le=1000),
+    trend_geo: str = Query("US", min_length=0, max_length=8),
+):
+    """Run one workbench pass, then present it as a 3-round 80/20 closed loop."""
+
+    try:
+        latest = _run_v2_operator_workbench(limit, trend_top_n, fb_limit, fb_exact_verify_limit, trend_geo)
+        return _build_v2_closed_loop(latest, cycles=cycles, limit=limit)
+    except AutoIntelRunLocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"V2 closed-loop run failed: {exc}") from exc
+
+
+@app.get("/api/v2/daily-monitor/status")
+def api_v2_daily_monitor_status():
+    return _v2_daily_status_copy()
+
+
+@app.post("/api/v2/daily-monitor/start")
+def api_v2_daily_monitor_start(
+    schedule_hour: int = Query(9, ge=0, le=23),
+    scan_limit: int = Query(0, ge=0, le=5000),
+    workbench_limit: int = Query(50, ge=1, le=100),
+    trend_top_n: int = Query(50, ge=0, le=100),
+    fb_limit: int = Query(5000, ge=1, le=20000),
+    fb_exact_verify_limit: int = Query(300, ge=0, le=1000),
+    trend_geo: str = Query("US", min_length=0, max_length=8),
+    run_now: bool = Query(False),
+):
+    _set_v2_daily_status(
+        ok=True,
+        enabled=True,
+        state="enabled",
+        message="每日自动抓取已开启",
+        schedule_hour=schedule_hour,
+        scan_limit=scan_limit,
+        workbench_limit=workbench_limit,
+        trend_top_n=trend_top_n,
+        fb_limit=fb_limit,
+        fb_exact_verify_limit=fb_exact_verify_limit,
+        trend_geo=(trend_geo or "US").upper(),
+        stopped_at=None,
+        run_requested=run_now,
+    )
+    started = _ensure_v2_daily_monitor_thread()
+    time.sleep(0.05)
+    return {**_v2_daily_status_copy(), "started": started}
+
+
+@app.post("/api/v2/daily-monitor/stop")
+def api_v2_daily_monitor_stop():
+    _set_v2_daily_status(
+        enabled=False,
+        run_requested=False,
+        stopped_at=_v2_daily_iso(),
+        message="正在关闭每日自动抓取",
+    )
+    _V2_DAILY_MONITOR_STOP.set()
+    time.sleep(0.05)
+    return _v2_daily_status_copy()
+
+
+@app.post("/api/v2/daily-monitor/run-now")
+def api_v2_daily_monitor_run_now(
+    workbench_limit: int = Query(50, ge=1, le=100),
+    trend_top_n: int = Query(50, ge=0, le=100),
+):
+    status = _v2_daily_status_copy(raw=True)
+    if status.get("active_run"):
+        return {**_v2_daily_status_copy(), "started": False, "already_running": True}
+    _set_v2_daily_status(
+        enabled=True,
+        workbench_limit=workbench_limit,
+        trend_top_n=trend_top_n,
+        run_requested=True,
+        message="已加入立即运行队列",
+    )
+    started = _ensure_v2_daily_monitor_thread()
+    time.sleep(0.05)
+    return {**_v2_daily_status_copy(), "started": started, "already_running": False}
+
+
+@app.get("/api/ai-autopilot/status")
+def api_ai_autopilot_status():
+    return _ai_autopilot_status_copy()
+
+
+@app.post("/api/ai-autopilot/start")
+def api_ai_autopilot_start(
+    interval_seconds: int = Query(60, ge=60, le=86400),
+    smart_refresh_limit: int = Query(180, ge=50, le=10000),
+    full_refresh_hours: int = Query(24, ge=1, le=168),
+    workbench_limit: int = Query(50, ge=10, le=100),
+    trend_top_n: int = Query(50, ge=0, le=100),
+    trend_geo: str = Query("US", min_length=0, max_length=8),
+    run_now: bool = Query(False),
+):
+    _set_ai_autopilot_status(
+        ok=True,
+        enabled=True,
+        state="enabled",
+        message="AI自动驾驶已开启：自动选品、自动补证、自动输出跟品队列",
+        interval_seconds=interval_seconds,
+        smart_refresh_limit=smart_refresh_limit,
+        full_refresh_hours=full_refresh_hours,
+        workbench_limit=workbench_limit,
+        trend_top_n=trend_top_n,
+        trend_geo=(trend_geo or "US").upper(),
+        stopped_at=None,
+        run_requested=run_now,
+        last_error="",
+    )
+    started = _ensure_ai_autopilot_thread()
+    if run_now:
+        _request_ai_autopilot_run("manual")
+    time.sleep(0.05)
+    return {**_ai_autopilot_status_copy(), "started": started}
+
+
+@app.post("/api/ai-autopilot/stop")
+def api_ai_autopilot_stop():
+    _set_ai_autopilot_status(
+        enabled=False,
+        run_requested=False,
+        stopped_at=_ai_autopilot_iso(),
+        message="正在关闭AI自动驾驶",
+    )
+    _AI_AUTOPILOT_STOP.set()
+    time.sleep(0.05)
+    return _ai_autopilot_status_copy()
+
+
+@app.post("/api/ai-autopilot/run-now")
+def api_ai_autopilot_run_now():
+    status = _ai_autopilot_status_copy(raw=True)
+    if status.get("active_run"):
+        return {**_ai_autopilot_status_copy(), "started": False, "already_running": True}
+    _set_ai_autopilot_status(
+        enabled=True,
+        run_requested=True,
+        message="AI自动驾驶已加入立即巡航队列",
+    )
+    started = _ensure_ai_autopilot_thread()
+    direct_started = _request_ai_autopilot_run("manual")
+    time.sleep(0.05)
+    return {**_ai_autopilot_status_copy(), "started": started or direct_started, "already_running": False}
+
+
+@app.get("/api/v2/workbench/blueprint")
+def api_v2_workbench_blueprint():
+    return {"ok": True, "blueprint": build_operator_blueprint()}
+
+
+@app.get("/api/v2/workbench/test-orders")
+def api_v2_workbench_test_orders():
+    return read_latest_profit_artifact("profit_test_orders")
+
+
+@app.get("/api/v2/workbench/report")
+def api_v2_workbench_report():
+    return read_latest_profit_artifact("profit_pipeline_report")
+
+
+@app.post("/api/v2/workbench/evaluate")
+def api_v2_workbench_evaluate(req: ProfitMetricsRequest):
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    return evaluate_profit_test_metrics(payload)
+
+
+@app.get("/api/v2/shopify/replica-draft/latest")
+def api_v2_shopify_replica_latest():
+    latest = SHOPIFY_REPLICA_OUTPUT_DIR / "replica_latest.json"
+    if not latest.exists():
+        return {"ok": False, "error": "No Shopify replica draft preview found"}
+    try:
+        return json.loads(latest.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "path": str(latest)}
+
+
+@app.post("/api/v2/shopify/replica-draft/preview")
+def api_v2_shopify_replica_preview(
+    product_url: str = Query("", max_length=1200),
+    rank: Optional[int] = Query(None, ge=1, le=500),
+    limit: int = Query(1, ge=1, le=10),
+    allow_unverified: bool = Query(False),
+):
+    """Generate a safe Shopify DRAFT catalog from strict V2 follow-product evidence."""
+
+    latest = get_latest_profit_pipeline()
+    if not latest.get("ok"):
+        return latest
+
+    actions, blocked = _find_replica_actions(latest, product_url=product_url, rank=rank, limit=limit, allow_unverified=allow_unverified)
+    if not actions:
+        return {
+            "ok": False,
+            "blocked": True,
+            "message": "没有达到 Shopify 草稿门禁的产品。至少需要2类严格平台验真；未验真不能复刻进店铺。",
+            "blocked_products": blocked[:5],
+            "stats": latest.get("stats", {}),
+        }
+
+    artifact = _write_replica_catalog(actions, mode="preview_unverified_diagnostic" if allow_unverified else "preview")
+    validation = _run_shopify_bulk_upload(
+        artifact["catalog_path"],
+        artifact["normalized_path"],
+        artifact["report_path"],
+        apply=False,
+    )
+    return {
+        "ok": bool(validation.get("ok")),
+        "blocked": False,
+        "mode": "preview",
+        "message": "已生成 Shopify DRAFT 预览 catalog；未写入店铺。上传前仍需人工确认素材、COGS、供应链、合规。",
+        "shop_ready": bool(os.getenv("SHOPIFY_SHOP_DOMAIN") and os.getenv("SHOPIFY_ADMIN_TOKEN")),
+        "artifact": {k: artifact.get(k) for k in ("catalog_path", "normalized_path", "report_path", "manifest_path", "products")},
+        "validation": validation,
+        "safety": artifact.get("catalog", {}).get("safety", {}),
+    }
+
+
+@app.post("/api/v2/shopify/replica-draft/apply")
+def api_v2_shopify_replica_apply(
+    product_url: str = Query("", max_length=1200),
+    rank: Optional[int] = Query(None, ge=1, le=500),
+    limit: int = Query(1, ge=1, le=10),
+):
+    """Create safe Shopify products as DRAFT only after strict evidence gate passes."""
+
+    latest = get_latest_profit_pipeline()
+    if not latest.get("ok"):
+        return latest
+
+    actions, blocked = _find_replica_actions(latest, product_url=product_url, rank=rank, limit=limit, allow_unverified=False)
+    if not actions:
+        return {
+            "ok": False,
+            "blocked": True,
+            "message": "上传被拦截：严格验真不足或该品被门禁 hold。未验真产品不能写入 Shopify。",
+            "blocked_products": blocked[:5],
+            "stats": latest.get("stats", {}),
+        }
+
+    missing_env = [name for name in ("SHOPIFY_SHOP_DOMAIN", "SHOPIFY_ADMIN_TOKEN") if not os.getenv(name)]
+    if missing_env:
+        return {
+            "ok": False,
+            "blocked": True,
+            "message": "产品已过复刻门禁，但缺少 Shopify 写入环境变量；只允许先生成预览 catalog。",
+            "missing_env": missing_env,
+            "required_scopes": ["write_products"],
+        }
+
+    artifact = _write_replica_catalog(actions, mode="apply")
+    upload = _run_shopify_bulk_upload(
+        artifact["catalog_path"],
+        artifact["normalized_path"],
+        artifact["report_path"],
+        apply=True,
+    )
+    return {
+        "ok": bool(upload.get("ok")),
+        "blocked": False,
+        "mode": "apply",
+        "message": "Shopify 写入已执行；产品状态固定为 DRAFT，需人工审核后才能发布。" if upload.get("ok") else "Shopify 写入失败，未伪造成功；请查看 report/stderr。",
+        "artifact": {k: artifact.get(k) for k in ("catalog_path", "normalized_path", "report_path", "manifest_path", "products")},
+        "upload": upload,
+        "safety": artifact.get("catalog", {}).get("safety", {}),
+    }
+
+
+@app.get("/api/auto-launch/latest")
+def api_auto_launch_latest():
+    """Latest social + Amazon auto-selection report and Shopify DRAFT catalog."""
+
+    return latest_auto_launch()
+
+
+@app.post("/api/auto-launch/run")
+def api_auto_launch_run(
+    limit: int = Query(20, ge=1, le=50),
+    min_score: float = Query(62, ge=0, le=100),
+    min_match_score: float = Query(0.18, ge=0.05, le=1.0),
+    refresh_sources: bool = Query(False),
+    apply: bool = Query(False),
+):
+    """Cross-validate social trend signals with Amazon demand and optionally create Shopify DRAFT products."""
+
+    try:
+        payload = run_auto_launch(
+            limit=limit,
+            min_score=min_score,
+            min_match_score=min_match_score,
+            refresh_sources=refresh_sources,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Auto launch run failed: {exc}") from exc
+
+    artifact = payload.get("artifact") or {}
+    products = artifact.get("products") or []
+    catalog_path = artifact.get("catalog_path")
+    normalized_path = artifact.get("normalized_path")
+    report_path = artifact.get("upload_report_path")
+    payload["shop_ready"] = bool(os.getenv("SHOPIFY_SHOP_DOMAIN") and os.getenv("SHOPIFY_ADMIN_TOKEN"))
+
+    if products and catalog_path and normalized_path and report_path:
+        payload["validation"] = _run_shopify_bulk_upload(
+            catalog_path,
+            normalized_path,
+            report_path,
+            apply=False,
+        )
+    else:
+        payload["validation"] = {
+            "ok": True,
+            "mode": "preview",
+            "message": "没有达到 DRAFT 门槛的产品，仅生成选品报告。",
+        }
+
+    if not apply:
+        payload["mode"] = "preview"
+        payload["message"] = "已生成社媒+Amazon交叉验证报告和 Shopify DRAFT 预览；未写入店铺。"
+        return payload
+
+    missing_env = [name for name in ("SHOPIFY_SHOP_DOMAIN", "SHOPIFY_ADMIN_TOKEN") if not os.getenv(name)]
+    if missing_env:
+        payload["mode"] = "apply_blocked"
+        payload["blocked"] = True
+        payload["missing_env"] = missing_env
+        payload["message"] = "已生成预览，但缺少 Shopify 写入环境变量；不会伪造上架成功。"
+        return payload
+
+    if not products:
+        payload["mode"] = "apply_blocked"
+        payload["blocked"] = True
+        payload["message"] = "没有达到 Shopify DRAFT 门槛的产品；本次只保留报告。"
+        return payload
+
+    payload["upload"] = _run_shopify_bulk_upload(
+        catalog_path,
+        normalized_path,
+        report_path,
+        apply=True,
+    )
+    payload["mode"] = "apply"
+    payload["blocked"] = False
+    payload["message"] = "Shopify 写入已执行；产品状态固定为 DRAFT，需人工审核后才能发布。" if payload["upload"].get("ok") else "Shopify 写入失败，请查看 upload/report/stderr。"
+    return payload
+
+
+@app.post("/api/profit-pipeline/run")
+def api_profit_pipeline_run(
+    limit: int = Query(50, ge=1, le=100),
+    trend_top_n: int = Query(50, ge=0, le=100),
+    fb_limit: int = Query(5000, ge=1, le=20000),
+    fb_exact_verify_limit: int = Query(300, ge=0, le=1000),
+    trend_geo: str = Query("US", min_length=0, max_length=8),
+):
+    """Run selection -> validation -> platform AI -> creative/budget/stop-scale pipeline."""
+
+    try:
+        return _run_v2_operator_workbench(limit, trend_top_n, fb_limit, fb_exact_verify_limit, trend_geo)
+    except AutoIntelRunLocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Profit pipeline run failed: {exc}") from exc
+
+
+@app.get("/api/profit-pipeline/latest")
+def api_profit_pipeline_latest():
+    """Return the latest closed-loop profit pipeline."""
+
+    return get_latest_profit_pipeline()
+
+
+@app.get("/api/profit-pipeline/report")
+def api_profit_pipeline_report():
+    """Return the latest closed-loop profit pipeline markdown report."""
+
+    return read_latest_profit_artifact("profit_pipeline_report")
+
+
+@app.get("/api/profit-pipeline/test-orders")
+def api_profit_pipeline_test_orders():
+    """Return operator-ready ad test orders from the latest profit pipeline."""
+
+    return read_latest_profit_artifact("profit_test_orders")
+
+
+@app.post("/api/profit-pipeline/evaluate")
+def api_profit_pipeline_evaluate(req: ProfitMetricsRequest):
+    """Evaluate imported FB/Shopify metrics and return stop/scale/fix action."""
+
+    payload = req.model_dump() if hasattr(req, "model_dump") else req.dict()
+    return evaluate_profit_test_metrics(payload)
+
+
+@app.get("/api/new-products-7d/judgement")
+def api_new_products_7d_judgement(
+    limit: int = Query(120, ge=1, le=300),
+    trend_top_n: int = Query(0, ge=0, le=100),
+    fb_limit: int = Query(1000, ge=1, le=20000),
+    fb_exact_verify_limit: int = Query(300, ge=0, le=1000),
+    trend_geo: str = Query("US", min_length=0, max_length=8),
+    force: bool = Query(False),
+):
+    """Rank newly listed products from the past seven days for follow-up."""
+
+    try:
+        cache_path = Path(AutoIntelConfig().output_root) / "seven_day_new_products_latest.json"
+        if not force and cache_path.exists() and (time.time() - cache_path.stat().st_mtime) < 1800:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if (
+                isinstance(cached, dict)
+                and cached.get("ok")
+                and cached.get("method_version") == SEVEN_DAY_METHOD_VERSION
+                and len(cached.get("products", [])) >= min(limit, 1)
+            ):
+                cached = {**cached, "cached": True}
+                cached["products"] = cached.get("products", [])[:limit]
+                cached["stats"] = {**(cached.get("stats") or {}), "returned_products": len(cached["products"])}
+                return cached
+
+        config = AutoIntelConfig(
+            lookback_days=7,
+            fb_limit=fb_limit,
+            fb_exact_verify_limit=fb_exact_verify_limit,
+            trend_geo=(trend_geo or "US").upper(),
+            trend_top_n=trend_top_n,
+            trend_max_keywords=max(1, min(max(trend_top_n or 1, limit or 1) * 3, 150)),
+            max_per_domain=3,
+            max_per_family=1,
+        )
+        return run_seven_day_new_product_judgement(
+            config,
+            limit=limit,
+            trend_top_n=trend_top_n,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Seven-day new product judgement failed: {exc}") from exc
+
+
+@app.get("/api/auto-intel/report")
+def api_auto_intel_report():
+    """Return the latest markdown action report."""
+
+    return read_latest_artifact("top20_action_report")
+
+
+@app.get("/api/auto-intel/drafts")
+def api_auto_intel_drafts():
+    """Return latest review-only Shopify draft payloads."""
+
+    return read_latest_artifact("shopify_draft_products")
+
+
+@app.get("/api/auto-intel/briefs")
+def api_auto_intel_briefs():
+    """Return latest Meta creative briefs."""
+
+    return read_latest_artifact("creative_briefs")
+
+
+@app.get("/api/auto-intel/board")
+def api_auto_intel_board():
+    """Return latest operator action board."""
+
+    return read_latest_artifact("selection_board")
+
+
+@app.get("/api/auto-intel/prompt")
+def api_auto_intel_prompt():
+    """Return the deterministic selection prompt/rubric used by auto intelligence."""
+
+    return read_latest_artifact("selection_prompt_blueprint")
+
+
+@app.post("/api/v2/generate-research-prompt")
+def api_v2_generate_research_prompt(product_url: str = "", domain: str = "", handle: str = ""):
+    """生成 AI 调研提示词"""
+    # 从 URL 或 domain+handle 获取产品数据
+    if not product_url and domain and handle:
+        product_url = f"https://{domain}/products/{handle}"
+
+    if not product_url:
+        raise HTTPException(status_code=400, detail="Need product_url or (domain + handle)")
+
+    # 从缓存中查找产品数据
+    cache = _v2_cache or _v2_load_cache()
+    product_data = None
+
+    if cache:
+        scored = cache.get("scored_products", [])
+        for p in scored:
+            p_domain = p.get("domain", "")
+            p_handle = p.get("handle", "")
+            if f"https://{p_domain}/products/{p_handle}" == product_url:
+                product_data = p
+                break
+
+    # 如果找不到，返回通用模板
+    if not product_data:
+        product_data = {
+            "product_title": "产品名称",
+            "price": 0,
+            "product_type": "未分类",
+            "score": 0,
+            "ad_appearances": 0,
+        }
+
+    # 生成提示词
+    score = product_data.get("score", 0)
+    price = product_data.get("price", 0)
+    title = product_data.get("product_title", "")
+    category = product_data.get("product_type", "未分类")
+    ad_count = product_data.get("ad_appearances", 0)
+
+    trend_signal = product_data.get("trend_signal") if isinstance(product_data.get("trend_signal"), dict) else None
+    if not trend_signal:
+        try:
+            trend_records, _, _ = enrich_top_products_with_trends([{
+                "title": title,
+                "product_title": title,
+                "product_type": category,
+                "domain": domain or product_data.get("domain", ""),
+                "handle": handle or product_data.get("handle", ""),
+            }], "US", 3)
+            trend_signal = trend_records[0] if trend_records and isinstance(trend_records[0], dict) else empty_trend_signal("cache_missing")
+        except Exception:
+            trend_signal = empty_trend_signal("prompt_lookup_failed")
+
+    trends_score = _v2_trend_number(trend_signal.get("trend_score"), 0)
+    trend_direction = _v2_trend_direction_label(trend_signal)
+    trend_momentum = _v2_trend_number(trend_signal.get("trend_yoy_change"), None)
+    if trend_momentum is None:
+        trend_momentum = _v2_trend_number(trend_signal.get("trend_momentum_pct"), 0)
+
+    prompt = f"""# 产品跟品深度调研
+
+## 产品基础信息
+- **产品链接**: {product_url}
+- **产品名称**: {title}
+- **当前售价**: ${price:.2f}
+- **产品类目**: {category}
+
+## 市场数据
+- **Google Trends 查询词**: {trend_signal.get("trend_query", "") or "未验证"}
+- **Google Trends 评分**: {trends_score:.0f}/100
+- **趋势方向**: {trend_direction}
+- **趋势动量/YoY**: {trend_momentum:+.0f}%
+- **数据质量**: {trend_signal.get("trend_data_quality", "未验证")}
+- **验证状态**: {trend_signal.get("trend_status", "unverified")} / source={trend_signal.get("trend_source", "")}
+- **趋势结论**: {trend_signal.get("trend_decision", "")}
+
+## 竞争情况
+- **FB 活跃广告数**: {ad_count} 个
+- **广告持续时长**: {30 if ad_count > 5 else 15} 天
+- **投放独立站数量**: 1+ 个
+- **主要素材类型**: {"视频" if ad_count > 10 else "图片"}
+- **竞品价格带**: ${price * 0.8:.2f} - ${price * 1.3:.2f}
+
+## 调研任务
+请作为一个有 30 年 D2C/Shopify 选品经验的老兵，从以下 8 个维度深度分析这个产品是否值得跟品：
+
+### 1. 市场需求验证
+- Google Trends 数据是否支持长期需求？
+- 搜索意图是否明确（购买 vs 信息）？
+- 是否存在相关长尾关键词机会？
+
+### 2. 竞争格局分析
+- 当前市场饱和度如何（独立站数量 vs 市场容量）？
+- 头部玩家是否已形成品牌壁垒？
+- 是否还有差异化切入空间？
+
+### 3. 广告投放健康度
+- 广告持续时长是否说明产品有利润（>30天为健康信号）？
+- 素材类型是否多样化（说明在持续优化）？
+- 是否有明显的广告疲劳迹象？
+
+### 4. 利润空间评估
+- 基于价格带，预估毛利率是否 >60%？
+- 物流成本占比（重量/体积）？
+- 是否需要高额广告成本才能获客？
+
+### 5. 供应链可行性
+- 1688/AliExpress 是否容易找到供应商？
+- 是否需要定制/MOQ 门槛高？
+- 发货时效是否影响客户体验？
+
+### 6. 合规与风险
+- 是否涉及 FDA/FCC/专利风险？
+- 2026 关税政策影响（de minimis $800 取消）？
+- 是否容易引发退款/差评？
+
+### 7. 营销难度
+- 产品是否"一图说清"（降低广告成本）？
+- 是否需要教育市场（提高获客成本）？
+- UGC/网红营销是否容易启动？
+
+### 8. 时机判断
+- 现在入场是早期/成长期/成熟期？
+- 是否有明确的时间窗口（如 BFCM 前）？
+- 错过这波是否还有下一波机会？
+
+## 输出要求
+请按以下格式输出：
+
+**【跟品决策】**: 🟢立即跟 / 🟡跟进观察 / 🔴坚决不碰
+
+**【综合评分】**: X/100 分
+
+**【核心理由】**: (3 条以内，每条不超过 30 字)
+1.
+2.
+3.
+
+**【风险提示】**: (最多 2 条关键风险)
+-
+-
+
+**【如果跟品，建议策略】**:
+- **差异化角度**:
+- **定价策略**:
+- **首月预算**:
+- **预期 ROI**:
+
+**【如果不跟，替代方向】**:
+-
+
+---
+**数据时效**: {datetime.now().strftime("%Y-%m-%d")}
+**分析模型**: Claude Opus 4.7 + 30年 D2C 选品方法论
+"""
+
+    return {
+        "ok": True,
+        "product_url": product_url,
+        "prompt": prompt,
+        "prompt_length": len(prompt),
+    }
+
+
+@app.post("/api/v2/sync-domains")
+def api_v2_sync_domains(max_scrape: int = 100):
+    """从 8000 API 拉取独立站域名，自动去重 + 平台检测 + 抓取。
+    Step 1 (首次): 全量并行扫描 35k 候选，分类 Shopify vs 非 Shopify（约 2 分钟）
+    Step 2+: 从分类列表中取域名抓取 snapshot
+    """
+    import urllib.request, concurrent.futures, ssl as _ssl
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+
+    OBVIOUS_NON_STORE = {
+        "facebook.com", "instagram.com", "amazon.com", "google.com", "youtube.com",
+        "twitter.com", "tiktok.com", "linkedin.com", "pinterest.com", "reddit.com",
+        "whatsapp.com", "messenger.com", "fb.me", "fb.com", "amazoncom.com",
+        "alibabacom.com", "facebookapp.com", "amazonwebservices.com", "shopify.com",
+        "aliexpress.com", "ebay.com", "walmart.com", "target.com", "etsy.com",
+        "microsoft.com", "apple.com", "netflix.com", "spotify.com", "zoom.us",
+    }
+
+    def _is_shopify(domain):
+        if domain in OBVIOUS_NON_STORE:
+            return False
+        try:
+            req = urllib.request.Request(f"https://{domain}/products.json?limit=1",
+                headers={"User-Agent": su.USER_AGENT, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read())
+                    return isinstance(data, dict) and "products" in data
+        except:
+            pass
+        return False
+
+    # 加载进度状态
+    prev = None
+    shopify_queue = []
+    non_shopify_queue = []
+    shopify_offset = 0
+    non_shopify_offset = 0
+    all_time_scraped = 0
+    all_time_non_shopify = 0
+    brands_cache = None
+
+    if V2_SYNC_FILE.exists():
+        try:
+            prev = json.loads(V2_SYNC_FILE.read_text(encoding="utf-8"))
+            shopify_queue = prev.get("shopify_queue", [])
+            non_shopify_queue = prev.get("non_shopify_queue", [])
+            shopify_offset = prev.get("shopify_offset", 0)
+            non_shopify_offset = prev.get("non_shopify_offset", 0)
+            all_time_scraped = prev.get("all_time_scraped", 0)
+            all_time_non_shopify = prev.get("all_time_non_shopify", 0)
+            brands_cache = prev.get("brands_cache")
+        except: pass
+
+    # Step 1: 首次运行 — 全量扫描分类所有候选域名
+    if not shopify_queue and not non_shopify_queue:
+        # 获取 8000 全量品牌
+        all_brands = []
+        if brands_cache:
+            all_brands = brands_cache
+        else:
+            offset = 0
+            while True:
+                try:
+                    url = f"http://127.0.0.1:8000/brands?limit=5000&offset={offset}"
+                    req = urllib.request.Request(url)
+                    with _LOCAL_OPENER.open(req, timeout=30) as resp:
+                        batch = json.loads(resp.read())
+                    if not batch:
+                        break
+                    all_brands.extend(batch)
+                    if len(batch) < 5000:
+                        break
+                    offset += 5000
+                except Exception as e:
+                    return {"ok": False, "error": f"获取8000品牌失败: {str(e)[:100]}"}
+
+        if not all_brands:
+            return {"ok": False, "error": "8000 端口返回 0 个品牌"}
+
+        # 去重
+        snap_domains = set()
+        for fp in glob.glob(str(MONITOR_DIR / "*_snapshot.json")):
+            snap_domains.add(os.path.basename(fp).replace("_snapshot.json", ""))
+
+        blacklist_domains = set()
+        try:
+            bl = su.load_blacklist()
+            blacklist_domains = set(bl.keys())
+        except: pass
+
+        all_candidates = []
+        skipped_snap = 0
+        skipped_bl = 0
+        seen = set()
+        for b in all_brands:
+            domain = su.normalize_domain(b.get("domain", ""))
+            if not domain or domain in seen:
+                continue
+            seen.add(domain)
+            if domain in snap_domains:
+                skipped_snap += 1
+                continue
+            if domain in blacklist_domains:
+                skipped_bl += 1
+                continue
+            all_candidates.append(domain)
+
+        total_candidates = len(all_candidates)
+        print(f"  📊 全量扫描: {total_candidates} 个候选域名（已有 {skipped_snap} snapshot, {skipped_bl} 黑名单）")
+
+        # 并行全量扫描分类（30 线程）
+        shopify_queue = []
+        non_shopify_queue = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=30) as scanner:
+            sfuts = {scanner.submit(_is_shopify, d): d for d in all_candidates}
+            for f in concurrent.futures.as_completed(sfuts):
+                d = sfuts[f]
+                if f.result():
+                    shopify_queue.append(d)
+                else:
+                    non_shopify_queue.append(d)
+
+        print(f"  ✅ 分类完成: Shopify={len(shopify_queue)}, 非Shopify={len(non_shopify_queue)}")
+
+    # Step 2: 从队列取域名抓取
+    scraped = []
+    failed = []
+    non_shopify_results = []
+    total_new_products = 0
+
+    # Shopify: 一批抓 20 个，并行
+    SHOPIFY_PER_BATCH = min(20, max_scrape)
+    shopify_batch = shopify_queue[shopify_offset:shopify_offset + SHOPIFY_PER_BATCH]
+
+    def _scrape_shopify_fast(domain):
+        try:
+            products = su._fetch_shopify_products(domain, su.get_session())
+            if products is None:
+                products = []
+            if not products:
+                return {"domain": domain, "status": "empty", "product_count": 0}
+            parsed = [su.parse_product(p) for p in products]
+            su.save_snapshot(domain, parsed)
+            return {"domain": domain, "status": "ok", "product_count": len(parsed)}
+        except Exception as e:
+            return {"domain": domain, "status": "error", "error": str(e)[:120]}
+
+    if shopify_batch:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(_scrape_shopify_fast, d): d for d in shopify_batch}
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result(timeout=90)
+                except Exception as e:
+                    result = {"domain": futures[future], "status": "error", "error": str(e)[:120]}
+                if result["status"] == "ok":
+                    scraped.append(result)
+                    total_new_products += result.get("product_count", 0)
+                else:
+                    failed.append(result)
+
+    new_shopify_offset = shopify_offset + len(shopify_batch)
+
+    # 非 Shopify: 一批尽力扫；优先 HTTP sitemap/JSON-LD/meta，必要时再由抓取器决定是否用浏览器。
+    NON_SHOPIFY_PER_BATCH = min(10, max_scrape)
+    non_shopify_batch = non_shopify_queue[non_shopify_offset:non_shopify_offset + NON_SHOPIFY_PER_BATCH]
+
+    def _scrape_non_shopify(domain):
+        try:
+            products = su.fetch_all_products(domain, su.get_session(), best_effort=True)
+            if products is None:
+                products = []
+            if not products:
+                return {"domain": domain, "status": "empty", "product_count": 0}
+            parsed = [su.parse_product(p) for p in products]
+            su.save_snapshot(domain, parsed)
+            return {
+                "domain": domain,
+                "status": "ok",
+                "product_count": len(parsed),
+                "best_effort": any(bool(p.get("_best_effort")) for p in products),
+            }
+        except Exception as e:
+            return {"domain": domain, "status": "error", "error": str(e)[:120]}
+
+    for d in non_shopify_batch:
+        result = _scrape_non_shopify(d)
+        if result["status"] == "ok":
+            scraped.append(result)
+            total_new_products += result.get("product_count", 0)
+        else:
+            non_shopify_results.append(result)
+
+    new_non_shopify_offset = non_shopify_offset + len(non_shopify_batch)
+    all_time_scraped += len(scraped)
+    all_time_non_shopify += len(non_shopify_results)
+
+    shopify_remaining = len(shopify_queue) - new_shopify_offset
+    non_shopify_remaining = len(non_shopify_queue) - new_non_shopify_offset
+    all_done = (shopify_remaining == 0 and non_shopify_remaining == 0)
+
+    stats = {
+        "shopify_total": len(shopify_queue),
+        "non_shopify_total": len(non_shopify_queue),
+        "shopify_offset": new_shopify_offset,
+        "non_shopify_offset": new_non_shopify_offset,
+        "shopify_remaining": shopify_remaining,
+        "non_shopify_remaining": non_shopify_remaining,
+        "scraped_this_batch": len(scraped),
+        "non_shopify_this_batch": len(non_shopify_results),
+        "failed": len(failed),
+        "total_new_products": total_new_products,
+        "all_time_scraped": all_time_scraped,
+        "all_time_non_shopify": all_time_non_shopify,
+    }
+
+    if all_done:
+        return {"ok": True, "synced": False, "reason": "all queues exhausted",
+                "stats": stats}
+
+    sync_record = {
+        "last_sync_date": today,
+        "last_sync_time": datetime.now().isoformat(),
+        "shopify_queue": shopify_queue,
+        "non_shopify_queue": non_shopify_queue,
+        "shopify_offset": new_shopify_offset,
+        "non_shopify_offset": new_non_shopify_offset,
+        "all_time_scraped": all_time_scraped,
+        "all_time_non_shopify": all_time_non_shopify,
+        "brands_cache": brands_cache,
+        "stats": stats,
+    }
+    V2_SYNC_FILE.write_text(json.dumps(sync_record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {"ok": True, "synced": True, "sync_date": today, "stats": stats,
+            "scraped": scraped[:30], "failed": failed[:10],
+            "non_shopify_count": len(non_shopify_results)}
+
+
+@app.get("/api/v2/sync-status")
+def api_v2_sync_status():
+    """查询域名同步状态"""
+    if not V2_SYNC_FILE.exists():
+        return {"ok": True, "synced_today": False, "last_sync": None}
+    try:
+        prev = json.loads(V2_SYNC_FILE.read_text(encoding="utf-8"))
+        today = datetime.now().strftime("%Y-%m-%d")
+        return {"ok": True,
+                "synced_today": prev.get("last_sync_date") == today,
+                "last_sync": prev}
+    except:
+        return {"ok": True, "synced_today": False, "last_sync": None}
+
+
+@app.get("/new-products-7d", response_class=HTMLResponse)
+def new_products_7d_page():
+    return HTMLResponse(r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>过去7天新品判断</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6f7f4;color:#18201f;min-height:100vh;font-size:14px}
+:root{--c1:#12805c;--c2:#12805c;--c3:#2563eb;--c4:#b7791f;--c5:#c2413a;--c6:#0f766e;--bg:#f6f7f4;--s1:#ffffff;--s2:#ffffff;--b1:#dfe5df;--b2:#d5ded5;--t1:#18201f;--t2:#33413d;--t3:#66716f;--soft:#eef2ec;--shadow:0 10px 28px rgba(24,32,31,.08)}
+.topbar{height:54px;background:var(--s1);border-bottom:1px solid var(--b1);display:flex;align-items:center;justify-content:space-between;padding:0 1.5rem}
+.topbar h1{font-size:16px;color:var(--c4)}.topbar span{font-size:12px;color:var(--t3);font-weight:400;margin-left:8px}
+.actions{display:flex;gap:8px;align-items:center}.btn{padding:7px 14px;border-radius:6px;border:1px solid var(--b2);background:var(--b1);color:var(--t1);font-size:12px;cursor:pointer;text-decoration:none}.btn:hover{background:var(--b2)}.btn-go{background:var(--c4);border-color:var(--c4);color:#111;font-weight:700}
+.main{max-width:1540px;margin:0 auto;padding:1.4rem}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--s2);border:1px solid var(--b1);border-radius:8px;padding:12px 14px;margin-bottom:14px}
+.toolbar label{font-size:11px;color:var(--t3)}.toolbar input{width:72px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:5px;padding:6px 8px}.status{margin-left:auto;font-size:12px;color:var(--t3)}.ts{color:var(--c6)}
+.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;margin-bottom:14px}.kpi{background:var(--s2);border:1px solid var(--b1);border-radius:8px;padding:14px}.kl{font-size:11px;color:var(--t3);margin-bottom:4px}.kv{font-size:24px;color:var(--t1);font-weight:800}.ks{font-size:11px;color:var(--t3);margin-top:3px}
+.panel{background:var(--s2);border:1px solid var(--b1);border-radius:8px;overflow:hidden;margin-bottom:14px}.panel-h{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--b1);font-weight:700;color:var(--t1);font-size:13px}.panel-h small{font-weight:400;color:var(--t3)}
+.method{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;padding:12px 14px}.method div{background:var(--s1);border:1px solid var(--b1);border-radius:6px;padding:10px;font-size:11px;color:var(--t2);line-height:1.45}.method strong{display:block;color:var(--t1);font-size:12px;margin-bottom:4px}
+.table-wrap{max-height:680px;overflow:auto}.prod-table{width:100%;border-collapse:collapse;font-size:12px}.prod-table th{text-align:left;padding:9px 10px;border-bottom:1px solid var(--b2);color:var(--t3);font-size:11px;position:sticky;top:0;background:var(--s2);z-index:1}.prod-table td{padding:8px 10px;border-bottom:1px solid rgba(223,229,223,.82);vertical-align:top;color:var(--t2)}.prod-table tr:hover td{background:rgba(18,128,92,.045)}.num{text-align:right;font-variant-numeric:tabular-nums}.product-link{color:var(--c6);text-decoration:none;display:block;max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.product-link:hover{text-decoration:underline}.meta{font-size:10px;color:var(--t3);margin-top:3px;line-height:1.35}
+.score{font-size:18px;font-weight:800}.go{color:var(--c2)}.light{color:var(--c4)}.watch{color:var(--c6)}.stop{color:var(--c5)}.badge{display:inline-block;border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700}.b-go{background:rgba(16,185,129,.16);color:var(--c2);border:1px solid rgba(16,185,129,.28)}.b-light{background:rgba(245,158,11,.16);color:var(--c4);border:1px solid rgba(245,158,11,.28)}.b-watch{background:rgba(6,182,212,.14);color:var(--c6);border:1px solid rgba(6,182,212,.25)}.b-stop{background:rgba(239,68,68,.14);color:var(--c5);border:1px solid rgba(239,68,68,.25)}
+.empty,.loading{text-align:center;padding:70px 20px;color:var(--t3)}.spinner{width:34px;height:34px;border:3px solid var(--b1);border-top-color:var(--c4);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 14px}@keyframes spin{to{transform:rotate(360deg)}}
+/* 与主仪表盘统一：浅底、白面板、绿色赚钱动作 */
+:root{--c1:#12805c;--c2:#12805c;--c3:#2563eb;--c4:#b7791f;--c5:#c2413a;--c6:#0f766e;--bg:#f6f7f4;--s1:#ffffff;--s2:#ffffff;--b1:#dfe5df;--b2:#d5ded5;--t1:#18201f;--t2:#33413d;--t3:#66716f;--soft:#eef2ec;--shadow:0 10px 28px rgba(24,32,31,.08)}
+body{background:var(--bg);color:var(--t1)}
+.topbar,.toolbar,.kpi,.panel{background:var(--s1);border-color:var(--b1);box-shadow:var(--shadow)}
+.topbar h1{color:var(--c1)}.topbar span,.toolbar label,.status,.kl,.ks,.panel-h small,.meta{color:var(--t3)}
+.btn{background:var(--s1);border-color:var(--b1);color:var(--t1)}.btn:hover{background:var(--soft);border-color:var(--b2)}
+.btn-go,.btn-go:hover{background:var(--c1);border-color:var(--c1);color:#fff}
+.toolbar input{background:var(--bg);border-color:var(--b2);color:var(--t1)}
+.method div{background:#fbfcfa;border-color:var(--b1);color:var(--t2)}.method strong,.kv{color:var(--t1)}
+.prod-table th{background:var(--s1);border-bottom-color:var(--b1);color:var(--t3)}
+.prod-table td{border-bottom:1px solid rgba(223,229,223,.82);color:var(--t2)}
+.prod-table tr:hover td{background:rgba(18,128,92,.045)}
+.product-link{color:var(--c6)}.spinner{border-color:var(--b1);border-top-color:var(--c1)}
+@media(max-width:1100px){.kpis{grid-template-columns:repeat(2,1fr)}.method{grid-template-columns:1fr}.status{width:100%;margin-left:0}.table-wrap{max-height:none}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <h1>过去7天新品判断 <span>新品窗口 · 跟进优先级 · Meta/Shopify/Trends</span></h1>
+  <div class="actions">
+    <button class="btn btn-go" onclick="loadSevenDay()">刷新判断</button>
+    <button class="btn" onclick="startGtrendsValidation('seven_day')" id="btn-gtrends">Google Trends 验证</button>
+    <a class="btn" href="/v2">返回 V2</a>
+    <a class="btn" href="/">主仪表盘</a>
+  </div>
+</div>
+<div class="main">
+  <div class="toolbar">
+    <label>返回数量</label><input id="limit" type="number" min="1" max="300" value="120">
+    <label>Trends Top</label><input id="trend-top" type="number" min="0" max="20" value="0">
+    <button class="btn btn-go" onclick="loadSevenDay()">运行7天新品判断</button>
+    <span class="status" id="status">等待加载...</span>
+    <span class="status" id="gtrends-status" style="width:100%;margin-left:0">Google Trends：后台空闲 · 每批5词 · 间隔30s</span>
+  </div>
+    <div class="kpis" style="grid-template-columns:repeat(7,1fr)">
+    <div class="kpi"><div class="kl">7天新品</div><div class="kv" id="k-new">--</div><div class="ks">created/published</div></div>
+    <div class="kpi"><div class="kl">返回候选</div><div class="kv" id="k-returned">--</div><div class="ks">已去重/控域名</div></div>
+    <div class="kpi"><div class="kl">立即跟进</div><div class="kv go" id="k-go">--</div><div class="ks">强跟优先</div></div>
+    <div class="kpi"><div class="kl">轻量跟进</div><div class="kv light" id="k-light">--</div><div class="ks">小预算验证</div></div>
+    <div class="kpi"><div class="kl">Trends验证</div><div class="kv" id="k-trends">--</div><div class="ks">真实时间序列</div></div>
+    <div class="kpi"><div class="kl">FB域名</div><div class="kv" id="k-fb">--</div><div class="ks">8000信号</div></div>
+    <div class="kpi"><div class="kl">平台验证</div><div class="kv" id="k-platform">--</div><div class="ks">Reddit/小垂直站</div></div>
+  </div>
+  <div class="panel">
+    <div class="panel-h">判断模型 <small id="method-version"></small></div>
+    <div class="method" id="method"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-h">更适合跟进的7天新品 <small id="count"></small></div>
+    <div class="table-wrap">
+      <table class="prod-table">
+        <thead><tr><th>#</th><th>产品</th><th class="num">跟进分</th><th>判断</th><th class="num">价格</th><th class="num">FB</th><th>Trends</th><th>平台验证</th><th>平台AI</th><th>平台信号</th><th>风险/动作</th></tr></thead>
+        <tbody id="tbody"><tr><td colspan="11"><div class="empty">等待加载</div></td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function api(url, opts){const r=await fetch(url, opts||{}); if(!r.ok) throw new Error(r.status+' '+r.statusText); return r.json();}
+let gtrendsTimer=null;
+async function startGtrendsValidation(source){
+  const btn=$('btn-gtrends');
+  btn.disabled=true; btn.textContent='Trends后台运行中';
+  $('gtrends-status').innerHTML='<span style="color:var(--c4)">正在提交 Google Trends 后台验证...</span>';
+  try{
+    const r=await api('/api/gtrends/background/start?source='+encodeURIComponent(source)+'&limit=50&geo=US&timeframe='+encodeURIComponent('today 12-m')+'&interval_seconds=30&workers=1',{method:'POST'});
+    renderGtrendsStatus(r);
+    pollGtrendsStatus();
+  }catch(e){
+    $('gtrends-status').innerHTML='<span style="color:var(--c5)">Google Trends 启动失败: '+esc(e.message)+'</span>';
+    btn.disabled=false; btn.textContent='Google Trends 验证';
+  }
+}
+async function pollGtrendsStatus(){
+  clearTimeout(gtrendsTimer);
+  try{
+    const r=await api('/api/gtrends/background/status');
+    renderGtrendsStatus(r);
+    if(r.running){gtrendsTimer=setTimeout(pollGtrendsStatus,3000);}
+    else {$('btn-gtrends').disabled=false; $('btn-gtrends').textContent='Google Trends 验证';}
+  }catch(e){
+    $('gtrends-status').innerHTML='<span style="color:var(--c5)">Google Trends 状态读取失败: '+esc(e.message)+'</span>';
+    $('btn-gtrends').disabled=false; $('btn-gtrends').textContent='Google Trends 验证';
+  }
+}
+function renderGtrendsStatus(r){
+  const ok=(r.results||[]).filter(x=>x.status==='ok').length;
+  const miss=(r.results||[]).filter(x=>x.status==='missing').length;
+  const current=(r.current_batch||[]).join(' / ');
+  $('gtrends-status').innerHTML='Google Trends：<span class="ts">'+esc(r.state||'idle')+'</span> · 词 '+(r.completed_keywords||0)+'/'+(r.total_keywords||0)+' · 批 '+(r.completed_batches||0)+'/'+(r.total_batches||0)+' · 每批 '+(r.batch_size||5)+' 词 · 间隔 '+(r.interval_seconds||30)+'s · 完整 '+ok+(miss?' / 缺 '+miss:'')+' · 含 related/regions'+(current?' · 当前 '+esc(current):'');
+}
+function badgeClass(decision){
+  if(decision==='立即跟进') return 'b-go';
+  if(decision==='轻量跟进') return 'b-light';
+  if(decision==='观察验证') return 'b-watch';
+  return 'b-stop';
+}
+function scoreClass(decision){
+  if(decision==='立即跟进') return 'go';
+  if(decision==='轻量跟进') return 'light';
+  if(decision==='观察验证') return 'watch';
+  return 'stop';
+}
+async function loadSevenDay(){
+  const limit=parseInt($('limit').value)||120;
+  const trendTop=parseInt($('trend-top').value)||0;
+  $('status').innerHTML='<span style="color:var(--c4)">正在计算7天新品跟进优先级...</span>';
+  $('tbody').innerHTML='<tr><td colspan="11"><div class="loading"><div class="spinner"></div><p>读取新品、8000 FB信号、Google Trends、平台验证和平台AI可投性...</p></div></td></tr>';
+  try{
+    const t0=performance.now();
+    const d=await api('/api/new-products-7d/judgement?limit='+limit+'&trend_top_n='+trendTop+'&trend_geo=US&force='+(trendTop>0?'true':'false'));
+    const elapsed=((performance.now()-t0)/1000).toFixed(1);
+    render(d, elapsed);
+  }catch(e){
+    $('status').innerHTML='<span style="color:var(--c5)">运行失败: '+esc(e.message)+'</span>';
+    $('tbody').innerHTML='<tr><td colspan="11"><div class="empty">运行失败</div></td></tr>';
+  }
+}
+function render(d, elapsed){
+  const stats=d.stats||{}, counts=stats.priority_counts||{}, ts=d.trend_summary||{};
+  $('status').innerHTML='完成 <span class="ts">'+esc(d.generated_at||'')+'</span> · '+elapsed+'s · 窗口 '+(d.window_days||7)+' 天';
+  $('k-new').textContent=(stats.new_products||0).toLocaleString();
+  $('k-returned').textContent=(stats.returned_products||0).toLocaleString();
+  $('k-go').textContent=(counts['立即跟进']||0).toLocaleString();
+  $('k-light').textContent=(counts['轻量跟进']||0).toLocaleString();
+  $('k-trends').textContent=(stats.trend_verified_products||0)+'/'+(stats.trend_checked_products||0);
+  $('k-fb').textContent=(stats.fb_signal_domains||0).toLocaleString();
+  $('k-platform').textContent=(stats.platform_verified_products||0).toLocaleString();
+  $('method-version').textContent=d.method_version||'';
+  const pillars=(d.method_blueprint||{}).pillars||[];
+  $('method').innerHTML=pillars.map((p,i)=>'<div><strong>'+['新品窗口','需求证据','素材表达','商业容错','风险过滤'][i]+'</strong>'+esc(p)+'</div>').join('');
+  const products=d.products||[];
+  $('count').textContent='共 '+products.length+' 个';
+  if(!products.length){
+    $('tbody').innerHTML='<tr><td colspan="11"><div class="empty">过去7天暂无可判断新品</div></td></tr>';
+    return;
+  }
+  $('tbody').innerHTML=products.map((p,i)=>{
+    const j=p.seven_day_judgement||{}, fb=p.fb_signal||{}, gt=p.google_trends||{}, pv=p.platform_validation||{}, pai=p.platform_ai||j.platform_ai||{};
+    const why=(j.why_follow||[]).slice(0,3).map(esc).join('<div class="meta">');
+    const risks=(j.watchouts||[]).slice(0,2).map(esc).join('<div class="meta">');
+    const plan=(j.first_72h_plan||[])[0]||'';
+    const psrc=(pv.sources||[]).slice(0,2).map(s=>esc((s.platform||'')+': '+(s.signal||s.status||''))).join('<div class="meta">');
+    const links=(pv.search_links||[]).slice(0,3).map(s=>'<a target="_blank" href="'+esc(s.url||'#')+'" style="color:var(--c6);margin-right:6px">'+esc(s.platform||'')+'</a>').join('');
+    return '<tr>'+
+      '<td>'+(i+1)+'</td>'+
+      '<td><a class="product-link" target="_blank" href="'+esc(p.product_url||'#')+'">'+esc(p.title||'')+'</a><div class="meta">'+esc(p.domain||'')+' · 新品 '+esc(p.days_since_new)+' 天 · '+esc(p.product_type||'')+'</div></td>'+
+      '<td class="num"><span class="score '+scoreClass(j.decision)+'">'+(j.follow_priority_score||0)+'</span><div class="meta">AI '+(p.score||0)+'</div></td>'+
+      '<td><span class="badge '+badgeClass(j.decision)+'">'+esc(j.decision||'')+'</span><div class="meta">'+esc(j.timing||'')+'</div></td>'+
+      '<td class="num" style="color:var(--c4);font-weight:700">$'+Number(p.price||0).toLocaleString()+'</td>'+
+      '<td class="num">'+(fb.ad_creative_count||0)+'<div class="meta">'+esc(fb.grade||'')+' / '+esc(fb.fb_verification_status||'')+'</div></td>'+
+      '<td>'+esc(gt.status||'unverified')+' '+esc(gt.score||0)+'<div class="meta">'+esc(gt.query||'')+' · '+esc(gt.data_quality||'未验证')+'</div></td>'+
+      '<td><strong style="color:var(--t1)">'+esc(pv.status||'needs_platform_proof')+' '+esc(pv.score||0)+'</strong><div class="meta">'+psrc+'</div><div class="meta">'+links+'</div></td>'+
+      '<td><strong style="color:var(--c6)">'+(pai.automation_score||0)+'</strong><div class="meta">'+esc(pai.readiness||'')+'</div><div class="meta">'+esc((pai.best_channels||[]).join(' / '))+'</div></td>'+
+      '<td><div>'+why+'</div></td>'+
+      '<td><div>'+risks+'</div><div class="meta" style="color:var(--t2)">'+esc(plan)+'</div></td>'+
+      '</tr>';
+  }).join('');
+}
+loadSevenDay();
+</script>
+</body>
+</html>""")
+
+
+@app.get("/daily-products", response_class=HTMLResponse)
+def daily_products_page():
+    return HTMLResponse(r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>每日产品更新</title>
+<style>
+:root{--bg:#f6f7f4;--panel:#fff;--ink:#18201f;--muted:#66716f;--line:#dfe5df;--soft:#eef2ec;--green:#12805c;--amber:#b7791f;--red:#c2413a;--blue:#2563eb;--teal:#0f766e;--shadow:0 10px 28px rgba(24,32,31,.08)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+a{color:var(--teal);text-decoration:none}
+a:hover{text-decoration:underline}
+.topbar{min-height:56px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.94);backdrop-filter:blur(12px);position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px 20px}
+.brand h1{margin:0;font-size:17px}.brand span{font-size:12px;color:var(--muted)}
+.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button,.btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:8px 12px;font-size:12px;font-weight:800;cursor:pointer;text-decoration:none;min-height:34px}
+button:hover,.btn:hover{border-color:#b9c5bd;text-decoration:none}
+.primary{background:var(--green);border-color:var(--green);color:#fff}
+.warning{background:#fff6df;border-color:#f2d28a;color:#7a4b08}
+button:disabled{opacity:.58;cursor:not-allowed}
+main{max-width:1500px;margin:0 auto;padding:20px}
+.hero{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:14px;margin-bottom:14px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);overflow:hidden}
+.panel-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px 15px;border-bottom:1px solid var(--line);background:#fbfcfa}
+.panel-head h2,.panel-head h3{margin:0;font-size:14px}.badge{font-size:11px;color:var(--muted);background:var(--soft);border:1px solid var(--line);border-radius:999px;padding:3px 8px;white-space:nowrap}
+.hero-body{padding:15px}.hero-body h2{margin:0 0 6px;font-size:24px}.hero-body p{margin:0;color:var(--muted);max-width:760px}
+.status{padding:15px;font-size:12px;color:var(--muted);line-height:1.6}
+.kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:14px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);padding:13px 14px;min-height:86px}
+.kpi .label{font-size:11px;color:var(--muted);font-weight:900;margin-bottom:6px}
+.kpi .value{font-size:27px;font-weight:900;line-height:1}.kpi .note{font-size:11px;color:var(--muted);margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trend-grid{display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:10px;margin-bottom:14px}
+.trend-box{padding:12px 14px}.trend-title{font-size:11px;color:var(--muted);font-weight:900;margin-bottom:9px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}.chip{border:1px solid #cfe3d6;background:#f4fbf6;color:#1f4b37;border-radius:999px;padding:5px 8px;font-size:11px;font-weight:900;max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.chip.info{border-color:#bed2ff;background:#eaf1ff;color:#1d4ed8}.chip.warn{border-color:#efd48d;background:#fff6df;color:#7a4b08}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px 15px;border-bottom:1px solid var(--line)}
+.search{min-width:260px;flex:1;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;background:#fff;color:var(--ink)}
+.table-wrap{overflow:auto;max-height:720px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{position:sticky;top:0;background:#fbfcfa;color:var(--muted);text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);font-size:11px;z-index:1}
+td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}tr:hover td{background:#fbfcfa}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.product{font-weight:900;color:var(--ink);display:block;max-width:360px;white-space:normal;overflow-wrap:anywhere}.meta{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.35}.trend{font-weight:900;color:var(--teal)}.action{font-weight:900;color:var(--ink)}.empty{padding:64px 20px;text-align:center;color:var(--muted)}
+@media(max-width:1100px){.hero{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}.trend-grid{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
+@media(max-width:720px){main{padding:14px}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.search{min-width:100%}table{min-width:920px}.hero-body h2{font-size:20px}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><h1>每日产品更新</h1><span>每天只看平台趋势、上新方向和可测试机会</span></div>
+  <div class="actions">
+    <button class="primary" id="btn-load" onclick="loadDailyProducts()">刷新本页</button>
+    <button class="warning" id="btn-run" onclick="runDailyUpdate()">立即更新</button>
+    <a class="btn" href="/api/v2/today-products/download">下载报告</a>
+    <a class="btn" href="/">主仪表盘</a>
+  </div>
+</div>
+<main>
+  <section class="hero">
+    <div class="panel">
+      <div class="hero-body">
+        <h2 id="headline">正在读取今日产品趋势</h2>
+        <p id="subline">直接把今日上新、热门品类、价格带、活跃店铺和高客单机会汇总成可执行视图。</p>
+      </div>
+    </div>
+    <div class="panel"><div class="panel-head"><h3>每日任务</h3><span class="badge" id="daily-badge">读取中</span></div><div class="status" id="daily-status">等待状态</div></div>
+  </section>
+
+  <section class="kpis">
+    <div class="kpi"><div class="label">今日新品</div><div class="value" id="k-new">--</div><div class="note" id="k-yesterday">昨日 --</div></div>
+    <div class="kpi"><div class="label">活跃店铺</div><div class="value" id="k-domains">--</div><div class="note">有新品店铺</div></div>
+    <div class="kpi"><div class="label">热门品类</div><div class="value" id="k-cats">--</div><div class="note" id="k-topcat">--</div></div>
+    <div class="kpi"><div class="label">价格中位</div><div class="value" id="k-median">--</div><div class="note" id="k-avg">--</div></div>
+    <div class="kpi"><div class="label">高客单机会</div><div class="value" id="k-high">--</div><div class="note">>= $100 且有样本</div></div>
+    <div class="kpi"><div class="label">扫描覆盖</div><div class="value" id="k-scan">--</div><div class="note" id="k-scan-note">snapshot</div></div>
+  </section>
+
+  <section class="trend-grid">
+    <div class="panel trend-box"><div class="trend-title">品类趋势</div><div class="chips" id="cat-list"></div></div>
+    <div class="panel trend-box"><div class="trend-title">价格带趋势</div><div class="chips" id="price-list"></div></div>
+    <div class="panel trend-box"><div class="trend-title">平台信号</div><div class="chips" id="signal-list"></div></div>
+  </section>
+
+  <section class="panel">
+    <div class="toolbar">
+      <input class="search" id="filter" placeholder="筛产品、店铺、品类" oninput="renderProducts()">
+      <span class="badge" id="count">--</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:42px">#</th><th>产品</th><th>平台趋势</th><th class="num">价格</th><th>店铺</th><th>更新</th><th>机会动作</th></tr></thead>
+        <tbody id="tbody"><tr><td colspan="7"><div class="empty">加载中</div></td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script>
+const state={data:null,products:[]};
+function $(id){return document.getElementById(id)}
+function h(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function n(v){return Number(v||0).toLocaleString()}
+function money(v){const x=Number(v||0);return x?'$'+x.toLocaleString(undefined,{maximumFractionDigits:2}):'--'}
+function shortTime(v){if(!v)return '--';const d=new Date(v);return Number.isNaN(d.getTime())?String(v).slice(0,19).replace('T',' '):d.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}
+async function api(path,opts={}){const r=await fetch(path,opts);if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}
+function topEntries(obj,limit=6){return Object.entries(obj||{}).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,limit)}
+function priceBand(v){const x=Number(v||0);if(!x)return '价格待补';if(x<=25)return '$0-25';if(x<=50)return '$25-50';if(x<=100)return '$50-100';if(x<=200)return '$100-200';if(x<=500)return '$200-500';return '$500+'}
+function chip(label,value,cls=''){return '<span class="chip '+h(cls)+'" title="'+h(label)+'">'+h(label)+(value!=null?' '+n(value):'')+'</span>'}
+function categoryOf(p){return p.specific_category||p.product_type_display||p.product_type||'品类待补'}
+function actionFor(p){
+  const price=Number(p.price||0), missing=(p.missing_fields||[]).length, images=Number(p.image_count||0);
+  if(price>=100 && images>0) return '高客单：先查供应链成本、物流和同类广告';
+  if(price>=50) return '中高客单：看素材演示和价格锚点';
+  if(missing>=3 || !images) return '数据不足：先补抓图片、描述、变体';
+  if(String(p.category_group||'').includes('Pain') || String(categoryOf(p)).includes('按摩')) return '问题解决型：优先看演示素材';
+  return '入池观察：等广告、趋势或社区信号升级';
+}
+function trendFor(p){
+  const pieces=[categoryOf(p), priceBand(p.price)];
+  if(p.source) pieces.push(p.source);
+  if(p.category_confidence) pieces.push('品类置信 '+n(p.category_confidence));
+  return pieces.filter(Boolean).join(' · ');
+}
+function renderSummary(d){
+  const cats=topEntries(d.category_breakdown,6), bands=topEntries(d.price_bands,6), signals=(d.trend_signals||[]).slice(0,5);
+  const high=(d.high_value_products||[]).length, ps=d.price_stats||{}, meta=d.scan_meta||{}, topCat=cats[0]||['--',0];
+  $('headline').textContent=Number(d.total_new_today||0)>0?'今日平台更新 '+n(d.total_new_today)+' 个产品':'今日产品更新待刷新';
+  $('subline').textContent=(signals[0]||'新品、价格带和活跃店铺已整理成实战视图。')+' · '+shortTime(d.scan_time);
+  $('k-new').textContent=n(d.total_new_today||0);
+  $('k-yesterday').textContent='昨日 '+n(d.total_new_yesterday||0);
+  $('k-domains').textContent=n(d.domains_with_new||d.scanned_domains||0);
+  $('k-cats').textContent=n(cats.length);
+  $('k-topcat').textContent=String(topCat[0]||'--');
+  $('k-median').textContent=money(ps.median);
+  $('k-avg').textContent='均价 '+money(ps.avg);
+  $('k-high').textContent=n(high);
+  $('k-scan').textContent=n(meta.snapshot_files_scanned||d.scanned_domains||0);
+  $('k-scan-note').textContent=meta.max_snapshot_age_days?'近 '+n(meta.max_snapshot_age_days)+' 天快照':'扫描覆盖';
+  $('cat-list').innerHTML=cats.map(([k,v])=>chip(k,v)).join('')||chip('暂无品类',null,'warn');
+  $('price-list').innerHTML=bands.map(([k,v])=>chip(k,v,'info')).join('')||chip('暂无价格带',null,'warn');
+  $('signal-list').innerHTML=(signals.length?signals:['等待快照刷新']).map(x=>chip(x,null,'warn')).join('');
+}
+function renderProducts(){
+  const q=($('filter').value||'').toLowerCase();
+  const products=state.products.filter(p=>!q || [p.title,p.domain,categoryOf(p)].join(' ').toLowerCase().includes(q));
+  $('count').textContent=n(products.length)+' 条';
+  if(!products.length){$('tbody').innerHTML='<tr><td colspan="7"><div class="empty">当前没有匹配产品</div></td></tr>';return}
+  $('tbody').innerHTML=products.map((p,i)=>'<tr>'+
+    '<td class="num">'+(i+1)+'</td>'+
+    '<td><a class="product" href="'+h(p.url||p.product_url||'#')+'" target="_blank" rel="noopener noreferrer">'+h(p.title||'')+'</a><div class="meta">'+h(categoryOf(p))+'</div></td>'+
+    '<td><div class="trend">'+h(trendFor(p))+'</div><div class="meta">图片 '+n(p.image_count||0)+' · 变体 '+n(p.variant_count||0)+'</div></td>'+
+    '<td class="num">'+money(p.price)+'</td>'+
+    '<td>'+h(p.domain||'')+'<div class="meta">SKU '+n(p.store_product_count||0)+'</div></td>'+
+    '<td>'+h((p.updated_at||p.created_at||p.published_at||'').slice(0,10)||'--')+'<div class="meta">发布 '+h((p.published_at||'').slice(0,10)||'--')+'</div></td>'+
+    '<td><div class="action">'+h(actionFor(p))+'</div><div class="meta">'+h((p.creative_angle||p.novelty_signal||'').slice(0,120))+'</div></td>'+
+  '</tr>').join('');
+}
+async function loadDailyProducts(){
+  $('btn-load').disabled=true;
+  $('tbody').innerHTML='<tr><td colspan="7"><div class="empty">正在读取今日新品快照</div></td></tr>';
+  try{
+    const d=await api('/api/v2/today-fast?product_limit=400&score_limit=400');
+    state.data=d;
+    state.products=(d.products||d.scored_products||[]).slice();
+    renderSummary(d);
+    renderProducts();
+  }catch(e){
+    $('headline').textContent='读取失败';
+    $('subline').textContent=e.message;
+    $('tbody').innerHTML='<tr><td colspan="7"><div class="empty">读取失败：'+h(e.message)+'</div></td></tr>';
+  }finally{$('btn-load').disabled=false}
+}
+function renderDailyStatus(s){
+  const enabled=!!s.enabled, active=!!s.active_run;
+  $('daily-badge').textContent=active?'运行中':(enabled?'已开启':'未开启');
+  const scan=s.scan_summary||{}, wb=s.workbench_summary||{};
+  $('daily-status').innerHTML=[
+    h(s.message||'--'),
+    '上次 '+h(shortTime(s.last_run_at)),
+    enabled?'计划 '+String(s.schedule_hour==null?9:s.schedule_hour).padStart(2,'0')+':00':'',
+    enabled?'下次 '+h(shortTime(s.next_run_at)):'',
+    scan.total_new_today!=null?'新品 '+n(scan.total_new_today):'',
+    wb.returned_actions!=null?'行动 '+n(wb.returned_actions):'',
+    s.last_error?('错误 '+h(String(s.last_error).slice(0,90))):''
+  ].filter(Boolean).join('<br>');
+}
+async function pollDailyStatus(){
+  try{
+    const s=await api('/api/v2/daily-monitor/status');
+    renderDailyStatus(s);
+    if(s.active_run){setTimeout(pollDailyStatus,4000)}
+  }catch(e){$('daily-badge').textContent='失败';$('daily-status').textContent=e.message}
+}
+async function runDailyUpdate(){
+  $('btn-run').disabled=true;
+  $('btn-run').textContent='更新中';
+  try{
+    const s=await api('/api/v2/daily-monitor/run-now?workbench_limit=50&trend_top_n=50',{method:'POST'});
+    renderDailyStatus(s);
+    setTimeout(pollDailyStatus,3000);
+    setTimeout(loadDailyProducts,5000);
+  }catch(e){
+    $('daily-status').textContent='立即更新失败：'+e.message;
+  }finally{
+    setTimeout(()=>{$('btn-run').disabled=false;$('btn-run').textContent='立即更新'},2500);
+  }
+}
+loadDailyProducts();
+pollDailyStatus();
+</script>
+</body>
+</html>""")
+
+
+@app.get("/v3")
+def v3_radar():
+    """爆款雷达 — 输入关键词 → 三态决策 → 一键上架。"""
+    try:
+        from v3.api import _render_page
+        return HTMLResponse(_render_page())
+    except Exception as e:
+        return HTMLResponse(f"<h1>v3 雷达加载失败</h1><pre>{e}</pre>"
+                            f"<p><a href='/v2'>→ 退回 V2 决策台</a></p>",
+                            status_code=500)
+
+
+@app.get("/v2", response_class=HTMLResponse)
+def v2_dashboard():
+    return HTMLResponse(r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>V2 跟品28决策台</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6f7f4;color:#18201f;min-height:100vh;font-size:14px}
+:root{--c1:#12805c;--c2:#12805c;--c3:#2563eb;--c4:#b7791f;--c5:#c2413a;--c6:#0f766e;--bg:#f6f7f4;--s1:#ffffff;--s2:#ffffff;--b1:#dfe5df;--b2:#d5ded5;--t1:#18201f;--t2:#33413d;--t3:#66716f;--soft:#eef2ec;--shadow:0 10px 28px rgba(24,32,31,.08)}
+
+/* 顶部 */
+.topbar{background:var(--s1);border-bottom:1px solid var(--b1);padding:0 1.5rem;display:flex;align-items:center;justify-content:space-between;height:52px}
+.topbar h1{font-size:16px;font-weight:700;color:var(--c4);letter-spacing:-.3px}
+.topbar h1 span{color:var(--t2);font-size:13px;font-weight:400;margin-left:8px}
+.topbar .actions{display:flex;gap:8px;align-items:center}
+.topbar .live-dot{width:8px;height:8px;border-radius:50%;background:var(--c2);animation:blink 2s infinite;margin-right:4px}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.btn{padding:7px 18px;border-radius:6px;border:1px solid var(--b2);background:var(--b1);color:var(--t1);cursor:pointer;font-size:13px;transition:.15s;white-space:nowrap}
+.btn:hover{background:var(--b2)}
+.btn-go{background:var(--c4);border-color:var(--c4);color:#000;font-weight:600}
+.btn-go:hover{background:var(--c1)}
+.btn-sm{padding:4px 10px;font-size:11px}
+.vk-btn{border:1px solid var(--b2);background:var(--s1);color:var(--t2);cursor:pointer;transition:.15s}
+.vk-btn:hover{background:var(--soft);color:var(--t1)}
+.vk-btn.on{background:var(--c1);border-color:var(--c1);color:#fff}
+
+.main{padding:1.5rem;max-width:1520px;margin:0 auto}
+
+/* 扫描控制栏 */
+.ctl{background:var(--s2);border:1px solid var(--b1);border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.25rem;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.ctl label{font-size:12px;color:var(--t3)}
+.ctl input{background:var(--b1);border:1px solid var(--b2);color:var(--t1);padding:6px 10px;border-radius:5px;font-size:13px;width:80px}
+.ctl .status{font-size:12px;color:var(--t3);margin-left:auto}
+.ctl .status .ts{color:var(--c6);font-weight:600}
+.ctl .hint{font-size:11px;color:var(--t3);width:100%;margin-top:2px}
+
+/* KPI */
+.kpi-row{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:1.25rem}
+.kpi{background:var(--s2);border:1px solid var(--b1);border-radius:10px;padding:1.1rem 1.25rem;position:relative;overflow:hidden}
+.kpi::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.kpi:nth-child(1)::before{background:var(--c4)}.kpi:nth-child(2)::before{background:var(--c2)}
+.kpi:nth-child(3)::before{background:var(--c6)}.kpi:nth-child(4)::before{background:var(--c3)}
+.kpi:nth-child(5)::before{background:var(--c1)}.kpi:nth-child(6)::before{background:var(--c5)}
+.kpi .kl{font-size:11px;color:var(--t3);margin-bottom:4px;letter-spacing:.5px}
+.kpi .kv{font-size:26px;font-weight:700;color:var(--t1);line-height:1.2}
+.kpi .ks{font-size:11px;color:var(--t3);margin-top:2px}
+.kpi .delta{font-size:12px;font-weight:600}
+.d-up{color:var(--c2)}.d-down{color:var(--c5)}
+
+/* 趋势信号条 */
+.signal-bar{background:var(--s2);border:1px solid var(--b1);border-radius:10px;padding:.85rem 1.25rem;margin-bottom:1.25rem;display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+.signal-bar .sig-tag{font-size:12px;padding:4px 12px;border-radius:20px;background:rgba(245,158,11,.12);color:var(--c4);border:1px solid rgba(245,158,11,.25);white-space:nowrap}
+.signal-bar .sig-label{font-size:11px;color:var(--t3);font-weight:600;letter-spacing:.5px}
+
+/* 双列布局 */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:1.25rem;margin-bottom:1.25rem}
+.panel{background:var(--s2);border:1px solid var(--b1);border-radius:10px;overflow:hidden}
+.panel-header{padding:.85rem 1.25rem;border-bottom:1px solid var(--b1);font-size:13px;font-weight:600;color:var(--t1);display:flex;align-items:center;justify-content:space-between}
+.panel-body{padding:1rem 1.25rem;max-height:380px;overflow-y:auto}
+
+/* 品类柱状图 */
+.bar-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:12px}
+.bar-row .blabel{width:90px;text-align:right;color:var(--t2);flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar-row .bfill{height:20px;border-radius:4px;min-width:3px;transition:.3s;position:relative}
+.bar-row .bcount{margin-left:6px;color:var(--t1);font-weight:600;font-size:12px;width:32px;flex-shrink:0}
+.bcolors{--bc1:var(--c1);--bc2:var(--c2);--bc3:var(--c6);--bc4:var(--c3);--bc5:var(--c4);--bc6:var(--c5);--bc7:#ec4899;--bc8:#14b8a6}
+
+/* 价格带图 */
+.price-band{display:flex;gap:4px;align-items:flex-end;height:140px}
+.price-band .pb-col{flex:1;border-radius:6px 6px 0 0;min-width:0;transition:.3s;position:relative;cursor:default}
+.price-band .pb-col:hover{opacity:.85}
+.price-band .pb-label{position:absolute;bottom:-22px;left:50%;transform:translateX(-50%);font-size:10px;color:var(--t3);white-space:nowrap}
+.price-band .pb-val{position:absolute;top:-18px;left:50%;transform:translateX(-50%);font-size:10px;color:var(--t1);font-weight:600}
+
+/* 产品表 */
+.prod-table{width:100%;border-collapse:collapse;font-size:12px}
+.prod-table th{text-align:left;padding:8px 10px;border-bottom:1px solid var(--b2);color:var(--t3);font-weight:600;font-size:11px;letter-spacing:.5px;position:sticky;top:0;background:var(--s2)}
+.prod-table td{padding:7px 10px;border-bottom:1px solid rgba(223,229,223,.82);color:var(--t2)}
+.prod-table tr:hover td{background:rgba(18,128,92,.045)}
+.prod-table .num{text-align:right;font-variant-numeric:tabular-nums}
+.prod-table .highlight{color:var(--c4);font-weight:600}
+.prod-table .tag{display:inline-block;padding:1px 7px;border-radius:3px;font-size:10px;background:rgba(139,92,246,.15);color:var(--c3);margin:1px 2px}
+.prod-table .domain-link{cursor:pointer;color:var(--c6)}
+.prod-table .domain-link:hover{text-decoration:underline}
+.prod-table .new-badge{display:inline-block;padding:2px 8px;border-radius:4px;background:rgba(245,158,11,.15);color:var(--c4);font-size:10px;font-weight:600}
+
+/* 域名活动表 */
+.domain-list{font-size:12px}
+.domain-list .dl-row{display:flex;align-items:center;padding:6px 0;border-bottom:1px solid rgba(223,229,223,.82);gap:10px}
+.domain-list .dl-domain{width:140px;color:var(--c6);cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-shrink:0}
+.domain-list .dl-bar-bg{flex:1;height:6px;background:var(--b1);border-radius:3px;overflow:hidden}
+.domain-list .dl-bar{height:100%;border-radius:3px;transition:.3s}
+.domain-list .dl-count{font-weight:600;color:var(--t1);width:36px;text-align:right;flex-shrink:0;font-size:13px}
+
+/* 空状态 */
+.empty{text-align:center;color:var(--t3);padding:60px 20px}
+.empty .big{font-size:48px;margin-bottom:12px;opacity:.3}
+.empty p{font-size:14px;margin-bottom:4px}
+
+/* 加载遮罩 */
+.scanning{text-align:center;padding:80px 20px}
+.scanning .spinner{width:40px;height:40px;border:3px solid var(--b1);border-top-color:var(--c4);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 16px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.tabs2{display:flex;gap:2px;margin-bottom:1.25rem}
+.tabs2 button{padding:7px 20px;border-radius:6px;cursor:pointer;font-size:13px;border:1px solid var(--b1);background:none;color:var(--t2);transition:.15s}
+.tabs2 button:hover{color:var(--t1)}
+.tabs2 button.on{background:var(--c1);color:#fff;border-color:var(--c1)}
+
+/* 跟品决策面板 */
+.dec-panel{background:var(--s2);border:1px solid var(--b1);border-radius:10px;padding:1.25rem;margin-bottom:1.25rem}
+.dec-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:12px;margin-top:.75rem}
+.dec-card{background:var(--s1);border:1px solid var(--b1);border-radius:8px;padding:1rem;position:relative;overflow:hidden}
+.dec-card.urgent{border-color:rgba(239,68,68,.4);box-shadow:0 0 20px rgba(239,68,68,.06)}
+.dec-card.watch{border-color:rgba(245,158,11,.4)}
+.dec-card-top{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.dec-decision{font-size:13px;font-weight:700}
+.dec-score{font-size:11px;background:var(--b2);padding:2px 8px;border-radius:4px;color:var(--t2)}
+.dec-title{font-size:13px;color:var(--t1);margin-bottom:3px;line-height:1.4}
+.dec-meta{font-size:11px;color:var(--t3);margin-bottom:6px}
+.dec-rationale{font-size:11px;color:var(--t3);margin-bottom:8px;font-style:italic}
+.dec-actions{font-size:11px;color:var(--t2);line-height:1.6}
+.dec-action{display:flex;align-items:flex-start;gap:4px;margin-bottom:2px}
+.dec-action::before{content:'✓';color:var(--c2);font-weight:700;flex-shrink:0}
+.dec-8k{font-size:10px;background:rgba(139,92,246,.15);color:var(--c3);padding:3px 8px;border-radius:4px;margin-top:8px;display:inline-block}
+
+/* 可跟品产品样式 */
+.prod-img{width:50px;height:50px;object-fit:cover;border-radius:6px;border:1px solid var(--b1)}
+.trend-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600}
+.trend-up{background:rgba(16,185,129,.15);color:var(--c2)}
+.trend-flat{background:rgba(148,163,184,.15);color:var(--t2)}
+.trend-down{background:rgba(239,68,68,.15);color:var(--c5)}
+.follow-badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600}
+.follow-go{background:rgba(16,185,129,.2);color:var(--c2);border:1px solid rgba(16,185,129,.3)}
+.follow-watch{background:rgba(245,158,11,.2);color:var(--c4);border:1px solid rgba(245,158,11,.3)}
+.btn-copy{padding:4px 12px;background:var(--c3);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;transition:.15s}
+.btn-copy:hover{background:var(--c1)}
+.btn-copy.copied{background:var(--c2)}
+.replica-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.btn-replica{padding:4px 8px;background:rgba(6,182,212,.16);color:var(--c6);border:1px solid rgba(6,182,212,.28);border-radius:4px;cursor:pointer;font-size:10px;transition:.15s}
+.btn-replica:hover{background:rgba(6,182,212,.24)}
+.btn-replica.apply{background:rgba(16,185,129,.16);color:var(--c2);border-color:rgba(16,185,129,.3)}
+.btn-replica:disabled{opacity:.45;cursor:not-allowed;background:var(--b1);color:var(--t3);border-color:var(--b2)}
+.product-link{color:var(--c6);text-decoration:none;font-size:12px;display:block;margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px}
+.product-link:hover{text-decoration:underline}
+.meta-row{font-size:10px;color:var(--t3);margin-top:2px}
+.ops-strip{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:10px;padding:12px 1.25rem;border-bottom:1px solid var(--b1);background:#fbfcfa}
+.ops-card{background:var(--s1);border:1px solid var(--b1);border-radius:8px;padding:10px 12px}
+.ops-card .label{font-size:10px;color:var(--t3);letter-spacing:.4px;margin-bottom:4px}
+.ops-card .value{font-size:20px;font-weight:800;color:var(--t1);line-height:1}
+.ops-card .note{font-size:10px;color:var(--t3);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gate-pill{display:inline-block;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;margin-bottom:3px}
+.gate-ready{background:rgba(16,185,129,.18);color:var(--c2);border:1px solid rgba(16,185,129,.25)}
+.gate-wait{background:rgba(245,158,11,.18);color:var(--c4);border:1px solid rgba(245,158,11,.25)}
+.gate-block{background:rgba(239,68,68,.18);color:var(--c5);border:1px solid rgba(239,68,68,.25)}
+.action-line{font-size:11px;color:var(--t1);line-height:1.45;max-width:240px}
+.lane-board{display:grid;grid-template-columns:repeat(4,minmax(220px,1fr));gap:12px;padding:12px 1.25rem;border-bottom:1px solid var(--b1);background:#fbfcfa}
+.lane{background:var(--s1);border:1px solid var(--b1);border-radius:8px;overflow:hidden;min-height:180px}
+.lane-head{padding:10px 12px;border-bottom:1px solid var(--b1);display:flex;justify-content:space-between;gap:8px;align-items:center}
+.lane-head strong{font-size:12px;color:var(--t1)}
+.lane-count{font-size:11px;color:var(--t3);background:var(--b1);padding:2px 7px;border-radius:99px}
+.lane-action{font-size:10px;color:var(--t3);padding:8px 12px;border-bottom:1px solid rgba(223,229,223,.82);line-height:1.4}
+.lane-card{padding:9px 12px;border-bottom:1px solid rgba(223,229,223,.82)}
+.lane-card-title{font-size:11px;color:var(--c6);font-weight:700;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lane-card-meta{font-size:10px;color:var(--t3);margin-top:3px;line-height:1.35}
+.lane-card-next{font-size:10px;color:var(--t2);margin-top:5px;line-height:1.4}
+.pareto-strip{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px;padding:12px 1.25rem;border-bottom:1px solid var(--b1);background:#fbfcfa}
+.pareto-card{background:var(--s1);border:1px solid var(--b1);border-radius:8px;padding:11px 12px}
+.pareto-card .label{font-size:10px;color:var(--t3);margin-bottom:5px}
+.pareto-card .value{font-size:24px;line-height:1;font-weight:850;color:var(--t1)}
+.pareto-card .note{font-size:10px;color:var(--t3);margin-top:6px;line-height:1.35}
+.pareto-principle{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:10px;padding:12px 1.25rem;border-bottom:1px solid var(--b1);background:#fbfcfa}
+.pareto-rule{border-left:3px solid var(--c6);padding:8px 10px;background:rgba(6,182,212,.06);font-size:11px;color:var(--t2);line-height:1.45}
+.pareto-pill{display:inline-block;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:800;margin-bottom:4px}
+.pareto-copy{background:rgba(16,185,129,.18);color:var(--c2);border:1px solid rgba(16,185,129,.28)}
+.pareto-teardown{background:rgba(245,158,11,.18);color:var(--c4);border:1px solid rgba(245,158,11,.28)}
+.pareto-supply{background:rgba(6,182,212,.14);color:var(--c6);border:1px solid rgba(6,182,212,.26)}
+.pareto-skip{background:rgba(239,68,68,.16);color:var(--c5);border:1px solid rgba(239,68,68,.26)}
+.triage-pill{display:inline-block;padding:4px 9px;border-radius:5px;font-size:11px;font-weight:900;margin-bottom:5px}
+.triage-launch{background:rgba(16,185,129,.2);color:var(--c2);border:1px solid rgba(16,185,129,.34)}
+.triage-observe{background:rgba(245,158,11,.2);color:var(--c4);border:1px solid rgba(245,158,11,.34)}
+.triage-avoid{background:rgba(239,68,68,.18);color:var(--c5);border:1px solid rgba(239,68,68,.32)}
+.triage-proof{font-size:10px;color:var(--t3);line-height:1.35;margin-top:3px}
+.compact-action{font-size:11px;color:var(--t1);line-height:1.45;max-width:300px}
+.safe-copy{font-size:10px;color:var(--c4);line-height:1.35;margin-top:4px}
+.simple-hero{display:grid;grid-template-columns:1.1fr .9fr;gap:14px;margin-bottom:14px}
+.simple-card{background:var(--s2);border:1px solid var(--b1);border-radius:10px;padding:14px 16px}
+.simple-card h2{font-size:15px;color:var(--t1);margin-bottom:8px;letter-spacing:0}
+.simple-card p{font-size:12px;color:var(--t2);line-height:1.55;margin-bottom:8px}
+.simple-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.simple-toolbar input{width:58px;padding:5px 8px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:5px;font-size:12px}
+.rule-lines{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:0 14px;margin-top:10px;border-top:1px solid var(--b1)}
+.rule-line{padding:9px 0;border-bottom:1px solid var(--b1);font-size:11px;color:var(--t2);line-height:1.4}
+.rule-line strong{display:block;color:var(--t1);font-size:12px;margin-bottom:3px}
+.rule-line.good strong{color:var(--c1)}.rule-line.warn strong{color:var(--c4)}.rule-line.info strong{color:var(--c6)}.rule-line.bad strong{color:var(--c5)}
+.insight-list{display:grid;gap:6px;margin-top:8px}
+.insight-list div{font-size:11px;color:var(--t2);line-height:1.45;border-left:3px solid var(--c6);padding-left:8px}
+.simple-stats{display:grid;grid-template-columns:repeat(4,minmax(110px,1fr));gap:10px;margin-bottom:14px}
+.simple-stat{background:var(--s2);border:1px solid var(--b1);border-radius:8px;padding:12px}
+.simple-stat .label{font-size:10px;color:var(--t3);margin-bottom:5px}
+.simple-stat .value{font-size:26px;font-weight:850;line-height:1;color:var(--t1)}
+.simple-stat .note{font-size:10px;color:var(--t3);line-height:1.35;margin-top:6px}
+.simple-list{display:grid;gap:10px;padding:12px 1.25rem;background:#fbfcfa}
+.simple-item{display:grid;grid-template-columns:1.2fr .8fr 1fr 1fr;gap:12px;background:var(--s1);border:1px solid var(--b1);border-radius:8px;padding:12px;align-items:start}
+.simple-item.copy-now{border-color:rgba(16,185,129,.45)}
+.simple-item.verify-first,.simple-item.teardown-first{border-color:rgba(245,158,11,.42)}
+.simple-item.skip{border-color:rgba(239,68,68,.35);opacity:.82}
+.simple-item.launch-now{border-color:rgba(16,185,129,.55)}
+.simple-item.observe{border-color:rgba(245,158,11,.45)}
+.simple-item.avoid{border-color:rgba(239,68,68,.38);opacity:.86}
+.simple-title{font-size:13px;font-weight:800;color:var(--c6);line-height:1.35;text-decoration:none;display:block;margin-bottom:4px}
+.simple-meta{font-size:10px;color:var(--t3);line-height:1.45}
+.simple-label{font-size:10px;color:var(--t3);margin-bottom:4px;font-weight:800;letter-spacing:.3px}
+.simple-text{font-size:11px;color:var(--t2);line-height:1.45}
+.simple-text strong{color:var(--t1)}
+.simple-gap{color:var(--c5);font-size:10px;line-height:1.35;margin-top:4px}
+.simple-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.simple-muted{font-size:11px;color:var(--t3);line-height:1.5}
+.advanced-toggle{margin-top:12px;border-top:1px solid var(--b1);padding-top:10px}
+.advanced-toggle summary{cursor:pointer;color:var(--t3);font-size:11px;user-select:none}
+.advanced-toggle[open] summary{color:var(--c6);margin-bottom:10px}
+.hidden-by-default{display:none!important}
+.module-strip{display:grid;grid-template-columns:repeat(8,minmax(125px,1fr));gap:8px;margin-bottom:14px}
+.module-btn{background:var(--s2);border:1px solid var(--b1);border-radius:8px;padding:10px 12px;color:var(--t2);text-align:left;text-decoration:none;cursor:pointer;transition:.15s;min-height:68px}
+.module-btn:hover{border-color:var(--c6);background:#fbfcfa;color:var(--t1)}
+.module-btn.active{border-color:var(--c1);box-shadow:0 0 0 1px rgba(18,128,92,.16) inset;background:#f3f7f2}
+.module-btn strong{display:block;color:var(--t1);font-size:12px;margin-bottom:4px;line-height:1.2}
+.module-btn span{display:block;color:var(--t3);font-size:10px;line-height:1.35}
+
+/* 与主仪表盘统一：浅底、白面板、绿色赚钱动作 */
+:root{--c1:#12805c;--c2:#12805c;--c3:#2563eb;--c4:#b7791f;--c5:#c2413a;--c6:#0f766e;--bg:#f6f7f4;--s1:#ffffff;--s2:#ffffff;--b1:#dfe5df;--b2:#d5ded5;--t1:#18201f;--t2:#33413d;--t3:#66716f;--soft:#eef2ec;--shadow:0 10px 28px rgba(24,32,31,.08)}
+body{background:var(--bg);color:var(--t1)}
+.topbar,.ctl,.signal-bar,.panel,.dec-panel,.simple-card,.simple-stat,.module-btn{background:var(--s1);border-color:var(--b1);box-shadow:var(--shadow)}
+.topbar h1{color:var(--c1)}.topbar h1 span,.ctl label,.ctl .status,.ctl .hint,.kpi .kl,.kpi .ks,.sig-label,.dec-meta,.dec-rationale,.triage-proof,.simple-muted{color:var(--t3)}
+.btn{background:var(--s1);border-color:var(--b1);color:var(--t1)}.btn:hover{background:var(--soft);border-color:var(--b2);color:var(--t1)}
+.btn-go,.btn-go:hover,.tabs2 button.on{background:var(--c1);border-color:var(--c1);color:#fff}
+.ctl input,.simple-toolbar input,.search,select{background:var(--bg);border-color:var(--b2);color:var(--t1)}
+.kpi,.dec-card,.ops-card,.lane,.pareto-card,.simple-item{background:var(--s1);border-color:var(--b1)}
+.kpi .kv,.bar-row .bcount,.price-band .pb-val,.domain-list .dl-count,.dec-title,.action-line,.compact-action,.simple-card h2,.simple-stat .value,.simple-text strong{color:var(--t1)}
+.panel-header,.prod-table th{background:var(--s1);border-bottom-color:var(--b1);color:var(--t1)}
+.prod-table td{border-bottom:1px solid rgba(223,229,223,.82);color:var(--t2)}
+.prod-table tr:hover td{background:rgba(18,128,92,.045)}
+.domain-list .dl-row,.lane-action,.lane-card{border-bottom-color:rgba(223,229,223,.82)}
+.domain-list .dl-bar-bg,.dec-score,.lane-count{background:var(--soft)}
+.ops-strip,.lane-board,.pareto-strip,.pareto-principle,.simple-list{background:#fbfcfa;border-bottom-color:var(--b1)}
+.pareto-rule{background:rgba(15,118,110,.06);color:var(--t2)}
+.advanced-toggle{border-top-color:var(--b1)}.advanced-toggle[open] summary,.simple-title,.lane-card-title,.product-link,.domain-list .dl-domain{color:var(--c6)}
+.module-btn:hover{border-color:var(--c6);background:#fbfcfa;color:var(--t1)}
+.module-btn.active{border-color:var(--c1);box-shadow:0 0 0 1px rgba(18,128,92,.16) inset;background:#f3f7f2}
+.scanning .spinner{border-color:var(--b1);border-top-color:var(--c1)}
+
+@media(max-width:1100px){.grid2{grid-template-columns:1fr}.kpi-row{grid-template-columns:repeat(3,1fr)}.dec-cards{grid-template-columns:1fr}.lane-board{grid-template-columns:1fr}.pareto-strip{grid-template-columns:1fr 1fr}.pareto-principle{grid-template-columns:1fr}.simple-hero{grid-template-columns:1fr}.simple-item{grid-template-columns:1fr}.simple-stats{grid-template-columns:1fr 1fr}.rule-lines{grid-template-columns:1fr}.module-strip{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>V2 跟品28决策台 <span>新品入池 · 趋势优先 · 硬风险才停</span></h1>
+  <div class="actions">
+    <span class="live-dot"></span>
+    <button class="btn" onclick="toggleV2DailyMonitor()" id="btn-v2-daily-toggle">每日自动 --</button>
+	    <button class="btn btn-go" onclick="runProfitPipeline()" id="btn-rescan">跑28监控</button>
+	    <button class="btn" onclick="loadProfitPipelineLatest()">最新判断</button>
+	    <a href="/daily-products" style="color:var(--t3);font-size:12px;text-decoration:none;margin-left:8px">每日产品更新</a>
+	    <a href="/" style="color:var(--t3);font-size:12px;text-decoration:none;margin-left:8px">返回主仪表盘</a>
+  </div>
+</div>
+
+<div class="main">
+
+<div class="module-strip">
+  <button class="module-btn active" data-v2-module="autointel" onclick="openV2Module('autointel')"><strong>AI自动跟品决策</strong><span>强趋势跟、轻跟先拆、补证跟</span></button>
+	  <button class="module-btn" data-v2-module="autolaunch" onclick="openV2Module('autolaunch')"><strong>自动选品上架</strong><span>只建 DRAFT，不自动花钱发布</span></button>
+	  <button class="module-btn" data-v2-module="all" onclick="openV2Module('all')"><strong>新品池</strong><span>独立站新品默认进池</span></button>
+	  <a class="module-btn" href="/daily-products"><strong>每日产品更新</strong><span>今日上新、品类和价格带趋势</span></a>
+	  <button class="module-btn" data-v2-module="catview" onclick="openV2Module('catview')"><strong>品类机会</strong><span>看哪些类目集中上新</span></button>
+  <button class="module-btn" data-v2-module="vertical" onclick="openV2Module('vertical')"><strong>小垂直站</strong><span>全量 snapshot 聚合</span></button>
+  <a class="module-btn" href="/new-products-7d"><strong>7天新品判断</strong><span>过去7天新品跟进优先级</span></a>
+  <button class="module-btn" data-v2-module="trends" onclick="startV2GtrendsValidation()"><strong>Google Trends</strong><span>后台5词一批验证趋势</span></button>
+</div>
+
+<!-- 28原则首屏 -->
+<div class="simple-hero">
+  <div class="simple-card">
+    <h2>监控原则</h2>
+    <p>独立站新品默认进入跟进池。系统自动判断跟哪些、怎么跟、按什么强度跟；趋势越高越靠前，缺广告/社区/供应链证据只影响跟法，不再等于不能跟。</p>
+    <div class="rule-lines">
+      <div class="rule-line good"><strong>强趋势跟</strong>趋势、广告、验真或新品窗口强，直接准备 DRAFT、供应链报价和小预算测试单。</div>
+      <div class="rule-line warn"><strong>轻跟先拆</strong>产品可跟但证据未齐，先拆 hook、offer、价格锚点、PDP 和套装差异化。</div>
+      <div class="rule-line info"><strong>补证跟</strong>弱趋势也不丢，自动补 Google Trends、Meta Ads、Reddit/UGC、Amazon/Shopping 和供应链证据。</div>
+      <div class="rule-line bad"><strong>硬风险暂不跟</strong>只拦合规/IP/履约不可控、假货无效、贡献毛利确定为负的不可逆风险。</div>
+    </div>
+    <div class="simple-toolbar">
+      <label style="font-size:11px;color:var(--t3)">数量</label><input id="auto-intel-limit" type="number" value="50" min="1" max="100">
+      <button class="btn btn-go" onclick="runProfitPipeline()">跑28监控</button>
+      <button class="btn" onclick="loadProfitPipelineLatest()">最新判断</button>
+      <button class="btn" onclick="startV2GtrendsValidation()" id="btn-v2-gtrends">Google Trends 验证</button>
+    </div>
+  </div>
+  <div class="simple-card">
+    <h2>赚钱洞见</h2>
+    <p id="v2-status">Reddit/电商/PPC 讨论的共同点：监控竞品是为了减少试错成本，不是复制。真正要抓的是新品、持续投放、页面迭代、价格/库存变化和用户抱怨。</p>
+    <div class="insight-list">
+      <div>第一性原理：行动价值 = 需求证据 × 毛利空间 × 差异化 × 履约确定性 × 时间窗口 - 执行成本。</div>
+      <div>用户抱怨优先转成差异化卖点；竞品品牌词、Logo、素材和私域内容不复制。</div>
+      <div>自动化只负责选品、补证、排序和建测试准备；不自动花广告费，不自动发布商品。</div>
+    </div>
+    <div id="v2-ai-status" class="simple-muted">AI自动选品跟：读取状态中...</div>
+    <div class="simple-toolbar" style="margin-top:8px">
+      <button class="btn" onclick="toggleV2AutoPilot()" id="btn-v2-ai-toggle">AI自动选品 --</button>
+      <button class="btn btn-go" onclick="runV2AutoPilotNow()" id="btn-v2-ai-run">立即AI判断</button>
+    </div>
+    <div id="v2-daily-status" class="simple-muted">每日自动：读取状态中...</div>
+    <div id="v2-gtrends-status" class="simple-muted">Google Trends：后台空闲 · 每批5词 · 间隔30s</div>
+    <details class="advanced-toggle">
+      <summary>展开普通新品/同步/报告</summary>
+      <div class="simple-toolbar">
+        <label style="font-size:11px;color:var(--t3)">域名</label><input id="v2-limit" value="0" type="number" min="0" max="2000">
+        <button class="btn" onclick="loadFast()">快速加载新品</button>
+	        <button class="btn" onclick="startScan()">实时扫描</button>
+	        <button class="btn" onclick="syncDomains()" id="btn-sync">同步域名</button>
+	        <a class="btn" href="/daily-products" style="text-decoration:none">每日产品更新</a>
+	        <a class="btn" href="/new-products-7d" style="text-decoration:none">7天新品判断</a>
+      </div>
+    </details>
+  </div>
+</div>
+
+<!-- KPI 卡片 -->
+<div class="kpi-row" id="kpi-row" style="display:none">
+  <div class="kpi"><div class="kl">今日新品池</div><div class="kv" id="k-total">--</div><div class="ks">只当入口，不当结论</div></div>
+  <div class="kpi"><div class="kl">上新站点</div><div class="kv" id="k-domains">--</div><div class="ks">找小垂直站和异常上新</div></div>
+  <div class="kpi"><div class="kl">价格带</div><div class="kv" id="k-avg">--</div><div class="ks">中位数 <span id="k-med">--</span></div></div>
+  <div class="kpi"><div class="kl">品类机会</div><div class="kv" id="k-cats">--</div><div class="ks">热门 <span id="k-topcat">--</span></div></div>
+  <div class="kpi"><div class="kl">高AOV样本</div><div class="kv" id="k-highval">--</div><div class="ks">&gt;$100 需看信任成本</div></div>
+  <div class="kpi"><div class="kl">扫描质量</div><div class="kv" id="k-success">--</div><div class="ks"><span id="k-fail">--</span></div></div>
+  <div class="kpi"><div class="kl">可行动线索</div><div class="kv" id="k-decisions">--</div><div class="ks">进入竞品/流量/供应链判断</div></div>
+</div>
+
+<!-- 旧评分跟品决策已禁用：所有跟品结论只从 28跟品 /api/v2/workbench 输出 -->
+<div id="decision-panel" style="display:none"></div>
+
+<!-- 趋势信号 -->
+<div class="signal-bar" id="signal-bar" style="display:none">
+  <span class="sig-label">趋势信号</span>
+  <span style="color:var(--t3);font-size:12px">等待扫描...</span>
+</div>
+
+<!-- 双列：品类 + 价格带 -->
+<div class="grid2" style="display:none">
+  <div class="panel">
+    <div class="panel-header">品类分布 <span style="color:var(--t3);font-weight:400;font-size:11px">Top 8</span></div>
+    <div class="panel-body" id="cat-chart">
+      <div class="empty"><div class="big">---</div><p>暂无数据</p></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-header">价格带分布 <span style="color:var(--t3);font-weight:400;font-size:11px">今日新品</span></div>
+    <div class="panel-body" id="price-chart">
+      <div class="empty"><div class="big">---</div><p>暂无数据</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- 双列：域名活跃 + 高价值 -->
+<div class="grid2" style="display:none">
+  <div class="panel">
+    <div class="panel-header">域名活跃榜 <span style="color:var(--t3);font-weight:400;font-size:11px">今日上新 Top 15</span></div>
+    <div class="panel-body" id="domain-panel">
+      <div class="empty"><div class="big">---</div><p>暂无数据</p></div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-header">高价值新品 <span style="color:var(--t3);font-weight:400;font-size:11px">&gt;$100 · Top 15</span></div>
+    <div class="panel-body" id="highval-panel">
+      <div class="empty"><div class="big">---</div><p>暂无数据</p></div>
+    </div>
+  </div>
+</div>
+
+<!-- Tab: 全部产品 / 品类视图 -->
+<div class="tabs2 hidden-by-default">
+  <button id="tab-all" onclick="switchV2Tab('all')">新品池</button>
+  <button id="tab-catview" onclick="switchV2Tab('catview')">品类机会</button>
+  <button id="tab-followable" onclick="switchV2Tab('autointel')" style="display:none">可跟品</button>
+  <button id="tab-vertical" onclick="openV2Module('vertical')">小垂直站</button>
+  <button class="on" id="tab-autointel" onclick="switchV2Tab('autointel')">28跟品</button>
+  <button id="tab-autolaunch" onclick="switchV2Tab('autolaunch')">自动上架</button>
+</div>
+
+<!-- 产品表格 -->
+<div class="panel" id="all-panel" style="display:none">
+  <div class="panel-header">今日新品列表 <span id="prod-count" style="color:var(--t3);font-weight:400;font-size:11px"></span><button class="btn btn-sm btn-go" onclick="downloadTodayHTML()" style="margin-left:auto" title="下载今日新品 HTML 报告(可打钩+写备注)">下载 HTML</button></div>
+  <div style="max-height:600px;overflow-y:auto">
+    <table class="prod-table">
+      <thead><tr>
+        <th>#</th><th>产品名称</th><th class="num">价格</th><th class="num">评分</th><th>等级</th><th>具体分类</th><th>用途/痛点</th><th>素材跟法</th><th>抓取</th><th>域名/时间</th>
+      </tr></thead>
+      <tbody id="prod-tbody">
+        <tr><td colspan="10"><div class="empty"><div class="big">---</div><p>点击"刷新扫描"获取今天新上架产品</p></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel" id="catview-panel" style="display:none">
+  <div class="panel-header">按品类浏览 <span id="catview-count" style="color:var(--t3);font-weight:400;font-size:11px"></span></div>
+  <div id="catview-body" style="max-height:600px;overflow-y:auto;padding:1rem 1.25rem">
+    <div class="empty"><p>暂无数据</p></div>
+  </div>
+</div>
+
+<div class="panel" id="followable-panel" style="display:none">
+  <div class="panel-header">
+    可跟品产品
+    <span id="followable-count" style="color:var(--t3);font-weight:400;font-size:11px"></span>
+    <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+      <label style="font-size:11px;color:var(--t3);font-weight:400">最低评分</label>
+      <input id="followable-min-score" type="number" value="60" min="0" max="100" style="width:60px;padding:4px 8px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:4px;font-size:12px">
+      <button class="btn btn-sm" onclick="loadFollowableProducts()">刷新</button>
+    </div>
+  </div>
+  <div style="max-height:600px;overflow-y:auto">
+    <table class="prod-table">
+      <thead><tr>
+        <th>#</th>
+        <th>产品</th>
+        <th class="num">价格</th>
+        <th class="num">AI评分</th>
+        <th class="num">Trends</th>
+        <th>趋势</th>
+        <th class="num">YoY</th>
+        <th class="num">广告数</th>
+        <th class="num">平台AI</th>
+        <th>跟品建议</th>
+        <th>操作</th>
+      </tr></thead>
+      <tbody id="followable-tbody">
+        <tr><td colspan="11"><div class="empty"><div class="big">---</div><p>点击"刷新"加载可跟品产品</p></div></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel" id="vertical-panel" style="display:none">
+  <div class="panel-header">
+    小垂直站 / 新奇特来源
+    <span id="vertical-count" style="color:var(--t3);font-weight:400;font-size:11px"></span>
+    <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      <button class="btn btn-sm" onclick="loadVerticalSites()">刷新</button>
+      <button class="btn btn-sm btn-go" onclick="downloadVerticalHTML()" title="下载当前分类的 HTML 报告(可打钩+写备注)">下载 HTML</button>
+    </div>
+  </div>
+  <div id="vertical-kind-bar" style="display:flex;gap:6px;flex-wrap:wrap;padding:10px 1.25rem;border-bottom:1px solid var(--b1);background:#fbfcfa;align-items:center">
+    <span style="font-size:11px;color:var(--t3);margin-right:4px">扫描分类</span>
+    <button class="btn btn-sm vk-btn on" data-kind="small" onclick="setVerticalKind('small')">小垂直 5-15</button>
+    <button class="btn btn-sm vk-btn" data-kind="tiny" onclick="setVerticalKind('tiny')">极简站 1-4</button>
+    <button class="btn btn-sm vk-btn" data-kind="medium" onclick="setVerticalKind('medium')">中型 15-30</button>
+    <button class="btn btn-sm vk-btn" data-kind="novelty" onclick="setVerticalKind('novelty')">新奇特优先</button>
+    <button class="btn btn-sm vk-btn" data-kind="demo" onclick="setVerticalKind('demo')">演示友好型</button>
+    <button class="btn btn-sm vk-btn" data-kind="highprice" onclick="setVerticalKind('highprice')">高客单 $50+</button>
+  </div>
+  <div id="vertical-body" style="max-height:620px;overflow-y:auto;padding:1rem 1.25rem">
+    <div class="empty"><p>点击加载全量小垂直站</p></div>
+  </div>
+</div>
+
+<div class="panel" id="autointel-panel" style="display:none">
+  <div class="panel-header">
+    28跟品决策
+    <span id="auto-intel-count" style="color:var(--t3);font-weight:400;font-size:11px"></span>
+  </div>
+  <div id="auto-intel-summary" style="padding:12px 1.25rem;border-bottom:1px solid var(--b1);font-size:12px;color:var(--t2)">等待加载...</div>
+  <div id="auto-intel-body" style="max-height:520px;overflow-y:auto">
+    <div class="empty"><p>正在读取最近一次28跟品判断；没有结果时点击“跑28监控”生成队列</p></div>
+  </div>
+  <details class="advanced-toggle" style="padding:10px 1.25rem;border-top:1px solid var(--b1)">
+    <summary>高级：报告、schema、投后复盘、草稿记录</summary>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+      <button class="btn btn-sm" onclick="loadAutoArtifact('board')">行动队列</button>
+      <button class="btn btn-sm" onclick="loadProfitPipelineReport()">28报告</button>
+      <button class="btn btn-sm" onclick="loadProfitTestOrders()">测试单</button>
+      <button class="btn btn-sm" onclick="loadV2Blueprint()">28原则</button>
+      <button class="btn btn-sm" onclick="loadShopifyReplicaLatest()">Shopify草稿记录</button>
+      <button class="btn btn-sm" onclick="runAutoIntel()">候选分析</button>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;background:#fbfcfa;border:1px solid var(--b1);border-radius:8px;padding:10px">
+      <label style="font-size:11px;color:var(--t3);font-weight:700">投后复盘</label>
+      <input id="eval-price" type="number" placeholder="售价" value="49.99" style="width:68px;padding:4px 8px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:4px;font-size:12px">
+      <input id="eval-spend" type="number" placeholder="花费" value="38" style="width:68px;padding:4px 8px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:4px;font-size:12px">
+      <input id="eval-impressions" type="number" placeholder="曝光" value="2400" style="width:76px;padding:4px 8px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:4px;font-size:12px">
+      <input id="eval-clicks" type="number" placeholder="点击" value="41" style="width:64px;padding:4px 8px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:4px;font-size:12px">
+      <input id="eval-atc" type="number" placeholder="ATC" value="0" style="width:58px;padding:4px 8px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:4px;font-size:12px">
+      <input id="eval-purchases" type="number" placeholder="订单" value="0" style="width:58px;padding:4px 8px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:4px;font-size:12px">
+      <input id="eval-revenue" type="number" placeholder="收入" value="0" style="width:68px;padding:4px 8px;background:var(--b1);border:1px solid var(--b2);color:var(--t1);border-radius:4px;font-size:12px">
+      <button class="btn btn-sm btn-go" onclick="evaluatePostTest()">评估动作</button>
+      <span id="eval-result" style="font-size:11px;color:var(--t3)"></span>
+    </div>
+  </details>
+  <pre id="auto-intel-artifact" style="display:none;margin:0;padding:1rem 1.25rem;background:#fbfcfa;border-top:1px solid var(--b1);max-height:360px;overflow:auto;font-size:11px;white-space:pre-wrap;color:var(--t2)"></pre>
+</div>
+
+<div class="panel" id="autolaunch-panel" style="display:none">
+  <div class="panel-header">
+    自动选品与 Shopify 草稿上架
+    <span id="auto-launch-count" style="color:var(--t3);font-weight:400;font-size:11px"></span>
+  </div>
+  <div style="padding:12px 1.25rem;border-bottom:1px solid var(--b1);background:#fbfcfa">
+    <div class="simple-toolbar" style="margin-top:0">
+      <label style="font-size:11px;color:var(--t3)">候选</label><input id="auto-launch-limit" type="number" value="20" min="1" max="50">
+      <label style="font-size:11px;color:var(--t3)">DRAFT分</label><input id="auto-launch-score" type="number" value="62" min="0" max="100">
+      <label style="font-size:11px;color:var(--t3);display:flex;gap:5px;align-items:center"><input id="auto-launch-refresh" type="checkbox">抓取最新Amazon</label>
+      <label style="font-size:11px;color:var(--t3);display:flex;gap:5px;align-items:center"><input id="auto-launch-apply" type="checkbox">写入Shopify DRAFT</label>
+      <button class="btn btn-go" onclick="runAutoLaunch()">运行自动选品</button>
+      <button class="btn" onclick="loadAutoLaunchLatest()">最新报告</button>
+    </div>
+    <div id="auto-launch-summary" class="simple-muted" style="margin-top:8px">等待运行；默认只生成报告和 DRAFT 预览，不写入店铺。</div>
+  </div>
+  <div id="auto-launch-body" style="max-height:560px;overflow-y:auto">
+    <div class="empty"><p>点击“运行自动选品”读取 TikTok/Meta/Instagram 本地线索和 Amazon 需求数据。</p></div>
+  </div>
+  <pre id="auto-launch-artifact" style="display:none;margin:0;padding:1rem 1.25rem;background:#fbfcfa;border-top:1px solid var(--b1);max-height:320px;overflow:auto;font-size:11px;white-space:pre-wrap;color:var(--t2)"></pre>
+</div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let v2data = null;
+
+async function api(url, opts) {
+  const r = await fetch(url, opts||{});
+  if (!r.ok) throw new Error(r.status + ' ' + r.statusText);
+  return r.json();
+}
+
+let v2DailyTimer = null;
+function shortTime(v) {
+  if (!v) return '--';
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return String(v).slice(0, 19);
+  return d.toLocaleString('zh-CN', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+}
+
+let v2AiTimer = null;
+function renderV2AutoPilotStatus(s) {
+  const box = $('v2-ai-status');
+  const toggle = $('btn-v2-ai-toggle');
+  const run = $('btn-v2-ai-run');
+  if (!box || !toggle || !run) return;
+  const a = s.last_assessment || {};
+  const data = s.data_quality || a.data_quality || {};
+  const evidence = s.evidence_quality || a.evidence_quality || {};
+  const judge = s.judgement_quality || a.judgement_quality || {};
+  const q = s.auto_selection_summary || {};
+  const qc = q.counts || {};
+  const score = a.precision_score || 0;
+  const enabled = !!s.enabled;
+  const active = !!s.active_run;
+  const next = (s.next_auto_actions || a.next_auto_actions || []).slice(0, 2).join(' / ');
+  toggle.disabled = active;
+  run.disabled = active;
+  toggle.textContent = enabled ? (active ? 'AI运行中' : '关闭AI自动选品') : '开启AI自动选品';
+  toggle.style.background = enabled ? 'rgba(16,185,129,.18)' : '';
+  toggle.style.borderColor = enabled ? 'rgba(16,185,129,.45)' : '';
+  toggle.style.color = enabled ? 'var(--c2)' : '';
+  box.innerHTML =
+    'AI自动选品跟：<span class="ts">' + esc(enabled ? (active ? '运行中' : '已开启') : '已关闭') + '</span>' +
+    ' · 精度 ' + (score || '--') + ' ' + esc(a.precision_grade || '--') +
+    ' · 数据 ' + (data.score == null ? '--' : data.score) +
+    ' · 证据 ' + (evidence.score == null ? '--' : evidence.score) +
+    ' · 判断 ' + (judge.score == null ? '--' : judge.score) +
+    ' · 队列 可跟' + (qc.follow_now || 0) + ' 先拆' + (qc.teardown_first || 0) + ' 补证' + (qc.prove_first || 0) + ' 不碰' + (qc.do_not_follow || 0) +
+    ' · 下次 ' + esc(shortTime(s.next_check_at)) +
+    (next ? ' · 机会动作 ' + esc(next) : '');
+}
+
+async function pollV2AutoPilotStatus() {
+  clearTimeout(v2AiTimer);
+  try {
+    const s = await api('/api/ai-autopilot/status');
+    renderV2AutoPilotStatus(s);
+  } catch(e) {
+    const box = $('v2-ai-status');
+    if (box) box.innerHTML = '<span style="color:var(--c5)">AI自动驾驶状态读取失败: ' + esc(e.message) + '</span>';
+  }
+  v2AiTimer = setTimeout(pollV2AutoPilotStatus, 15000);
+}
+
+async function toggleV2AutoPilot() {
+  const btn = $('btn-v2-ai-toggle');
+  btn.disabled = true;
+  try {
+    const current = await api('/api/ai-autopilot/status');
+    const endpoint = current.enabled
+      ? '/api/ai-autopilot/stop'
+      : '/api/ai-autopilot/start?interval_seconds=60&smart_refresh_limit=180&full_refresh_hours=24&workbench_limit=50&trend_top_n=50&trend_geo=US&run_now=true';
+    const s = await api(endpoint, {method:'POST'});
+    renderV2AutoPilotStatus(s);
+  } catch(e) {
+    $('v2-ai-status').innerHTML = '<span style="color:var(--c5)">AI自动选品切换失败: ' + esc(e.message) + '</span>';
+  } finally {
+    btn.disabled = false;
+    pollV2AutoPilotStatus();
+  }
+}
+
+async function runV2AutoPilotNow() {
+  const btn = $('btn-v2-ai-run');
+  btn.disabled = true;
+  btn.textContent = 'AI判断中';
+  try {
+    const s = await api('/api/ai-autopilot/run-now', {method:'POST'});
+    renderV2AutoPilotStatus(s);
+  } catch(e) {
+    $('v2-ai-status').innerHTML = '<span style="color:var(--c5)">立即AI判断失败: ' + esc(e.message) + '</span>';
+  } finally {
+    btn.textContent = '立即AI判断';
+    pollV2AutoPilotStatus();
+  }
+}
+
+function renderV2DailyMonitorStatus(s) {
+  const btn = $('btn-v2-daily-toggle');
+  const box = $('v2-daily-status');
+  if (!btn || !box) return;
+  const enabled = !!s.enabled;
+  const active = !!s.active_run;
+  btn.disabled = active;
+  btn.textContent = enabled ? (active ? '每日运行中' : '关闭每日自动') : '开启每日自动';
+  btn.style.background = enabled ? 'rgba(16,185,129,.18)' : '';
+  btn.style.borderColor = enabled ? 'rgba(16,185,129,.45)' : '';
+  btn.style.color = enabled ? 'var(--c2)' : '';
+  const scan = s.scan_summary || {};
+  const wb = s.workbench_summary || {};
+  const bits = [
+    '每日自动：' + (enabled ? (active ? '运行中' : '已开启') : '已关闭'),
+    '上次 ' + shortTime(s.last_run_at),
+  ];
+  if (enabled) {
+    bits.splice(1, 0, '计划 ' + String(s.schedule_hour == null ? 9 : s.schedule_hour).padStart(2, '0') + ':00');
+    bits.push('下次 ' + shortTime(s.next_run_at));
+  }
+  if (scan.total_new_today != null) bits.push('新品 ' + scan.total_new_today);
+  if (wb.returned_actions != null) bits.push('28行动 ' + wb.returned_actions);
+  if (s.last_error) bits.push('错误 ' + String(s.last_error).slice(0, 90));
+  box.innerHTML = bits.map(esc).join(' · ');
+}
+
+async function pollV2DailyMonitor() {
+  clearTimeout(v2DailyTimer);
+  try {
+    const s = await api('/api/v2/daily-monitor/status');
+    renderV2DailyMonitorStatus(s);
+    if (s.active_run) {
+      $('auto-intel-summary').innerHTML = '<span style="color:var(--c4)">' + esc(s.message || '每日自动抓取运行中') + '</span>';
+    }
+  } catch(e) {
+    const box = $('v2-daily-status');
+    if (box) box.innerHTML = '<span style="color:var(--c5)">每日自动状态读取失败: ' + esc(e.message) + '</span>';
+  }
+  v2DailyTimer = setTimeout(pollV2DailyMonitor, 15000);
+}
+
+async function toggleV2DailyMonitor() {
+  const btn = $('btn-v2-daily-toggle');
+  const limit = Math.max(50, parseInt($('auto-intel-limit').value) || 50);
+  btn.disabled = true;
+  try {
+    const current = await api('/api/v2/daily-monitor/status');
+    const endpoint = current.enabled
+      ? '/api/v2/daily-monitor/stop'
+      : '/api/v2/daily-monitor/start?schedule_hour=9&scan_limit=0&workbench_limit=' + encodeURIComponent(limit) + '&trend_top_n=50&fb_limit=5000&fb_exact_verify_limit=300&trend_geo=US';
+    const s = await api(endpoint, {method:'POST'});
+    renderV2DailyMonitorStatus(s);
+  } catch(e) {
+    $('v2-daily-status').innerHTML = '<span style="color:var(--c5)">每日自动切换失败: ' + esc(e.message) + '</span>';
+  } finally {
+    btn.disabled = false;
+    pollV2DailyMonitor();
+  }
+}
+
+async function startScan() {
+  $('v2-status').innerHTML = '<span style="color:var(--c4)">正在并行扫描 Shopify API...</span>';
+  ['k-total','k-domains','k-avg','k-med','k-cats','k-topcat','k-highval','k-success','k-fail','k-decisions'].forEach(id => $(id).textContent = '...');
+  $('prod-tbody').innerHTML = '<tr><td colspan="10"><div class="scanning"><div class="spinner"></div><p>正在实时访问 Shopify /products.json 接口</p><p style="font-size:11px;color:var(--t3);margin-top:4px">并行扫描所有监控域名、提取 today 的 created_at / published_at...</p></div></td></tr>';
+  $('cat-chart').innerHTML = '<div class="scanning"><div class="spinner"></div></div>';
+  $('price-chart').innerHTML = '<div class="scanning"><div class="spinner"></div></div>';
+  $('domain-panel').innerHTML = '<div class="scanning"><div class="spinner"></div></div>';
+  $('highval-panel').innerHTML = '<div class="scanning"><div class="spinner"></div></div>';
+  $('signal-bar').innerHTML = '<span class="sig-label">趋势信号</span><span style="color:var(--t3);font-size:12px">扫描中...</span>';
+  $('decision-panel').style.display = 'none';
+
+  const limit = parseInt($('v2-limit').value) || 0;
+  try {
+    const t0 = performance.now();
+    const d = await api('/api/v2/today-scan?limit=' + limit, {method:'POST'});
+    const elapsed = ((performance.now()-t0)/1000).toFixed(1);
+    v2data = d;
+    renderAll(d, elapsed);
+  } catch(e) {
+    $('v2-status').innerHTML = '<span style="color:var(--c5)">扫描失败: ' + e.message + '</span>';
+  }
+}
+
+async function loadFast() {
+  $('v2-status').innerHTML = '<span style="color:var(--c6)">从磁盘 snapshot 瞬时加载...</span>';
+  try {
+    const t0 = performance.now();
+    const d = await api('/api/v2/today-fast');
+    const elapsed = ((performance.now()-t0)/1000).toFixed(2);
+    v2data = d;
+    renderAll(d, elapsed + 's (磁盘)');
+  } catch(e) {
+    $('v2-status').innerHTML = '<span style="color:var(--c5)">加载失败: ' + e.message + '</span>';
+  }
+}
+
+window.currentVerticalKind = window.currentVerticalKind || 'small';
+function setVerticalKind(kind) {
+  window.currentVerticalKind = kind || 'small';
+  document.querySelectorAll('.vk-btn').forEach(b => {
+    b.classList.toggle('on', b.getAttribute('data-kind') === window.currentVerticalKind);
+  });
+  loadVerticalSites();
+}
+
+function downloadVerticalHTML() {
+  const kind = window.currentVerticalKind || 'small';
+  const url = '/api/v2/vertical-sites/download?kind=' + encodeURIComponent(kind);
+  const a = document.createElement('a');
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+function downloadTodayHTML() {
+  const a = document.createElement('a');
+  a.href = '/api/v2/today-products/download';
+  a.target = '_blank';
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
+async function loadVerticalSites() {
+  $('vertical-body').innerHTML = '<div class="scanning"><div class="spinner"></div><p>正在汇总全量 snapshot 的小垂直站...</p></div>';
+  const kind = window.currentVerticalKind || 'small';
+  try {
+    const t0 = performance.now();
+    const d = await api('/api/v2/vertical-sites?kind=' + encodeURIComponent(kind));
+    const elapsed = ((performance.now()-t0)/1000).toFixed(2);
+    renderVerticalSites(d.vertical_micro_sites || []);
+    const rangeLabel = d.kind_label || (d.sku_range ? (d.sku_range + ' SKU') : '');
+    $('vertical-count').textContent = '[' + rangeLabel + '] 共 ' + (d.vertical_micro_sites_total || 0) + ' 个 · ' + (d.scanned_snapshots || 0) + ' 个 snapshot · ' + elapsed + 's';
+    window.verticalSitesLoaded = true;
+  } catch(e) {
+    $('vertical-body').innerHTML = '<div class="empty"><p>加载小垂直站失败</p><p style="font-size:11px;color:var(--t3);margin-top:4px">' + esc(e.message) + '</p></div>';
+  }
+}
+
+let v2GtrendsTimer = null;
+async function startV2GtrendsValidation() {
+  const btn = $('btn-v2-gtrends');
+  btn.disabled = true;
+  btn.textContent = 'Trends后台运行中';
+  $('v2-gtrends-status').innerHTML = '<span style="color:var(--c4)">正在提交 Google Trends 后台验证...</span>';
+  try {
+    const r = await api('/api/gtrends/background/start?source=v2&limit=50&geo=US&timeframe=' + encodeURIComponent('today 12-m') + '&interval_seconds=30&workers=1', {method:'POST'});
+    renderV2GtrendsStatus(r);
+    pollV2GtrendsStatus();
+  } catch(e) {
+    $('v2-gtrends-status').innerHTML = '<span style="color:var(--c5)">Google Trends 启动失败: ' + esc(e.message) + '</span>';
+    btn.disabled = false;
+    btn.textContent = 'Google Trends 验证';
+  }
+}
+
+async function pollV2GtrendsStatus() {
+  clearTimeout(v2GtrendsTimer);
+  try {
+    const r = await api('/api/gtrends/background/status');
+    renderV2GtrendsStatus(r);
+    if (r.running) {
+      v2GtrendsTimer = setTimeout(pollV2GtrendsStatus, 3000);
+    } else {
+      $('btn-v2-gtrends').disabled = false;
+      $('btn-v2-gtrends').textContent = 'Google Trends 验证';
+    }
+  } catch(e) {
+    $('v2-gtrends-status').innerHTML = '<span style="color:var(--c5)">Google Trends 状态读取失败: ' + esc(e.message) + '</span>';
+    $('btn-v2-gtrends').disabled = false;
+    $('btn-v2-gtrends').textContent = 'Google Trends 验证';
+  }
+}
+
+function renderV2GtrendsStatus(r) {
+  const ok = (r.results || []).filter(x => x.status === 'ok').length;
+  const miss = (r.results || []).filter(x => x.status === 'missing').length;
+  const current = (r.current_batch || []).join(' / ');
+  $('v2-gtrends-status').innerHTML = 'Google Trends：<span class="ts">' + esc(r.state || 'idle') + '</span>' +
+    ' · 词 ' + (r.completed_keywords || 0) + '/' + (r.total_keywords || 0) +
+    ' · 批 ' + (r.completed_batches || 0) + '/' + (r.total_batches || 0) +
+    ' · 每批 ' + (r.batch_size || 5) + ' 词' +
+    ' · 间隔 ' + (r.interval_seconds || 30) + 's' +
+    ' · 完整 ' + ok + (miss ? ' / 缺 ' + miss : '') +
+    ' · 含 related/regions' +
+    (current ? ' · 当前 ' + esc(current) : '');
+}
+
+function renderAll(d, elapsed) {
+  const method = d.method ? (' · ' + d.method) : '';
+  $('v2-status').innerHTML = '完成 <span class="ts">' + d.scan_date + '</span> · 耗时 ' + elapsed + method + ' · 扫描 ' + (d.scanned_domains||0) + ' 域名' + (d.failed_domains > 0 ? ' · ' + d.failed_domains + ' 失败' : '');
+
+  // KPI
+  $('k-total').textContent = (d.total_new_today||0).toLocaleString();
+  $('k-domains').textContent = (d.domains_with_new||0).toLocaleString();
+  $('k-avg').textContent = '$' + ((d.price_stats||{}).avg||0).toLocaleString();
+  $('k-med').textContent = '$' + ((d.price_stats||{}).median||0).toLocaleString();
+  var cats = Object.keys(d.category_breakdown||{});
+  $('k-cats').textContent = cats.length;
+  $('k-topcat').textContent = cats[0] || '--';
+  $('k-highval').textContent = (d.high_value_products||[]).length;
+  $('k-success').textContent = (d.scanned_domains||0) + '/' + ((d.scanned_domains||0) + (d.failed_domains||0));
+  $('k-fail').textContent = (d.failed_domains||0) > 0 ? (d.failed_domains||0) + ' 失败' : '全部成功';
+
+  // 旧评分跟品建议禁用：可跟结论只允许由 /api/v2/workbench 的严格验真输出
+  $('k-decisions').textContent = '--';
+  $('k-decisions').style.color = 'var(--t3)';
+
+  // 趋势信号
+  var sigs = d.trend_signals || [];
+  $('signal-bar').innerHTML = '<span class="sig-label">趋势信号</span>' +
+    (sigs.length > 0 ? sigs.map(function(s){return '<span class="sig-tag">'+s+'</span>'}).join('') : '<span style="color:var(--t3);font-size:12px">数据不足</span>') +
+    '<span style="margin-left:auto;font-size:11px;color:var(--t3)">昨天新品: ' + (d.total_new_yesterday||0) + ' 个</span>';
+
+  // 禁止渲染旧“立即测款/素材验证”面板，避免绕过2类平台验真
+  renderDecisions([]);
+
+  // 图表
+  renderCatChart(d.category_breakdown, d.total_new_today);
+  renderPriceBands(d.price_bands);
+  renderDomainActivity(d.domain_activity);
+  renderHighValue(d.high_value_products);
+  renderProductTable(d.products, d.scored_products||[]);
+  renderCategoryView(d.products, d.category_breakdown);
+  renderVerticalSites(d.vertical_micro_sites || []);
+}
+
+function renderDecisions(_unused) {
+  $('decision-panel').style.display = 'none';
+}
+
+function renderCatChart(cats, total) {
+  if (!cats || Object.keys(cats).length === 0) {
+    $('cat-chart').innerHTML = '<div class="empty"><p>暂无品类数据</p></div>'; return;
+  }
+  const entries = Object.entries(cats).slice(0, 8);
+  const maxv = entries[0][1];
+  const barColors = ['var(--c1)','var(--c2)','var(--c6)','var(--c3)','var(--c4)','var(--c5)','#ec4899','#14b8a6'];
+  $('cat-chart').innerHTML = entries.map(([name, count], i) => {
+    const pct = Math.max((count/maxv*100), 3);
+    return '<div class="bar-row"><span class="blabel">' + name + '</span>' +
+      '<span class="bfill" style="width:' + pct + '%;background:' + barColors[i] + '"></span>' +
+      '<span class="bcount">' + count + '</span></div>';
+  }).join('');
+}
+
+function renderPriceBands(bands) {
+  if (!bands) { $('price-chart').innerHTML = '<div class="empty"><p>暂无价格数据</p></div>'; return; }
+  const entries = Object.entries(bands);
+  const maxv = Math.max(...entries.map(([,v])=>v), 1);
+  const colors = ['#12805c','#0f766e','#2563eb','#b7791f','#d97706','#c2413a'];
+  $('price-chart').innerHTML = '<div class="price-band">' + entries.map(([label, count], i) => {
+    const h = Math.max((count/maxv*120), 4);
+    return '<div class="pb-col" style="height:' + h + 'px;background:' + colors[i] + '" title="' + label + ': ' + count + '">' +
+      '<span class="pb-val">' + count + '</span><span class="pb-label">' + label + '</span></div>';
+  }).join('') + '</div>';
+}
+
+function renderDomainActivity(domains) {
+  if (!domains || domains.length === 0) {
+    $('domain-panel').innerHTML = '<div class="empty"><p>暂无活跃域名</p></div>'; return;
+  }
+  const maxv = domains[0].today_count;
+  const colors = ['var(--c4)','var(--c1)','var(--c2)','var(--c6)','var(--c3)'];
+  $('domain-panel').innerHTML = '<div class="domain-list">' + domains.slice(0, 15).map((d,i) =>
+    '<div class="dl-row"><span class="dl-domain" title="' + d.domain + '">' + d.domain + '</span>' +
+    '<span class="dl-bar-bg"><span class="dl-bar" style="width:' + Math.max(d.today_count/maxv*100,2) + '%;background:' + colors[i%5] + '"></span></span>' +
+    '<span class="dl-count">' + d.today_count + '</span></div>'
+  ).join('') + '</div>';
+}
+
+function renderHighValue(products) {
+  if (!products || products.length === 0) {
+    $('highval-panel').innerHTML = '<div class="empty"><p>暂无 $100+ 新品</p></div>'; return;
+  }
+  $('highval-panel').innerHTML = '<table class="prod-table"><thead><tr><th>产品</th><th class="num">价格</th><th>具体分类</th><th>素材角度</th><th>域名</th></tr></thead><tbody>' +
+    products.slice(0, 15).map(function(p) {
+      var title = esc(p.title || p.product_title || '--');
+      var cat = esc(p.specific_category || p.product_type || '未分类');
+      var angle = esc(p.creative_angle || p.use_case || '--');
+      return '<tr><td><a class="product-link" href="' + esc(v2ProductUrl(p)) + '" target="_blank" rel="noopener noreferrer" title="' + title + '">' + title + '</a></td>' +
+        '<td class="num highlight">$' + (p.price || 0).toLocaleString() + '</td>' +
+        '<td>' + cat + '<div style="font-size:10px;color:var(--t3)">置信 ' + (p.category_confidence || 0) + '%</div></td>' +
+        '<td style="font-size:11px;color:var(--t2)">' + angle + '</td><td class="domain-link">' + esc(p.domain || '') + '</td></tr>';
+    }).join('') + '</tbody></table>';
+}
+
+function v2ProductUrl(p) {
+  var raw = p.product_url || p.url || p.online_store_url || p.link || '';
+  if (raw) return raw;
+  var domain = String(p.domain || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  var handle = String(p.handle || '').replace(/^\/+|\/+$/g, '');
+  if (domain && handle) return 'https://' + domain + '/products/' + encodeURIComponent(handle);
+  if (domain) return 'https://' + domain;
+  return '#';
+}
+
+function renderProductTable(products, scored) {
+  $('prod-count').textContent = '共 ' + products.length + ' 个';
+  if (!products || products.length === 0) {
+    $('prod-tbody').innerHTML = '<tr><td colspan="10"><div class="empty"><p>今天暂未发现新品</p><p style="font-size:12px;color:var(--t3)">所有域名今天都没有上新产品，或 snapshot 数据尚未更新</p></div></td></tr>';
+    return;
+  }
+  // 按 handle 建立评分 lookup
+  var scoreMap = {};
+  if (scored && scored.length) {
+    scored.forEach(function(s){ scoreMap[s.handle||''] = s; });
+  }
+  $('prod-tbody').innerHTML = products.slice(0, 500).map(function(p,i){
+    var s = scoreMap[p.handle||''] || {};
+    var info = Object.assign({}, p, s);
+    var scoreVal = s.score||0;
+    var tier = s.tier||'';
+    var tierColor = tier.indexOf('测款')>=0?'var(--c5)':tier.indexOf('拆解')>=0?'var(--c4)':tier.indexOf('观察')>=0?'var(--c6)':'var(--t3)';
+    var createdDate = (p.created_at||'').slice(0,10);
+    var isNew = createdDate === (v2data? v2data.scan_date : '');
+    var productTitle = esc(p.title || p.product_title || '--');
+    var productUrl = esc(v2ProductUrl(p));
+    var cat = esc(info.specific_category || info.product_type || '未分类');
+    var rawCat = esc(info.product_type_raw || '');
+    var useCase = esc(info.use_case || '--');
+    var pain = esc(info.pain_point || '--');
+    var angle = esc(info.creative_angle || info.follow_playbook || '--');
+    var depth = esc(info.extraction_depth || '标准抓取');
+    var confidence = info.category_confidence || 0;
+    return '<tr>' +
+      '<td>' + (i+1) + '</td>' +
+      '<td><a class="product-link" href="' + productUrl + '" target="_blank" rel="noopener noreferrer" title="' + productTitle + '">' + productTitle + '</a>' + (isNew?' <span class="new-badge">NEW</span>':'') + '</td>' +
+      '<td class="num highlight">$' + (p.price||0).toLocaleString() + '</td>' +
+      '<td class="num" style="font-weight:600;color:'+(scoreVal>=60?'var(--c4)':scoreVal>=40?'var(--c6)':'var(--t3)')+'">' + scoreVal + '</td>' +
+      '<td style="color:'+tierColor+';font-weight:600;font-size:11px">' + (tier||'--') + '</td>' +
+      '<td>' + cat + '<div style="font-size:10px;color:var(--t3)">置信 ' + confidence + '%' + (rawCat && rawCat !== cat ? ' · 原 ' + rawCat : '') + '</div></td>' +
+      '<td style="font-size:11px;color:var(--t2)">' + useCase + '<div style="color:var(--t3);margin-top:2px">' + pain + '</div></td>' +
+      '<td style="font-size:11px;color:var(--t2)">' + angle + '</td>' +
+      '<td style="font-size:11px;color:' + (confidence < 35 ? 'var(--c5)' : 'var(--t3)') + '">' + depth + '</td>' +
+      '<td><div class="domain-link">' + esc(p.domain||'') + '</div><div style="font-size:11px;color:var(--t3)">' + (p.created_at||p.updated_at||'--').slice(0,16) + '</div></td>' +
+      '</tr>';
+  }).join('');
+}
+
+function renderCategoryView(products, cats) {
+  if (!products || products.length === 0) {
+    $('catview-body').innerHTML = '<div class="empty"><p>暂无数据</p></div>'; return;
+  }
+  const byCat = {};
+  products.forEach(p => {
+    const c = p.specific_category || p.product_type || '未分类';
+    if (!byCat[c]) byCat[c] = [];
+    byCat[c].push(p);
+  });
+  const sorted = Object.entries(byCat).sort((a,b) => b[1].length - a[1].length);
+  $('catview-count').textContent = sorted.length + ' 个品类';
+  $('catview-body').innerHTML = sorted.map(([cat, prods]) =>
+    '<div style="margin-bottom:1rem"><div style="font-weight:600;color:var(--t1);margin-bottom:6px;font-size:13px">' +
+    cat + ' <span style="color:var(--t3);font-weight:400">(' + prods.length + ')</span></div>' +
+    '<table class="prod-table"><thead><tr><th>产品</th><th class="num">价格</th><th>用途/痛点</th><th>域名</th></tr></thead><tbody>' +
+    prods.sort((a,b) => b.price - a.price).map(p =>
+      '<tr><td>' + esc(p.title || '') + '</td><td class="num highlight">$' + (p.price||0).toLocaleString() + '</td><td style="font-size:11px">' + esc(p.use_case || '--') + '<div style="color:var(--t3)">' + esc(p.pain_point || '') + '</div></td><td class="domain-link">' + esc(p.domain || '') + '</td></tr>'
+    ).join('') + '</tbody></table></div>'
+  ).join('');
+}
+
+function renderVerticalSites(sites) {
+  $('vertical-count').textContent = '共 ' + sites.length + ' 个';
+  if (!sites || sites.length === 0) {
+    $('vertical-body').innerHTML = '<div class="empty"><p>暂无 5-15 SKU 的小垂直站</p><p style="font-size:11px;color:var(--t3);margin-top:4px">当前已经扫过全部 snapshot；如果没有结果，说明本地数据里暂时没有符合范围的站点。</p></div>';
+    return;
+  }
+  $('vertical-body').innerHTML = sites.map(function(site, i) {
+    var rawCount = site.raw_products_before_dedupe || site.total_products || 0;
+    var effectiveCount = site.deduped_products || site.new_products || 0;
+    var removedCount = site.duplicate_products_removed || Math.max(0, rawCount - effectiveCount);
+    const rows = (site.products || []).map(function(p) {
+      var cat = esc(p.specific_category || p.micro_category || p.product_type || '未分类');
+      var shape = esc(p.product_shape || p.core_mechanism || '形态待补');
+      var demo = esc(p.demo_scene || p.creative_angle || '--');
+      var usePain = esc(p.use_case || '--') + '<div style="color:var(--t3);margin-top:2px">' + esc(p.pain_point || '') + '</div>';
+      var angle = esc(p.how_to_follow || p.follow_playbook || p.creative_angle || '--');
+      var focus = esc((p.monitoring_focus_fields || []).slice(0,3).join(' / ') || '新品/价格/Offer');
+      var missing = esc((p.missing_fields || []).slice(0,3).join(' / '));
+      var next = esc(p.next_data_action || '');
+      var dup = p.duplicate_products_removed ? '<div style="font-size:10px;color:var(--c4)">已合并 ' + p.duplicate_products_removed + ' 个重复变体/套装</div>' : '';
+      return '<tr><td><a class="product-link" href="' + esc(p.product_url || ('https://' + site.domain)) + '" target="_blank" title="' + esc(p.title || '') + '">' + esc(p.title || '') + '</a><div style="font-size:10px;color:var(--t3)">词: ' + esc((p.micro_matched_keywords || p.matched_keywords || []).slice(0,3).join(', ') || '--') + '</div>' + dup + '</td>' +
+        '<td class="num highlight">$' + (p.price || 0).toLocaleString() + '</td>' +
+        '<td>' + cat + '<div style="font-size:10px;color:var(--t3)">' + shape + ' · 置信 ' + (p.category_confidence || 0) + '%</div><div style="font-size:10px;color:var(--t3)">机制: ' + esc(p.core_mechanism || '--') + '</div></td>' +
+        '<td style="font-size:11px">' + usePain + '</td>' +
+        '<td style="font-size:11px;color:var(--t2)">' + demo + '<div style="color:var(--t3);margin-top:2px">' + angle + '</div></td>' +
+        '<td style="font-size:11px;color:var(--t3)">' + esc(p.extraction_depth || '标准抓取') + '<div>盯: ' + focus + '</div>' + (missing ? '<div style="color:var(--c5)">缺: ' + missing + '</div>' : '') + (next ? '<div style="color:var(--t2)">' + next + '</div>' : '') + '</td></tr>';
+    }).join('');
+    return '<div style="margin-bottom:1rem;border:1px solid var(--b1);border-radius:8px;overflow:hidden;background:var(--s1)">' +
+      '<div style="padding:10px 12px;border-bottom:1px solid var(--b1);display:flex;gap:12px;align-items:center;flex-wrap:wrap">' +
+        '<strong style="color:var(--c6)">' + (i + 1) + '. ' + esc(site.domain || '') + '</strong>' +
+        '<span class="tag">总SKU ' + (site.total_products || 0) + '</span>' +
+        '<span class="tag">原始 ' + rawCount + '</span>' +
+        '<span class="tag">有效品 ' + effectiveCount + '</span>' +
+        '<span class="tag">去重 ' + removedCount + '</span>' +
+        '<span class="tag">' + esc(site.dominant_specific_category || site.dominant_category || '未分类') + '</span>' +
+        '<span class="tag">' + esc(site.dominant_category_group || 'Other DTC') + '</span>' +
+        '<span class="tag">演示友好 ' + (site.demo_friendly_count || 0) + '</span>' +
+        '<span class="tag">低置信 ' + (site.low_confidence_count || 0) + '</span>' +
+        '<span style="font-size:11px;color:var(--t3)">' + esc(site.why || '') + '</span>' +
+        '<span style="font-size:11px;color:var(--t2);width:100%">' + esc(site.follow_strategy || '') + '</span>' +
+      '</div>' +
+      '<table class="prod-table"><thead><tr><th>新品</th><th class="num">价格</th><th>具体分类/形态</th><th>用途/痛点</th><th>演示/跟法</th><th>抓取/补数</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    '</div>';
+  }).join('');
+}
+
+function switchV2Tab(tab) {
+  if (tab === 'followable') tab = 'autointel';
+  document.querySelectorAll('.tabs2 button').forEach(b => b.classList.remove('on'));
+  $('all-panel').style.display = tab === 'all' ? 'block' : 'none';
+  $('catview-panel').style.display = tab === 'catview' ? 'block' : 'none';
+  $('followable-panel').style.display = tab === 'followable' ? 'block' : 'none';
+  $('vertical-panel').style.display = tab === 'vertical' ? 'block' : 'none';
+  $('autointel-panel').style.display = tab === 'autointel' ? 'block' : 'none';
+  $('autolaunch-panel').style.display = tab === 'autolaunch' ? 'block' : 'none';
+  if ($('tab-' + tab)) $('tab-' + tab).classList.add('on');
+
+  // 自动加载可跟品产品数据
+  if (tab === 'followable' && !window.followableLoaded) {
+    loadFollowableProducts();
+  }
+  if (tab === 'autointel' && !window.autoIntelLoaded) {
+    window.autoIntelLoaded = true;
+    loadProfitPipelineLatest();
+  }
+}
+
+async function loadFollowableProducts() {
+  const minScore = parseInt($('followable-min-score').value) || 60;
+  $('followable-tbody').innerHTML = '<tr><td colspan="11"><div class="scanning"><div class="spinner"></div><p>正在加载可跟品产品...</p></div></td></tr>';
+
+  try {
+    const r = await api('/api/v2/followable-products?min_score=' + minScore + '&limit=100&trend_top_n=50&trend_geo=US');
+    if (!r.ok) {
+      $('followable-tbody').innerHTML = '<tr><td colspan="11"><div class="empty"><div class="big">!</div><p>' + (r.error || '加载失败') + '</p></div></td></tr>';
+      return;
+    }
+
+    window.followableLoaded = true;
+    const products = r.products || [];
+    const ts = r.trend_summary || {};
+    $('followable-count').textContent = '共 ' + r.total_followable + ' 个产品（评分 ≥ ' + minScore + '） · 前50趋势验证 ' + (ts.verified_products || 0) + '/' + (ts.requested_products || 0) + ' · 代理 ' + (ts.proxy_products || 0);
+
+    if (products.length === 0) {
+      $('followable-tbody').innerHTML = '<tr><td colspan="11"><div class="empty"><div class="big">---</div><p>暂无符合条件的可跟品产品</p><p style="font-size:11px;color:var(--t3);margin-top:4px">尝试降低最低评分或先运行"刷新扫描"</p></div></td></tr>';
+      return;
+    }
+
+    $('followable-tbody').innerHTML = products.map(function(p, i) {
+      const direction = p.trend_direction || '未验证';
+      const trendClass = direction.includes('上升') ? 'trend-up' : (direction.includes('下降') ? 'trend-down' : 'trend-flat');
+      const followClass = p.follow_decision.includes('立即') ? 'follow-go' : 'follow-watch';
+      const yoyColor = p.yoy_growth > 0 ? 'var(--c2)' : (p.yoy_growth < 0 ? 'var(--c5)' : 'var(--t3)');
+      const trendScore = p.trend_verified || p.trend_status === 'proxy' ? p.trends_score : '--';
+      const trendMeta = (p.trend_query ? p.trend_query + ' · ' : '') + (p.trend_data_quality || '未验证') + ' · ' + (p.trend_source || '');
+      const yoyText = p.trend_verified ? ((p.yoy_growth > 0 ? '+' : '') + p.yoy_growth + '%') : '--';
+      const pai = p.platform_ai || {};
+
+      return '<tr>' +
+        '<td>' + (i + 1) + '</td>' +
+        '<td>' +
+          '<a href="' + p.product_url + '" target="_blank" class="product-link" title="' + p.product_title + '">' +
+            (p.product_title.length > 40 ? p.product_title.substring(0, 40) + '...' : p.product_title) +
+          '</a>' +
+          '<div class="meta-row">' + p.domain + ' · ' + p.product_type + '</div>' +
+        '</td>' +
+        '<td class="num highlight">$' + p.price.toLocaleString() + '</td>' +
+        '<td class="num" style="font-weight:700;color:' + (p.ai_score >= 80 ? 'var(--c2)' : (p.ai_score >= 60 ? 'var(--c4)' : 'var(--c6)')) + '">' + p.ai_score + '</td>' +
+        '<td class="num" style="font-weight:600">' + trendScore + '</td>' +
+        '<td><span class="trend-badge ' + trendClass + '" title="' + esc(trendMeta) + '">' + esc(direction) + '</span><div class="meta-row">' + esc(p.trend_status || 'unverified') + '</div></td>' +
+        '<td class="num" style="color:' + yoyColor + ';font-weight:600">' + yoyText + '</td>' +
+        '<td class="num">' + p.active_ads_count + '</td>' +
+        '<td class="num"><strong style="color:var(--c6)">' + (pai.automation_score || 0) + '</strong><div class="meta-row">' + esc(pai.readiness || '') + '</div></td>' +
+        '<td><span class="follow-badge ' + followClass + '">' + p.follow_decision + '</span></td>' +
+        '<td><button class="btn-copy" onclick="copyResearchPrompt(\'' + p.product_url + '\', this)">AI调研</button></td>' +
+        '</tr>';
+    }).join('');
+
+  } catch(e) {
+    $('followable-tbody').innerHTML = '<tr><td colspan="11"><div class="empty"><div class="big">!</div><p>加载失败: ' + e.message + '</p></div></td></tr>';
+  }
+}
+
+async function copyResearchPrompt(productUrl, btn) {
+  const originalText = btn.textContent;
+  btn.textContent = '生成中...';
+  btn.disabled = true;
+
+  try {
+    const r = await api('/api/v2/generate-research-prompt?product_url=' + encodeURIComponent(productUrl), {method: 'POST'});
+    if (r.ok && r.prompt) {
+      await navigator.clipboard.writeText(r.prompt);
+      btn.textContent = '✓ 已复制';
+      btn.classList.add('copied');
+      setTimeout(() => {
+        btn.textContent = originalText;
+        btn.classList.remove('copied');
+        btn.disabled = false;
+      }, 2000);
+    } else {
+      throw new Error('生成失败');
+    }
+  } catch(e) {
+    btn.textContent = '失败';
+    setTimeout(() => {
+      btn.textContent = originalText;
+      btn.disabled = false;
+    }, 2000);
+  }
+}
+
+async function syncDomains() {
+  $('btn-sync').disabled = true;
+  $('btn-sync').textContent = '同步中...';
+  $('v2-status').innerHTML = '<span style="color:var(--c4)">正在从FB管线拉取域名...</span>';
+  try {
+    const t0 = performance.now();
+    const r = await api('/api/v2/sync-domains', {method:'POST'});
+    const elapsed = ((performance.now()-t0)/1000).toFixed(1);
+    if (r.synced) {
+      var s = r.stats;
+      $('v2-status').innerHTML = '域名同步完成 <span class="ts">'+r.sync_date+'</span> · 耗时 '+elapsed+'s · 新增 '+s.scraped_success+' 个域名 · '+s.total_new_products+' 个产品';
+      if (s.scraped_success > 0) loadFast();
+    } else {
+      $('v2-status').innerHTML = r.reason || '今日已同步，无需重复';
+    }
+  } catch(e) {
+    $('v2-status').innerHTML = '<span style="color:var(--c5)">同步失败: '+e.message+'</span>';
+  }
+  $('btn-sync').disabled = false;
+  $('btn-sync').textContent = '同步域名';
+}
+
+function esc(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, function(c) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+
+function setV2ModuleActive(tab) {
+  document.querySelectorAll('[data-v2-module]').forEach(function(btn) {
+    btn.classList.toggle('active', btn.getAttribute('data-v2-module') === tab);
+  });
+}
+
+async function openV2Module(tab) {
+  if (tab === 'trends') {
+    setV2ModuleActive('trends');
+    await startV2GtrendsValidation();
+    return;
+  }
+  setV2ModuleActive(tab);
+  switchV2Tab(tab);
+  if (tab === 'vertical') {
+    if (!window.verticalSitesLoaded) {
+      await loadVerticalSites();
+    }
+    switchV2Tab(tab);
+    const verticalPanel = $(tab + '-panel');
+    if (verticalPanel) verticalPanel.scrollIntoView({behavior:'smooth', block:'start'});
+    return;
+  }
+  if (tab === 'autolaunch') {
+    if (!window.autoLaunchLoaded) {
+      window.autoLaunchLoaded = true;
+      await loadAutoLaunchLatest();
+    }
+    switchV2Tab(tab);
+    const launchPanel = $('autolaunch-panel');
+    if (launchPanel) launchPanel.scrollIntoView({behavior:'smooth', block:'start'});
+    return;
+  }
+  if (tab === 'autointel') {
+    if (!window.autoIntelLoaded) {
+      window.autoIntelLoaded = true;
+      await loadProfitPipelineLatest();
+    }
+  } else if (!v2data) {
+    await loadFast();
+    switchV2Tab(tab);
+  }
+  const panel = $(tab + '-panel');
+  if (panel) panel.scrollIntoView({behavior:'smooth', block:'start'});
+}
+
+async function runAutoIntel() {
+  const limit = parseInt($('auto-intel-limit').value) || 20;
+  const minScore = $('auto-intel-score') ? (parseInt($('auto-intel-score').value) || 60) : 60;
+  const days = $('auto-intel-days') ? (parseInt($('auto-intel-days').value) || 3) : 3;
+  $('auto-intel-summary').innerHTML = '<span style="color:var(--c4)">正在读取 8001 快照并拉取 8000 FB 信号...</span>';
+  $('auto-intel-body').innerHTML = '<div class="scanning"><div class="spinner"></div><p>生成候选、草稿和创意简报中...</p></div>';
+  $('auto-intel-artifact').style.display = 'none';
+  try {
+    const r = await api('/api/auto-intel/run?limit=' + limit + '&min_score=' + minScore + '&lookback_days=' + days + '&fb_limit=500&enable_trends=true&trend_top_n=50&trend_max_keywords=150&trend_geo=US', {method:'POST'});
+    window.autoIntelLoaded = true;
+    renderAutoIntel(r);
+  } catch(e) {
+    $('auto-intel-summary').innerHTML = '<span style="color:var(--c5)">运行失败: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function loadAutoIntelLatest() {
+  $('auto-intel-summary').innerHTML = '<span style="color:var(--c6)">读取最新自动智能结果...</span>';
+  try {
+    const r = await api('/api/auto-intel/latest');
+    window.autoIntelLoaded = true;
+    renderAutoIntel(r);
+  } catch(e) {
+    $('auto-intel-summary').innerHTML = '<span style="color:var(--c5)">读取失败: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function runAutoIntelTrends() {
+  $('auto-intel-summary').innerHTML = '<span style="color:var(--c4)">正在用 gtrends-bulk 验证 Top 50 Google Trends...</span>';
+  $('auto-intel-body').innerHTML = '<div class="scanning"><div class="spinner"></div><p>读取缓存并补跑真实趋势时间序列...</p></div>';
+  $('auto-intel-artifact').style.display = 'none';
+  try {
+    const r = await api('/api/auto-intel/trends/run?trend_top_n=50&trend_geo=US&trend_max_keywords=150&timeframe=' + encodeURIComponent('today 12-m') + '&workers=2&ttl_days=7&timeout_seconds=900', {method:'POST'});
+    window.autoIntelLoaded = true;
+    renderAutoIntel(r);
+  } catch(e) {
+    $('auto-intel-summary').innerHTML = '<span style="color:var(--c5)">Google Trends 运行失败: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function runProfitPipeline() {
+  const limit = Math.max(50, parseInt($('auto-intel-limit').value) || 50);
+  $('auto-intel-summary').innerHTML = '<span style="color:var(--c4)">正在跑28跟品监控：竞品、流量来源、供应链路径、一个动作...</span>';
+  $('auto-intel-body').innerHTML = '<div class="scanning"><div class="spinner"></div><p>生成28跟品队列...</p></div>';
+  $('auto-intel-artifact').style.display = 'none';
+  try {
+    const r = await api('/api/v2/workbench/run?limit=' + limit + '&trend_top_n=50&trend_geo=US&fb_limit=5000&fb_exact_verify_limit=300', {method:'POST'});
+    renderProfitPipeline(r);
+  } catch(e) {
+    $('auto-intel-summary').innerHTML = '<span style="color:var(--c5)">28跟品运行失败: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function loadProfitPipelineLatest() {
+  $('auto-intel-summary').innerHTML = '<span style="color:var(--c6)">读取最近一次28跟品判断...</span>';
+  try {
+    const r = await api('/api/v2/workbench/latest');
+    if (r && r.ok) {
+      renderProfitPipeline(r);
+    } else {
+      $('auto-intel-summary').innerHTML = '<span style="color:var(--t3)">暂无28跟品结果，点击“跑28监控”生成一次。</span>';
+      $('auto-intel-body').innerHTML = '<div class="empty"><p>暂无28跟品队列</p></div>';
+    }
+  } catch(e) {
+    $('auto-intel-summary').innerHTML = '<span style="color:var(--c5)">读取28跟品失败: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function runAutoLaunch() {
+  const limit = Math.max(1, Math.min(50, parseInt($('auto-launch-limit').value) || 20));
+  const minScore = Math.max(0, Math.min(100, parseFloat($('auto-launch-score').value) || 62));
+  const refresh = $('auto-launch-refresh').checked;
+  const apply = $('auto-launch-apply').checked;
+  if (apply && !confirm('只会写入 Shopify DRAFT 草稿，不会发布。确认继续？')) return;
+  $('auto-launch-summary').innerHTML = '<span style="color:var(--c4)">正在聚合 TikTok/Meta/Instagram + Amazon 销量/榜单信号，并生成 Shopify DRAFT catalog...</span>';
+  $('auto-launch-body').innerHTML = '<div class="scanning"><div class="spinner"></div><p>交叉验证中...</p></div>';
+  $('auto-launch-artifact').style.display = 'none';
+  try {
+    const url = '/api/auto-launch/run?limit=' + limit +
+      '&min_score=' + encodeURIComponent(minScore) +
+      '&refresh_sources=' + encodeURIComponent(refresh) +
+      '&apply=' + encodeURIComponent(apply);
+    const r = await api(url, {method:'POST'});
+    window.autoLaunchLoaded = true;
+    renderAutoLaunch(r);
+  } catch(e) {
+    $('auto-launch-summary').innerHTML = '<span style="color:var(--c5)">自动选品失败: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function loadAutoLaunchLatest() {
+  $('auto-launch-summary').innerHTML = '<span style="color:var(--c6)">读取最近一次社媒+Amazon自动选品报告...</span>';
+  try {
+    const r = await api('/api/auto-launch/latest');
+    renderAutoLaunch(r);
+  } catch(e) {
+    $('auto-launch-summary').innerHTML = '<span style="color:var(--c5)">读取失败: ' + esc(e.message) + '</span>';
+  }
+}
+
+function renderAutoLaunch(r) {
+  if (!r || !r.ok) {
+    $('auto-launch-count').textContent = '';
+    $('auto-launch-summary').innerHTML = '<span style="color:var(--t3)">' + esc((r && r.error) || '暂无自动选品报告') + '</span>';
+    $('auto-launch-body').innerHTML = '<div class="empty"><p>暂无结果</p></div>';
+    return;
+  }
+  const stats = r.stats || {};
+  const opps = r.opportunities || [];
+  const artifact = r.artifact || {};
+  const validation = r.validation || {};
+  const upload = r.upload || {};
+  $('auto-launch-count').textContent = '候选 ' + (stats.opportunities || 0) + ' / DRAFT ' + (stats.draft_products || 0);
+  $('auto-launch-summary').innerHTML =
+    '生成 <span class="ts">' + esc(r.generated_at || '') + '</span>' +
+    ' · Amazon原料 ' + ((r.raw_counts || {}).amazon_records || 0) +
+    ' · 社媒原料 ' + ((r.raw_counts || {}).social_records || 0) +
+    ' · 可建DRAFT ' + (stats.draft_products || 0) +
+    ' · 报告观察 ' + (stats.blocked_report_only || 0) +
+    ' · Shopify ' + (r.shop_ready ? '已配置' : '未配置写入环境') +
+    ' · 预检 ' + (validation.ok === false ? '失败' : '通过');
+  const sourceHtml = (r.sources || []).map(function(s) {
+    const color = s.count > 0 ? 'var(--c2)' : 'var(--t3)';
+    return '<div class="simple-stat"><div class="label">' + esc(s.name || '') + '</div><div class="value" style="font-size:18px;color:' + color + '">' + (s.count || 0) + '</div><div class="note">' + esc((s.status || '') + ' · ' + (s.note || '')).slice(0, 120) + '</div></div>';
+  }).join('');
+  if (!opps.length) {
+    $('auto-launch-body').innerHTML = '<div style="padding:12px 1.25rem"><div class="simple-stats">' + sourceHtml + '</div><div class="empty"><p>没有达到社媒+Amazon交叉验证的机会。</p></div></div>';
+  } else {
+    $('auto-launch-body').innerHTML =
+      '<div style="padding:12px 1.25rem"><div class="simple-stats">' + sourceHtml + '</div></div>' +
+      '<div class="simple-list">' +
+      opps.slice(0, 24).map(function(o) {
+        const ok = o.decision === 'CREATE_DRAFT';
+        const badgeClass = ok ? 'triage-launch' : 'triage-observe';
+        const socials = (o.social_matches || []).slice(0, 3).map(function(m) {
+          return '<div class="meta-row">' + esc((m.platform || '') + ' · ' + (m.source || '') + ' · match ' + (m.match_score || 0)) + '</div>';
+        }).join('');
+        return '<div class="simple-item ' + (ok ? 'launch-now' : 'observe') + '">' +
+          '<div><div class="simple-title">#' + (o.rank || '') + ' ' + esc(o.concept_title || o.title || '') + '</div>' +
+            '<span class="triage-pill ' + badgeClass + '">' + esc(o.decision || '') + '</span>' +
+            '<div class="simple-meta">分数 ' + (o.score || 0) + ' · 匹配 ' + (o.match_score || 0) + ' · 建议售价 $' + Number(o.suggested_price || 0).toLocaleString() + '</div>' +
+            '<div class="simple-gap">' + esc((o.risk_flags || []).join(', ')) + '</div></div>' +
+          '<div><div class="simple-label">Amazon需求</div><a class="product-link" target="_blank" href="' + esc((o.amazon || {}).url || '#') + '">' + esc(((o.amazon || {}).title || '').slice(0, 95)) + '</a><div class="meta-row">rank ' + esc((o.amazon || {}).rank || '--') + ' · est sales ' + esc((o.amazon || {}).sales_estimate || '--') + '</div></div>' +
+          '<div><div class="simple-label">社媒验真</div>' + socials + '<div class="meta-row">' + esc((o.evidence_sources || []).slice(0, 4).join(' / ')) + '</div></div>' +
+          '<div><div class="simple-label">机会动作</div><div class="compact-action">' + esc(((o.next_actions || [])[0] || '').slice(0, 150)) + '</div></div>' +
+        '</div>';
+      }).join('') + '</div>';
+  }
+  const box = $('auto-launch-artifact');
+  box.style.display = 'block';
+  box.textContent = JSON.stringify({
+    message: r.message,
+    artifact: artifact,
+    validation: validation,
+    upload: upload,
+    safety: r.safety,
+  }, null, 2);
+}
+
+function renderProfitPipeline(r) {
+  if (!r || !r.ok) {
+    $('auto-intel-summary').innerHTML = '<span style="color:var(--t3)">' + esc((r && r.error) || '暂无28跟品结果') + '</span>';
+    $('auto-intel-body').innerHTML = '<div class="empty"><p>暂无28跟品结果</p></div>';
+    return;
+  }
+  const stats = r.stats || {};
+  const actions = r.actions || [];
+  const workbench = r.workbench || {};
+  const triageCounts = stats.triage_counts || {};
+  const launchCount = stats.launch_now_products || triageCounts.launch_now || 0;
+  const observeCount = stats.observe_products || triageCounts.observe || 0;
+  const avoidCount = stats.avoid_products || triageCounts.avoid || 0;
+  $('auto-intel-count').textContent = '行动 ' + actions.length + ' / 立即上架 ' + launchCount + ' / 观察跟进 ' + observeCount + ' / 不碰 ' + avoidCount;
+  $('auto-intel-summary').innerHTML =
+    '最后判断 <span class="ts">' + esc(r.generated_at || '') + '</span>' +
+    ' · 原料 ' + (stats.source_products || 0).toLocaleString() +
+    ' · 立即上架 ' + launchCount +
+    ' · 观察跟进 ' + observeCount +
+    ' · 不碰 ' + avoidCount +
+    ' · 当前只看前 ' + actions.length + ' 个可行动线索';
+  if (!actions.length) {
+    $('auto-intel-body').innerHTML = '<div class="empty"><p>暂无28跟品行动项</p></div>';
+    return;
+  }
+  const laneClass = function(lane) {
+    if (lane === 'copy_now') return 'pareto-copy';
+    if (lane === 'verify_first' || lane === 'teardown_first') return 'pareto-teardown';
+    if (lane === 'find_supplier') return 'pareto-supply';
+    return 'pareto-skip';
+  };
+  const itemClass = function(lane) {
+    return String(lane || 'verify_first').replace(/_/g, '-');
+  };
+  const shortText = function(v, n) {
+    return esc(String(v || '').slice(0, n || 120));
+  };
+  const firstTraffic = function(list) {
+    list = Array.isArray(list) ? list : [];
+    return list.length ? (list[0].source + (list[0].signal ? ' · ' + list[0].signal : '')) : '缺流量证据';
+  };
+  const sourceHtml = function(traffic) {
+    traffic = Array.isArray(traffic) ? traffic : [];
+    if (!traffic.length) return '<span style="color:var(--c5)">缺流量验证</span>';
+    return traffic.slice(0, 2).map(function(t) {
+      const level = t.verification_level === 'strict' ? '<span style="color:var(--c2)">验真</span>' : '<span style="color:var(--c4)">线索</span>';
+      return '<div>' + level + ' · <strong>' + esc(t.source || '') + '</strong><div class="meta-row">' + shortText(t.signal || t.status || '', 92) + '</div></div>';
+    }).join('');
+  };
+  const sectionHtml = function(sections, fallback) {
+    sections = Array.isArray(sections) ? sections : [];
+    if (!sections.length) return '<span style="color:var(--t3)">' + esc(fallback || '待拆解') + '</span>';
+    return sections.slice(0, 2).map(function(s) {
+      return '<div><strong>' + esc(s.section || '') + '</strong><div class="meta-row">' + shortText(s.task || '', 95) + '</div></div>';
+    }).join('');
+  };
+  const statsHtml =
+    '<div class="simple-stats">' +
+      '<div class="simple-stat"><div class="label">立即上架</div><div class="value" style="color:var(--c2)">' + launchCount + '</div><div class="note">只允许先建DRAFT，发布前人工复核</div></div>' +
+      '<div class="simple-stat"><div class="label">观察跟进</div><div class="value" style="color:var(--c4)">' + observeCount + '</div><div class="note">缺验真、趋势、讨论、素材或供应链</div></div>' +
+      '<div class="simple-stat"><div class="label">不碰</div><div class="value" style="color:var(--c5)">' + avoidCount + '</div><div class="note">风险、毛利或证据不成立</div></div>' +
+      '<div class="simple-stat"><div class="label">严格验真</div><div class="value" style="color:var(--c6)">' + (stats.traffic_validated_products || 0) + '</div><div class="note">至少2类平台证据</div></div>' +
+    '</div>';
+  const principle = (workbench.principle || [])[0] || '28原则：先验证流量和供应链，只做少数可赚钱动作。';
+  $('auto-intel-body').innerHTML =
+    '<div style="padding:12px 1.25rem 0"><div class="simple-card"><h2>今天只看这件事</h2><p>' + esc(principle) + '</p><p>绿色是立即上架DRAFT；黄色只观察跟进；红色不碰。所有绿色仍需人工核实COGS、库存、合规后才能发布。</p></div></div>' +
+    '<div style="padding:12px 1.25rem 0">' + statsHtml + '</div>' +
+    '<div class="simple-list">' +
+    actions.slice(0, 12).map(function(a) {
+      const pareto = a.pareto || {};
+      const unit = a.unit_economics || {};
+      const supply = pareto.supply_chain || {};
+      const traffic = pareto.traffic_sources || [];
+      const strategy = pareto.traffic_strategy || {};
+      const truth = pareto.truth_check || {};
+      const triage = pareto.launch_triage || {};
+      const triageValidation = triage.validation || {};
+      const clone = pareto.landing_page_clone || {};
+      const gaps = pareto.evidence_gaps || [];
+      const routes = supply.routes || [];
+      const routeLinks = routes.slice(0, 2).map(function(route) {
+        return '<a target="_blank" href="' + esc(route.url || '#') + '" style="color:var(--c6);text-decoration:none">' + esc(route.name || '') + '</a>';
+      }).join(' / ');
+      const tactic = ((strategy.tactics || [])[0] || {}).play || firstTraffic(traffic);
+      const cloneHtml = sectionHtml(clone.copy_structure || [], '先拆竞品首屏 / Offer / FAQ / Bundle');
+      const neverCopy = (clone.never_copy || [])[0] || '不能复制竞品图片、视频、文案、评价和品牌词';
+      const next = shortText(pareto.one_action || a.next_action || '', 170);
+      const triageLevel = triage.level || 'observe';
+      const triageClass = triageLevel === 'launch_now' ? 'triage-launch' : (triageLevel === 'avoid' ? 'triage-avoid' : 'triage-observe');
+      const itemTriageClass = triageLevel === 'launch_now' ? 'launch-now' : (triageLevel === 'avoid' ? 'avoid' : 'observe');
+      const pClass = laneClass(pareto.lane || '');
+      const eligibleReplica = triage.can_upload_draft === true;
+      const applyDisabled = eligibleReplica ? '' : ' disabled title="' + shortText(triage.one_line || '未达到立即上架门槛：先补验真、经济性或供应链证据', 120) + '"';
+      const replicaAttrs = ' data-url="' + esc(a.product_url || '') + '" data-rank="' + esc(a.rank || '') + '"';
+      const replicaBtns = '<div class="simple-actions">' +
+        '<button class="btn-replica" ' + replicaAttrs + ' onclick="previewShopifyReplica(this)">草稿预览</button>' +
+        '<button class="btn-replica apply" ' + replicaAttrs + applyDisabled + ' onclick="applyShopifyReplica(this)">上传DRAFT</button>' +
+      '</div>';
+      const missing = (triage.missing && triage.missing[0]) || (truth.missing && truth.missing[0]) || gaps[0] || '';
+      return '<div class="simple-item ' + itemClass(pareto.lane || '') + ' ' + itemTriageClass + '">' +
+        '<div><a class="simple-title" target="_blank" href="' + esc(a.product_url || '#') + '">#' + (a.rank || '') + ' ' + esc(a.title || '') + '</a>' +
+          '<div class="simple-meta">' + esc(a.domain || '') + ' · $' + Number(a.price || 0).toLocaleString() + ' · ' + esc(a.product_type || '') + '</div>' +
+          '<span class="triage-pill ' + triageClass + '">' + esc(triage.label || '观察跟进') + '</span>' +
+          '<div class="triage-proof">验真 ' + (triageValidation.strict_count || pareto.real_validation_count || 0) + '/' + (triageValidation.required_count || pareto.required_validation_count || 2) +
+            ' · 经济 ' + (triageValidation.economics_ready ? '过' : '缺') +
+            ' · 供应链 ' + (triageValidation.supply_ready ? '过' : '缺') +
+            ' · 素材 ' + (triageValidation.assets_ready ? '过' : '缺') + '</div>' +
+          '<span class="pareto-pill ' + pClass + '">' + esc(pareto.decision || '') + '</span>' +
+          '<div class="simple-meta">验真 ' + (pareto.real_validation_count || 0) + '/' + (pareto.required_validation_count || 2) + ' · BE CPA $' + Number(unit.break_even_cpa || 0).toLocaleString() + '</div>' +
+          '<div class="simple-text" style="margin-top:4px"><strong>' + shortText(triage.one_line || '', 115) + '</strong></div>' +
+          (missing ? '<div class="simple-gap">缺：' + shortText(missing, 92) + '</div>' : '') + '</div>' +
+        '<div><div class="simple-label">流量从哪来</div><div class="simple-text">' + sourceHtml(traffic) + '</div><div class="simple-gap">打法：' + shortText(tactic, 95) + '</div></div>' +
+        '<div><div class="simple-label">页面学什么</div><div class="simple-text">' + cloneHtml + '</div><div class="safe-copy">只抄结构：' + shortText(neverCopy, 78) + '</div></div>' +
+        '<div><div class="simple-label">供应链 + 今天动作</div><div class="simple-text"><strong>' + esc(supply.keyword || '待找货') + '</strong><div class="meta-row">' + esc(supply.status || '') + '</div><div class="meta-row">' + routeLinks + '</div></div><div class="compact-action" style="margin-top:6px">' + next + '</div>' + replicaBtns + '</div>' +
+      '</div>';
+    }).join('') + '</div>';
+}
+
+function renderAutoIntel(r) {
+  if (!r || !r.ok) {
+    $('auto-intel-count').textContent = '';
+    $('auto-intel-summary').innerHTML = '<span style="color:var(--t3)">' + esc((r && r.error) || '暂无自动智能结果，请先运行') + '</span>';
+    $('auto-intel-body').innerHTML = '<div class="empty"><p>暂无自动智能结果</p></div>';
+    return;
+  }
+  const stats = r.stats || {};
+  const trendSummary = r.trend_summary || {};
+  const top = r.top_products || [];
+  const trendProvider = trendSummary.provider ? ' · 趋势源 ' + esc(trendSummary.provider) : '';
+  const trendCheckedAt = r.trend_checked_at || trendSummary.checked_at || '';
+  $('auto-intel-count').textContent = 'Top ' + top.length + ' / 候选 ' + (stats.qualified_candidates || 0);
+  $('auto-intel-summary').innerHTML =
+    '生成时间 <span class="ts">' + esc(r.generated_at || '') + '</span>' +
+    ' · 扫描商品 ' + (stats.recent_products || 0).toLocaleString() +
+    ' · FB 域名 ' + (stats.fb_signal_domains || 0).toLocaleString() +
+    ' · 8000精验 ' + (stats.fb_exact_verify_checked || 0).toLocaleString() +
+    ' / 命中 ' + (stats.fb_exact_verify_matched || 0).toLocaleString() +
+    ' / 未命中 ' + (stats.fb_exact_verify_not_found || 0).toLocaleString() +
+    ' · Trends ' + (stats.trend_verified_products || 0).toLocaleString() +
+    '/' + (stats.trend_checked_products || 0).toLocaleString() +
+    ' · 代理 ' + (stats.trend_proxy_products || 0).toLocaleString() +
+    trendProvider +
+    (trendCheckedAt ? ' · 趋势时间 <span class="ts">' + esc(trendCheckedAt) + '</span>' : '') +
+    ' · 输出目录 <span class="ts">' + esc(r.output_dir || '') + '</span>';
+  if (!top.length) {
+    $('auto-intel-body').innerHTML = '<div class="empty"><p>暂无达到门槛的候选，可降低最低分数或扩大天数</p></div>';
+    return;
+  }
+  $('auto-intel-body').innerHTML =
+    '<table class="prod-table"><thead><tr><th>#</th><th>候选产品</th><th class="num">分数</th><th>可跟/时机</th><th class="num">价格</th><th class="num">FB</th><th>趋势</th><th>平台AI</th><th>赚钱判断</th><th>48h动作</th></tr></thead><tbody>' +
+    top.map(function(p, i) {
+      const fb = p.fb_signal || {};
+      const risks = p.risk_flags || [];
+      const expert = p.expert_assessment || {};
+      const money = p.money_decision || {};
+      const pai = p.platform_ai || money.platform_ai || {};
+      const evidence = money.evidence || {};
+      const gt = evidence.google_trends || p.trend_signal || {};
+      const plan = money.first_48h_test_plan || {};
+      const whyNow = money.why_now || [];
+      const whySell = money.why_will_sell || [];
+      const whyFail = money.why_may_fail || [];
+      const angles = plan.angles || [];
+      const followColor = money.follow_level === '强跟' ? 'var(--c2)' : (money.follow_level === '轻跟' ? 'var(--c4)' : (money.follow_level === '不跟' ? 'var(--c5)' : 'var(--t2)'));
+      const gtDir = gt.direction || gt.trend_direction || 'unverified';
+      const gtStatus = gt.status || gt.trend_status || 'unverified';
+      const gtQuality = gt.data_quality || gt.trend_data_quality || '未验证';
+      const gtScore = gt.verified || gtStatus === 'proxy' ? (gt.score || gt.trend_score || 0) : '--';
+      const gtClass = gtDir === 'up' ? 'trend-up' : (gtDir === 'down' ? 'trend-down' : 'trend-flat');
+      return '<tr>' +
+        '<td>' + (i + 1) + '</td>' +
+        '<td><a class="product-link" href="' + esc(p.product_url || '#') + '" target="_blank" title="' + esc(p.title || '') + '">' + esc(p.title || '') + '</a><div class="meta-row">' + esc(p.domain || '') + ' · ' + esc(p.product_type || '') + '</div></td>' +
+        '<td class="num" style="font-weight:700;color:' + ((p.score || 0) >= 82 ? 'var(--c2)' : ((p.score || 0) >= 60 ? 'var(--c4)' : 'var(--t3)')) + '">' + (p.score || 0) + '</td>' +
+        '<td><strong style="color:' + followColor + '">' + esc(money.follow_level || p.decision || '') + '</strong><div class="meta-row">' + esc(money.timing || p.ad_heat || '') + ' · ' + esc(p.decision || '') + '</div>' + (risks.length ? '<div class="meta-row" style="color:var(--c5)">' + esc(risks[0]) + '</div>' : '') + '</td>' +
+        '<td class="num highlight">$' + (p.price || 0).toLocaleString() + '</td>' +
+        '<td class="num">' + (fb.ad_creative_count || 0) + '</td>' +
+        '<td style="font-size:11px;color:var(--t2)"><span class="trend-badge ' + gtClass + '">' + esc(gtStatus) + ' ' + gtScore + '</span><div class="meta-row">' + esc((gt.query || gt.trend_query || '').slice(0, 60)) + '</div><div class="meta-row">' + esc(gtQuality) + '</div></td>' +
+        '<td class="num"><strong style="color:var(--c6)">' + (pai.automation_score || 0) + '</strong><div class="meta-row">' + esc(pai.readiness || '') + '</div></td>' +
+        '<td style="font-size:11px;color:var(--t2)"><strong style="color:var(--t1)">' + esc((whySell[0] || whyNow[0] || expert.archetype || '')) + '</strong><div class="meta-row">' + esc((whyNow[1] || whySell[1] || expert.meta_launch_tier || '')) + '</div>' + (whyFail.length ? '<div class="meta-row" style="color:var(--c5)">' + esc(whyFail[0]) + '</div>' : '') + '</td>' +
+        '<td style="font-size:11px;color:var(--t2)"><strong style="color:var(--t1)">' + esc(plan.budget || '') + '</strong><div class="meta-row">' + esc((angles[0] || money.next_action || '').slice(0, 120)) + '</div></td>' +
+      '</tr>';
+    }).join('') + '</tbody></table>';
+}
+
+async function loadProfitPipelineReport() {
+  try {
+    const r = await api('/api/v2/workbench/report');
+    const box = $('auto-intel-artifact');
+    box.style.display = 'block';
+    box.textContent = typeof r.content === 'string' ? r.content : JSON.stringify(r.content, null, 2);
+  } catch(e) {
+    $('auto-intel-artifact').style.display = 'block';
+    $('auto-intel-artifact').textContent = '读取失败: ' + e.message;
+  }
+}
+
+async function loadProfitTestOrders() {
+  try {
+    const r = await api('/api/v2/workbench/test-orders');
+    const box = $('auto-intel-artifact');
+    box.style.display = 'block';
+    box.textContent = typeof r.content === 'string' ? r.content : JSON.stringify(r.content, null, 2);
+  } catch(e) {
+    $('auto-intel-artifact').style.display = 'block';
+    $('auto-intel-artifact').textContent = '读取失败: ' + e.message;
+  }
+}
+
+async function loadShopifyReplicaLatest() {
+  try {
+    const r = await api('/api/v2/shopify/replica-draft/latest');
+    const box = $('auto-intel-artifact');
+    box.style.display = 'block';
+    box.textContent = JSON.stringify(r, null, 2);
+  } catch(e) {
+    $('auto-intel-artifact').style.display = 'block';
+    $('auto-intel-artifact').textContent = '读取失败: ' + e.message;
+  }
+}
+
+async function previewShopifyReplica(btn) {
+  const original = btn.textContent;
+  const productUrl = btn.getAttribute('data-url') || '';
+  btn.disabled = true;
+  btn.textContent = '生成中...';
+  try {
+    const r = await api('/api/v2/shopify/replica-draft/preview?product_url=' + encodeURIComponent(productUrl), {method: 'POST'});
+    const box = $('auto-intel-artifact');
+    box.style.display = 'block';
+    box.textContent = JSON.stringify(r, null, 2);
+    btn.textContent = r.ok ? '已预览' : '被拦截';
+  } catch(e) {
+    $('auto-intel-artifact').style.display = 'block';
+    $('auto-intel-artifact').textContent = '生成失败: ' + e.message;
+    btn.textContent = '失败';
+  } finally {
+    setTimeout(function() {
+      btn.textContent = original;
+      btn.disabled = false;
+    }, 1800);
+  }
+}
+
+async function applyShopifyReplica(btn) {
+  const productUrl = btn.getAttribute('data-url') || '';
+  if (!confirm('只会创建 Shopify DRAFT 草稿；不会发布。确认已满足2类验真，并会人工检查素材、COGS、供应链和合规？')) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '上传中...';
+  try {
+    const r = await api('/api/v2/shopify/replica-draft/apply?product_url=' + encodeURIComponent(productUrl), {method: 'POST'});
+    const box = $('auto-intel-artifact');
+    box.style.display = 'block';
+    box.textContent = JSON.stringify(r, null, 2);
+    btn.textContent = r.ok ? '已上传DRAFT' : '上传被挡';
+  } catch(e) {
+    $('auto-intel-artifact').style.display = 'block';
+    $('auto-intel-artifact').textContent = '上传失败: ' + e.message;
+    btn.textContent = '失败';
+  } finally {
+    setTimeout(function() {
+      btn.textContent = original;
+      btn.disabled = false;
+    }, 2200);
+  }
+}
+
+async function loadV2Blueprint() {
+  try {
+    const r = await api('/api/v2/workbench/blueprint');
+    const box = $('auto-intel-artifact');
+    box.style.display = 'block';
+    box.textContent = JSON.stringify(r.blueprint || r, null, 2);
+  } catch(e) {
+    $('auto-intel-artifact').style.display = 'block';
+    $('auto-intel-artifact').textContent = '读取失败: ' + e.message;
+  }
+}
+
+async function evaluatePostTest() {
+  const payload = {
+    price: parseFloat($('eval-price').value) || 0,
+    spend: parseFloat($('eval-spend').value) || 0,
+    impressions: parseInt($('eval-impressions').value) || 0,
+    clicks: parseInt($('eval-clicks').value) || 0,
+    add_to_cart: parseInt($('eval-atc').value) || 0,
+    purchases: parseInt($('eval-purchases').value) || 0,
+    revenue: parseFloat($('eval-revenue').value) || 0
+  };
+  try {
+    const r = await api('/api/v2/workbench/evaluate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const decisionColor = r.decision && r.decision.indexOf('kill') >= 0 ? 'var(--c5)' : (r.decision && r.decision.indexOf('scale') >= 0 ? 'var(--c2)' : 'var(--c4)');
+    $('eval-result').innerHTML = '<strong style="color:' + decisionColor + '">' + esc(r.decision || '') + '</strong> · ' + esc(((r.actions || [])[0] || '').slice(0, 120));
+    const box = $('auto-intel-artifact');
+    box.style.display = 'block';
+    box.textContent = JSON.stringify(r, null, 2);
+  } catch(e) {
+    $('eval-result').innerHTML = '<span style="color:var(--c5)">评估失败: ' + esc(e.message) + '</span>';
+  }
+}
+
+async function loadAutoArtifact(kind) {
+  const endpoint = {board:'board', report:'report', drafts:'drafts', briefs:'briefs', prompt:'prompt'}[kind] || 'report';
+  try {
+    const r = await api('/api/auto-intel/' + endpoint);
+    const box = $('auto-intel-artifact');
+    box.style.display = 'block';
+    box.textContent = typeof r.content === 'string' ? r.content : JSON.stringify(r.content, null, 2);
+  } catch(e) {
+    $('auto-intel-artifact').style.display = 'block';
+    $('auto-intel-artifact').textContent = '读取失败: ' + e.message;
+  }
+}
+
+// 默认只进入28跟品工作台；普通新品池放到辅助入口手动加载。
+switchV2Tab('autointel');
+pollV2DailyMonitor();
+pollV2AutoPilotStatus();
+</script>
+</body>
+</html>""")
+
+# ═══════════════════════════════════════════════════════════
+#  专业仪表盘 HTML（全中文）
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/", response_class=HTMLResponse)
+def profit_command_dashboard():
+    return HTMLResponse(r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>赚钱优先竞品监控台</title>
+<style>
+:root{--bg:#f6f7f4;--panel:#ffffff;--ink:#18201f;--muted:#66716f;--line:#dfe5df;--soft:#eef2ec;--green:#12805c;--amber:#b7791f;--red:#c2413a;--blue:#2563eb;--teal:#0f766e;--shadow:0 10px 28px rgba(24,32,31,.08)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}
+a{color:var(--blue);text-decoration:none}
+a:hover{text-decoration:underline}
+.topbar{height:56px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.92);backdrop-filter:blur(12px);position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;padding:0 20px;gap:16px}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.mark{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,var(--green),var(--teal));box-shadow:0 6px 16px rgba(18,128,92,.2)}
+.brand h1{margin:0;font-size:17px;line-height:1.1;white-space:nowrap}
+.brand span{font-size:12px;color:var(--muted);white-space:nowrap}
+.actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+button,.linkbtn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:8px 12px;font-size:12px;font-weight:700;cursor:pointer;min-height:34px}
+button:hover,.linkbtn:hover{border-color:#b9c5bd;text-decoration:none}
+button.primary{background:var(--green);border-color:var(--green);color:#fff}
+button.warning{background:#fff6df;border-color:#f2d28a;color:#7a4b08}
+button:disabled{opacity:.55;cursor:not-allowed}
+main{max-width:1500px;margin:0 auto;padding:20px}
+.headline{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin:4px 0 16px}
+.headline h2{margin:0 0 6px;font-size:24px;letter-spacing:0}
+.headline p{margin:0;color:var(--muted);max-width:760px}
+.status{font-size:12px;color:var(--muted);text-align:right;min-width:240px}
+.status strong{color:var(--ink)}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:13px 14px;box-shadow:var(--shadow);min-height:86px}
+.kpi .label{font-size:11px;color:var(--muted);letter-spacing:.2px;margin-bottom:6px}
+.kpi .value{font-size:27px;font-weight:800;line-height:1;color:var(--ink);white-space:nowrap}
+.kpi .note{font-size:11px;color:var(--muted);margin-top:8px;min-height:16px}
+.kpi.good .value{color:var(--green)}.kpi.warn .value{color:var(--amber)}.kpi.bad .value{color:var(--red)}.kpi.info .value{color:var(--blue)}
+.grid{display:grid;grid-template-columns:330px minmax(0,1fr);gap:14px;align-items:start}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);overflow:hidden}
+.panel-head{padding:13px 15px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px;background:#fbfcfa}
+.panel-head h3{margin:0;font-size:14px}
+.badge{font-size:11px;color:var(--muted);background:var(--soft);border:1px solid var(--line);border-radius:999px;padding:3px 8px;white-space:nowrap}
+.brief{margin-bottom:14px}
+.brief-body{padding:14px 15px;display:grid;gap:12px}
+.brief-call{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;border-bottom:1px solid var(--line);padding-bottom:12px}
+.brief-call h3{margin:0 0 5px;font-size:18px;line-height:1.25}
+.brief-call p{margin:0;color:var(--muted);font-size:12px}
+.brief-grid{display:grid;grid-template-columns:1.1fr 1fr 1fr 1fr;gap:12px}
+.brief-block{border-left:3px solid var(--green);padding:2px 0 2px 11px;min-width:0}
+.brief-block.warn{border-left-color:var(--amber)}.brief-block.info{border-left-color:var(--blue)}
+.brief-title{font-size:11px;color:var(--muted);font-weight:900;margin-bottom:7px}
+.brief-item{font-size:12px;font-weight:800;color:var(--ink);margin-bottom:7px;overflow-wrap:anywhere}
+.brief-line{font-size:12px;color:var(--ink);margin-bottom:7px;overflow-wrap:anywhere}
+.brief-line:last-child,.brief-item:last-child{margin-bottom:0}
+.lane-list{padding:10px;display:grid;gap:8px}
+.lane{width:100%;display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;text-align:left;background:#fff;border:1px solid var(--line);border-radius:8px;padding:11px 12px}
+.lane.active{border-color:var(--green);box-shadow:0 0 0 3px rgba(18,128,92,.1)}
+.lane .name{font-weight:800;font-size:13px}
+.lane .hint{font-size:11px;color:var(--muted);margin-top:3px;font-weight:500}
+.lane .count{font-size:20px;font-weight:900}
+.lane.good .count{color:var(--green)}.lane.warn .count{color:var(--amber)}.lane.bad .count{color:var(--red)}.lane.info .count{color:var(--blue)}
+.rounds{display:grid;gap:8px;padding:0 10px 12px}
+.round{border:1px solid var(--line);border-radius:8px;background:#fbfcfa;padding:10px 11px}
+.round .top{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:800}
+.round .flow{color:var(--green);font-size:18px;font-weight:900;margin:4px 0}
+.round .rule{font-size:11px;color:var(--muted)}
+.insights{margin-bottom:14px}
+.insight-body{padding:12px 15px;display:grid;gap:12px}
+.principle{font-size:13px;font-weight:800;color:var(--ink);background:#f6fbf6;border:1px solid #cce6d6;border-radius:8px;padding:10px 12px}
+.equation{font-size:12px;font-weight:900;color:#14342b;background:#eef8f1;border:1px solid #bfe2ca;border-radius:8px;padding:10px 12px}
+.logic-details{border-top:1px solid var(--line);padding-top:10px}
+.logic-details summary{cursor:pointer;font-size:12px;font-weight:900;color:var(--green);list-style:none}
+.logic-details summary::-webkit-details-marker{display:none}
+.logic-details summary:after{content:"展开";float:right;color:var(--muted);font-weight:700}
+.logic-details[open] summary:after{content:"收起"}
+.logic-deep{display:grid;gap:12px;margin-top:10px}
+.alert-strip{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.alert{border:1px solid var(--line);border-radius:8px;background:#fff;padding:10px 11px;min-height:82px}
+.alert .top{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:5px}
+.alert .label{font-size:11px;color:var(--muted);font-weight:800}
+.alert .value{font-size:18px;font-weight:900;color:var(--blue);font-variant-numeric:tabular-nums}
+.alert .text{font-size:11px;color:var(--ink)}
+.insight-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.insight{border:1px solid var(--line);border-radius:8px;background:#fff;padding:10px 11px;min-height:138px}
+.insight .name{font-size:13px;font-weight:900;margin-bottom:6px;color:var(--ink)}
+.insight .watch{font-size:11px;color:var(--muted);margin-bottom:7px}
+.insight .money{font-size:12px;color:var(--ink);font-weight:700;margin-bottom:7px}
+.insight .action{font-size:11px;color:var(--muted)}
+.first-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.first-card{border:1px solid #d8e8de;background:#fbfefb;border-radius:8px;padding:10px 11px;min-height:154px}
+.first-card .name{font-size:13px;font-weight:900;margin-bottom:6px;color:#153b2e}
+.first-card .axiom{font-size:12px;font-weight:800;color:var(--ink);margin-bottom:7px}
+.first-card .watch{font-size:11px;color:var(--muted);margin-bottom:7px}
+.first-card .decision{font-size:11px;color:var(--green);font-weight:800}
+.principle-rule-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.principle-rule{border:1px solid #dce7dc;background:#f8fbf6;border-radius:8px;padding:9px 10px;font-size:11px;color:#244036;font-weight:800}
+.rule-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.lane-rule{border:1px solid #d8e2f8;background:#f4f7ff;border-radius:8px;padding:9px 10px;font-size:11px;color:#27406f}
+.lane-rule strong{display:block;font-size:12px;color:#19325f;margin-bottom:4px}
+.source-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px}
+.source-card{display:block;border:1px solid #e1e6df;background:#fff;border-radius:8px;padding:9px 10px;min-height:86px;text-decoration:none;color:var(--ink)}
+.source-card:hover{border-color:#b9c5bd;text-decoration:none}
+.source-card strong{display:block;font-size:12px;color:var(--blue);margin-bottom:5px}
+.source-card span{display:block;font-size:11px;color:var(--muted)}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.search{min-width:220px;flex:1;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;color:var(--ink);background:#fff}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{position:sticky;top:56px;background:#fbfcfa;color:var(--muted);text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);font-size:11px;z-index:5}
+td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:hover td{background:#fbfcfa}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.product{font-weight:800;color:var(--ink);display:block;max-width:430px;white-space:normal;overflow-wrap:anywhere}
+.domain{font-size:11px;color:var(--muted);margin-top:3px;overflow-wrap:anywhere}
+.chip{display:inline-flex;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:900;white-space:nowrap;border:1px solid transparent}
+.chip.good{background:#e7f6ee;color:var(--green);border-color:#b9e5ce}
+.chip.warn{background:#fff5dc;color:var(--amber);border-color:#efd48d}
+.chip.bad{background:#ffe9e7;color:var(--red);border-color:#f2b7b1}
+.chip.info{background:#eaf1ff;color:var(--blue);border-color:#bed2ff}
+.reason{max-width:360px;white-space:normal;overflow-wrap:anywhere}
+.next{color:var(--muted);font-size:11px;margin-top:4px}
+.money-signal{font-weight:900;color:var(--ink)}
+.monitor-focus{color:var(--blue);font-size:11px;margin-top:4px}
+.first-check{color:var(--green);font-size:11px;margin-top:4px;font-weight:800}
+.row-action{font-weight:900;color:var(--ink)}
+.row-follow{color:var(--blue);font-size:11px;margin-top:4px}
+.row-test{color:var(--muted);font-size:11px;margin-top:4px}
+.decision-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px}
+.mini-tag{display:inline-flex;align-items:center;border:1px solid var(--line);background:#f8faf7;color:#33413d;border-radius:999px;padding:2px 6px;font-size:10px;font-weight:800;max-width:160px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.validation-line{font-size:11px;margin-top:5px;color:var(--ink);background:#f8fbf6;border:1px solid #dce7dc;border-radius:6px;padding:5px 7px}
+.validation-line strong{color:var(--green)}
+.validation-line.blocked strong{color:var(--red)}
+.validation-line .muted{color:var(--muted)}
+.scorecard{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.score-mini{display:inline-flex;align-items:center;gap:3px;border-radius:6px;padding:2px 5px;font-size:10px;font-weight:900;border:1px solid var(--line);background:#fff;color:var(--muted)}
+.score-mini.pass{border-color:#b9e5ce;background:#eaf7ef;color:var(--green)}
+.score-mini.warn{border-color:#efd48d;background:#fff6df;color:var(--amber)}
+.score-mini.block{border-color:#f2b7b1;background:#ffefed;color:var(--red)}
+.score-mini span{font-weight:800;color:inherit}
+.empty{padding:54px 20px;text-align:center;color:var(--muted)}
+.foot{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:14px;color:var(--muted);font-size:12px;flex-wrap:wrap}
+.progress{display:none;margin-bottom:14px}.progress.show{display:block}
+.progressbar{height:8px;background:var(--soft);border:1px solid var(--line);border-radius:999px;overflow:hidden}.progressbar div{height:100%;width:0;background:linear-gradient(90deg,var(--amber),var(--green));transition:width .25s}
+.autopilot{margin-bottom:14px}
+.autopilot-body{padding:13px 15px;display:grid;grid-template-columns:220px minmax(0,1fr) auto;gap:14px;align-items:center}
+.auto-score{display:flex;align-items:baseline;gap:7px}
+.auto-score .big{font-size:34px;line-height:1;font-weight:900;color:var(--green)}
+.auto-score .grade{font-size:13px;font-weight:900;color:var(--ink)}
+.auto-muted{font-size:11px;color:var(--muted);line-height:1.45;margin-top:4px}
+.auto-quality{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.auto-q{border:1px solid var(--line);border-radius:8px;background:#fbfcfa;padding:9px 10px;min-width:0}
+.auto-q .label{font-size:10px;color:var(--muted);font-weight:900;margin-bottom:4px}
+.auto-q .value{font-size:18px;font-weight:900;color:var(--ink)}
+.auto-q .note{font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.auto-actions{display:flex;gap:7px;justify-content:flex-end;flex-wrap:wrap}
+.auto-next{font-size:11px;color:var(--ink);margin-top:8px;display:flex;gap:6px;flex-wrap:wrap}
+.auto-pill{border:1px solid #cfe3d6;background:#f4fbf6;color:#1f4b37;border-radius:999px;padding:3px 8px;font-weight:800;max-width:360px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.platform-trends{margin-bottom:14px}
+.trend-body{padding:14px 15px;display:grid;gap:12px}
+.trend-call{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;border-bottom:1px solid var(--line);padding-bottom:12px}
+.trend-call strong{display:block;font-size:18px;line-height:1.25;margin-bottom:5px}
+.trend-call span{display:block;font-size:12px;color:var(--muted)}
+.trend-stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
+.trend-stat{border:1px solid var(--line);background:#fbfcfa;border-radius:8px;padding:10px 11px;min-height:76px}
+.trend-stat .label{font-size:10px;color:var(--muted);font-weight:900;margin-bottom:6px}
+.trend-stat .value{font-size:22px;font-weight:900;color:var(--ink);line-height:1}
+.trend-stat .note{font-size:10px;color:var(--muted);margin-top:7px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trend-lists{display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:10px}
+.trend-box{border:1px solid var(--line);background:#fff;border-radius:8px;padding:10px 11px;min-height:112px}
+.trend-title{font-size:11px;color:var(--muted);font-weight:900;margin-bottom:8px}
+.trend-chipline{display:flex;gap:6px;flex-wrap:wrap}
+.trend-chip{border:1px solid #cfe3d6;background:#f4fbf6;color:#1f4b37;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:900;max-width:240px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trend-chip.warn{border-color:#efd48d;background:#fff6df;color:#7a4b08}
+.trend-chip.info{border-color:#bed2ff;background:#eaf1ff;color:#1d4ed8}
+.tool-panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);overflow:hidden}
+.tool-body{padding:13px 15px;display:grid;gap:12px}
+.tool-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.tool-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.tool-metric{border:1px solid var(--line);background:#fbfcfa;border-radius:8px;padding:9px 10px;min-height:70px}
+.tool-metric .label{font-size:10px;color:var(--muted);font-weight:900;margin-bottom:5px}
+.tool-metric .value{font-size:22px;font-weight:900;color:var(--ink);line-height:1}
+.tool-metric .note{font-size:10px;color:var(--muted);margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tool-list{display:grid;gap:7px;max-height:220px;overflow:auto}
+.tool-row{border:1px solid var(--line);background:#fff;border-radius:8px;padding:8px 10px;font-size:11px;color:var(--ink)}
+.tool-row strong{display:block;font-size:12px;margin-bottom:4px}
+.tool-row .muted{color:var(--muted);line-height:1.35}
+.tool-form{display:grid;grid-template-columns:1.4fr 1fr;gap:8px}
+.tool-form input,.tool-form select{width:100%;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;color:var(--ink);background:#fff;min-height:34px}
+@media(max-width:1180px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}.grid,.trend-lists{grid-template-columns:1fr}.trend-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.status{text-align:left}.headline{flex-direction:column}.topbar{height:auto;align-items:flex-start;padding:12px 14px;flex-direction:column}.brief-call,.trend-call{flex-direction:column}.brief-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.alert-strip{grid-template-columns:repeat(2,minmax(0,1fr))}.insight-grid,.first-grid,.principle-rule-grid,.rule-grid,.source-grid{grid-template-columns:repeat(2,minmax(0,1fr))}th{top:0}}
+@media(max-width:1180px){.autopilot-body{grid-template-columns:1fr}.auto-actions{justify-content:flex-start}}
+@media(max-width:720px){main{padding:14px}.kpis,.tool-metrics,.trend-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.headline h2{font-size:20px}.actions{width:100%;justify-content:flex-start}.toolbar{align-items:stretch}.search{min-width:100%}.brief-grid,.alert-strip,.insight-grid,.first-grid,.principle-rule-grid,.rule-grid,.source-grid,.auto-quality,.tool-form{grid-template-columns:1fr}.table-wrap{overflow-x:auto}table{min-width:980px}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand">
+    <div class="mark" aria-hidden="true"></div>
+    <div><h1>赚钱优先竞品监控台</h1><span>每日看趋势，直接挑能测试的产品</span></div>
+  </div>
+  <div class="actions">
+    <button class="primary" id="btn-run" onclick="runDecision()">重算跟品判断</button>
+    <button class="warning" id="btn-refresh" onclick="startMonitorRefresh()">刷新竞品快照</button>
+    <a class="linkbtn" href="/daily-products">每日产品更新</a>
+    <a class="linkbtn" href="/v2">实战台</a>
+  </div>
+</div>
+<main>
+  <section class="headline">
+    <div>
+      <h2 id="money-call">正在读取竞品监控结果</h2>
+      <p id="money-sub">系统把新品、广告热度、价格带和品类集中成平台趋势；你先看趋势，再决定小预算测试。</p>
+    </div>
+    <div class="status" id="status-box">加载中</div>
+  </section>
+
+  <section class="progress panel" id="refresh-panel">
+    <div class="panel-head"><h3>后台刷新</h3><span class="badge" id="refresh-badge">idle</span></div>
+    <div style="padding:12px 15px">
+      <div style="display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--muted);margin-bottom:8px"><span id="refresh-message">等待刷新</span><span id="refresh-count">0/0</span></div>
+      <div class="progressbar"><div id="refresh-fill"></div></div>
+    </div>
+  </section>
+
+  <section class="panel autopilot" id="ai-panel">
+    <div class="panel-head"><h3>AI自动选品跟</h3><span class="badge" id="ai-badge">读取中</span></div>
+    <div class="autopilot-body">
+      <div>
+        <div class="auto-score"><span class="big" id="ai-score">--</span><span class="grade" id="ai-grade">--</span></div>
+        <div class="auto-muted" id="ai-label">自动选品、自动补证、自动输出跟品队列。</div>
+      </div>
+      <div>
+        <div class="auto-quality">
+          <div class="auto-q"><div class="label">数据精度</div><div class="value" id="ai-data-score">--</div><div class="note" id="ai-data-note">--</div></div>
+          <div class="auto-q"><div class="label">证据完整</div><div class="value" id="ai-evidence-score">--</div><div class="note" id="ai-evidence-note">--</div></div>
+          <div class="auto-q"><div class="label">判断可信</div><div class="value" id="ai-judge-score">--</div><div class="note" id="ai-judge-note">--</div></div>
+        </div>
+        <div class="auto-next" id="ai-next-actions"></div>
+      </div>
+      <div class="auto-actions">
+        <button id="btn-ai-toggle" onclick="toggleAutoPilot()">自动驾驶 --</button>
+        <button class="primary" id="btn-ai-run" onclick="runAutoPilotNow()">立即AI判断</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel platform-trends">
+    <div class="panel-head"><h3>平台趋势</h3><span class="badge" id="platform-trend-badge">读取中</span></div>
+    <div class="trend-body">
+      <div class="trend-call">
+        <div><strong id="platform-trend-headline">正在读取今日平台趋势</strong><span id="platform-trend-sub">从本地新品快照直接汇总品类、价格带、活跃店铺和高客单机会。</span></div>
+        <a class="linkbtn" href="/daily-products">打开每日产品更新</a>
+      </div>
+      <div class="trend-stats">
+        <div class="trend-stat"><div class="label">今日新品</div><div class="value" id="pt-new">--</div><div class="note" id="pt-new-note">平台更新量</div></div>
+        <div class="trend-stat"><div class="label">活跃店铺</div><div class="value" id="pt-domains">--</div><div class="note">今日有新品</div></div>
+        <div class="trend-stat"><div class="label">热门品类</div><div class="value" id="pt-cats">--</div><div class="note" id="pt-top-cat">--</div></div>
+        <div class="trend-stat"><div class="label">价格中位</div><div class="value" id="pt-median">--</div><div class="note" id="pt-avg">--</div></div>
+        <div class="trend-stat"><div class="label">高客单</div><div class="value" id="pt-high">--</div><div class="note">>= $100</div></div>
+        <div class="trend-stat"><div class="label">扫描覆盖</div><div class="value" id="pt-scan">--</div><div class="note" id="pt-scan-note">snapshot</div></div>
+      </div>
+      <div class="trend-lists">
+        <div class="trend-box"><div class="trend-title">品类趋势</div><div class="trend-chipline" id="pt-cat-list"></div></div>
+        <div class="trend-box"><div class="trend-title">价格带趋势</div><div class="trend-chipline" id="pt-price-list"></div></div>
+        <div class="trend-box"><div class="trend-title">平台信号</div><div class="trend-chipline" id="pt-signal-list"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="kpis">
+    <div class="kpi info"><div class="label">注册店铺</div><div class="value" id="k-stores">--</div><div class="note" id="k-store-note">真实域名池</div></div>
+    <div class="kpi info"><div class="label">已抓快照</div><div class="value" id="k-snapshots">--</div><div class="note" id="k-snapshot-note">已有产品数据</div></div>
+    <div class="kpi warn"><div class="label">待扫队列</div><div class="value" id="k-queue">--</div><div class="note" id="k-queue-note">按优先级分批扫</div></div>
+    <div class="kpi"><div class="label">百万目标</div><div class="value" id="k-target">--</div><div class="note" id="k-target-note">容量目标</div></div>
+    <div class="kpi info"><div class="label">监控产品</div><div class="value" id="k-products">--</div><div class="note">已抓库覆盖</div></div>
+    <div class="kpi good"><div class="label">强趋势跟</div><div class="value" id="k-follow">--</div><div class="note">优先测试</div></div>
+    <div class="kpi warn"><div class="label">跟进池</div><div class="value" id="k-prepare">--</div><div class="note">轻跟/补证</div></div>
+    <div class="kpi bad"><div class="label">硬风险</div><div class="value" id="k-avoid">--</div><div class="note">暂不跟</div></div>
+  </section>
+
+  <section class="panel brief">
+    <div class="panel-head"><h3>今日跟品作战</h3><span class="badge" id="brief-mode">--</span></div>
+    <div class="brief-body">
+      <div class="brief-call">
+        <div><h3 id="brief-headline">正在生成作战摘要</h3><p id="brief-lane">只输出该做的动作，不堆信息。</p></div>
+        <span class="badge" id="brief-count">--</span>
+      </div>
+      <div class="brief-grid">
+        <div class="brief-block"><div class="brief-title">跟哪些</div><div id="brief-follow"></div></div>
+        <div class="brief-block warn"><div class="brief-title">今天做什么</div><div id="brief-do"></div></div>
+        <div class="brief-block info"><div class="brief-title">平台趋势</div><div id="brief-how"></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <aside class="panel">
+      <div class="panel-head"><h3>决策队列</h3><span class="badge" id="lane-total">--</span></div>
+      <div class="lane-list">
+        <button class="lane good active" data-lane="can_follow_now" onclick="setLane('can_follow_now')"><span><span class="name">强趋势跟</span><span class="hint">趋势/广告/验真强，优先准备测试</span></span><span class="count" id="c-follow">0</span></button>
+        <button class="lane warn" data-lane="can_prepare" onclick="setLane('can_prepare')"><span><span class="name">轻跟先拆</span><span class="hint">新品可跟，先拆素材/供应链/价格锚点</span></span><span class="count" id="c-prepare">0</span></button>
+        <button class="lane info" data-lane="need_proof" onclick="setLane('need_proof')"><span><span class="name">补证跟</span><span class="hint">新品入池，自动补趋势/广告/社区证据</span></span><span class="count" id="c-proof">0</span></button>
+        <button class="lane bad" data-lane="cannot_follow" onclick="setLane('cannot_follow')"><span><span class="name">硬风险暂不跟</span><span class="hint">只拦合规/IP/履约/确定亏损</span></span><span class="count" id="c-avoid">0</span></button>
+        <button class="lane" data-lane="low_priority" onclick="setLane('low_priority')"><span><span class="name">低趋势监控</span><span class="hint">还在跟进池，等趋势或证据升级</span></span><span class="count" id="c-low">0</span></button>
+      </div>
+      <div class="panel-head"><h3>三轮过滤</h3><span class="badge">28 闭环</span></div>
+      <div class="rounds" id="rounds"></div>
+    </aside>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h3 id="table-title">可以跟</h3>
+        <div class="toolbar">
+          <input class="search" id="filter" placeholder="筛产品或域名" oninput="renderTable()">
+          <span class="badge" id="table-count">--</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th style="width:42px">#</th>
+            <th>产品 / 竞品</th>
+            <th>状态</th>
+            <th class="num">价格</th>
+            <th class="num">优先级</th>
+            <th class="num">广告</th>
+            <th>验真</th>
+            <th class="num">目标 CPA</th>
+            <th class="num">保本 CPA</th>
+            <th>平台趋势</th>
+          </tr></thead>
+          <tbody id="tbody"><tr><td colspan="10"><div class="empty">加载中</div></td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </section>
+  <div class="foot">
+    <span id="source-time">--</span>
+    <span>规则：未过利润、广告、验真、供应链和素材门槛的产品，不自动进入 Shopify 上架。</span>
+  </div>
+</main>
+<script>
+const state = {data:null,lane:'can_follow_now'};
+const laneMeta = {
+  can_follow_now:['强趋势跟','good'],
+  can_prepare:['轻跟先拆','warn'],
+  need_proof:['补证跟','info'],
+  cannot_follow:['硬风险暂不跟','bad'],
+  low_priority:['低趋势监控','']
+};
+function $(id){return document.getElementById(id)}
+function h(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function n(v){return Number(v||0).toLocaleString()}
+function money(v){const x=Number(v||0);return x?'$'+x.toLocaleString(undefined,{maximumFractionDigits:2}):'--'}
+function shortTime(v){
+  if(!v) return '--';
+  const d=new Date(v);
+  if(Number.isNaN(d.getTime())) return String(v).slice(0,19).replace('T',' ');
+  return d.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+}
+function scoreLabel(state){return state==='pass'?'过':(state==='block'?'挡':'补')}
+function renderDecisionTags(tags){
+  return (tags||[]).slice(0,12).map(t=>'<span class="mini-tag" title="'+h(t)+'">'+h(t)+'</span>').join('');
+}
+function renderScorecard(cards){
+  return (cards||[]).slice(0,5).map(c=>{
+    const state=(c.state||'warn');
+    return '<span class="score-mini '+h(state)+'" title="'+h(c.reason||c.text||'')+'">'+h(c.label||'项')+'<span>'+h(scoreLabel(state))+'</span></span>';
+  }).join('');
+}
+function renderValidationLine(x){
+  const v=(x.validation_summary||((x.judgement_fields||{}).validation)||{});
+  const required=Number(v.required_count||0), verified=Number(v.verified_count||0), blocking=Number(v.blocking_count||0);
+  if(!required) return '';
+  const pending=(((x.judgement_fields||{}).validation||{}).pending_slots||[]).slice(0,3).map(s=>s.short||s.label||s.key).filter(Boolean).join(' / ');
+  const next=String(v.next_action||((x.validation_tasks||[])[0])||'补齐未验证证据').slice(0,92);
+  const cls=blocking?' blocked':'';
+  const missing=pending?'<span class="muted"> · 待验 '+h(pending)+'</span>':'';
+  return '<div class="validation-line'+cls+'"><strong>必验 '+verified+'/'+required+'</strong> · 阻塞 '+blocking+missing+'<div class="muted">待补：'+h(next)+'</div></div>';
+}
+async function json(path, opts={}){
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), opts.timeoutMs || 30000);
+  const fetchOpts = {...opts, signal: controller.signal};
+  delete fetchOpts.timeoutMs;
+  try{
+    const r = await fetch(path, fetchOpts);
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return await r.json();
+  }finally{clearTimeout(timer)}
+}
+function setStatus(text){$('status-box').innerHTML=text}
+let aiTimer=null;
+function renderAutoPilotStatus(s){
+  if(!s) return;
+  const a=s.last_assessment||s.data_precision||{};
+  const data=s.data_quality||a.data_quality||{};
+  const evidence=s.evidence_quality||a.evidence_quality||{};
+  const judge=s.judgement_quality||a.judgement_quality||{};
+  const q=s.auto_selection_summary||{};
+  const qc=q.counts||{};
+  const score=Number(a.precision_score||s.precision_score||0);
+  const enabled=!!s.enabled;
+  const active=!!s.active_run;
+  $('ai-score').textContent=score?String(score):'--';
+  $('ai-grade').textContent=(a.precision_grade||s.precision_grade||'--')+' · '+(enabled?(active?'运行中':'已开启'):'已关闭');
+  $('ai-label').textContent=(s.message||q.decision||a.precision_label||'AI自动选品跟巡航中')+' · 下次 '+shortTime(s.next_check_at);
+  $('ai-badge').textContent=(s.state||'idle')+(s.running?' · 巡航':'');
+  $('ai-data-score').textContent=data.score!=null?String(data.score):'--';
+  $('ai-data-note').textContent=(data.label||'--')+' · 活跃 '+n(data.active_1d)+'/'+n(data.stores);
+  $('ai-evidence-score').textContent=evidence.score!=null?String(evidence.score):'--';
+  $('ai-evidence-note').textContent=(evidence.label||'--')+' · Trends '+n(evidence.trend_verified_products)+'/'+n(evidence.trend_checked_products);
+  $('ai-judge-score').textContent=judge.score!=null?String(judge.score):'--';
+  $('ai-judge-note').textContent=(judge.label||'--')+' · 队列 可跟'+n(qc.follow_now)+' 先拆'+n(qc.teardown_first)+' 补证'+n(qc.prove_first)+' 不碰'+n(qc.do_not_follow);
+  const next=(s.next_auto_actions||a.next_auto_actions||[]).slice(0,3);
+  $('ai-next-actions').innerHTML=(next.length?next:['维持巡航，等待新证据触发自动动作']).map(x=>'<span class="auto-pill">'+h(x)+'</span>').join('');
+  const toggle=$('btn-ai-toggle');
+  toggle.textContent=enabled?(active?'AI运行中':'关闭AI自动选品'):'开启AI自动选品';
+  toggle.disabled=active;
+  $('btn-ai-run').disabled=active;
+}
+async function pollAutoPilotStatus(){
+  clearTimeout(aiTimer);
+  try{
+    const s=await json('/api/ai-autopilot/status',{timeoutMs:20000});
+    renderAutoPilotStatus(s);
+  }catch(e){
+    $('ai-badge').textContent='读取失败';
+    $('ai-label').textContent=e.message;
+  }
+  aiTimer=setTimeout(pollAutoPilotStatus,15000);
+}
+async function toggleAutoPilot(){
+  const btn=$('btn-ai-toggle'); btn.disabled=true;
+  try{
+    const current=await json('/api/ai-autopilot/status',{timeoutMs:20000});
+    const endpoint=current.enabled?'/api/ai-autopilot/stop':'/api/ai-autopilot/start?interval_seconds=60&smart_refresh_limit=180&full_refresh_hours=24&workbench_limit=50&trend_top_n=50&trend_geo=US&run_now=true';
+    const s=await json(endpoint,{method:'POST',timeoutMs:30000});
+    renderAutoPilotStatus(s);
+  }catch(e){
+    $('ai-label').textContent='自动驾驶切换失败：'+e.message;
+  }finally{
+    btn.disabled=false;
+    pollAutoPilotStatus();
+  }
+}
+async function runAutoPilotNow(){
+  const btn=$('btn-ai-run'); btn.disabled=true; btn.textContent='AI判断中';
+  try{
+    const s=await json('/api/ai-autopilot/run-now',{method:'POST',timeoutMs:30000});
+    renderAutoPilotStatus(s);
+  }catch(e){
+    $('ai-label').textContent='立即AI判断失败：'+e.message;
+  }finally{
+    btn.textContent='立即AI判断';
+    pollAutoPilotStatus();
+  }
+}
+function renderPrecisionAudit(audit){
+  const summary=(audit&&audit.summary)||{};
+  const focus=(audit&&audit.focus_domains)||[];
+  $('precision-score').textContent=summary.avg_precision_score!=null?String(summary.avg_precision_score):'--';
+  $('precision-low').textContent=n(summary.low_precision_domains||0);
+  $('precision-stale').textContent=n(summary.stale_domains||0);
+  $('precision-products').textContent=n(summary.loaded_products||0);
+  $('precision-badge').textContent=audit&&audit.ok?'已体检':'待体检';
+  $('precision-status').textContent=audit&&audit.ok
+    ? '已找到 '+n(focus.length)+' 个优先补抓域名'
+    : ((audit&&audit.error)||'自动找图片、价格、描述缺口最大的店铺。');
+  $('precision-domains').innerHTML=(focus.length?focus.slice(0,6):[]).map(item=>{
+    const issues=item.issues||{};
+    const reasons=(item.refresh_reasons||[]).slice(0,3).join(' / ');
+    return '<div class="tool-row"><strong>'+h(item.domain||'')+' · '+h(item.precision_score||0)+'分</strong><div class="muted">缺图 '+n(issues.missing_images||0)+' · 图少 '+n(issues.thin_images||0)+' · 缺价 '+n(issues.missing_prices||0)+' · 描述薄 '+n(issues.thin_descriptions||0)+'</div><div class="muted">'+h(reasons||'建议刷新校准')+'</div></div>';
+  }).join('') || '<div class="tool-row"><strong>暂无低精度域名</strong><div class="muted">当前快照没有明显缺口，或还没有运行体检。</div></div>';
+}
+async function runPrecisionAudit(){
+  const btn=$('btn-precision-audit'); btn.disabled=true; btn.textContent='体检中';
+  $('precision-badge').textContent='体检中';
+  try{
+    const d=await json('/api/scrape-precision/audit?limit=12&refresh=true',{timeoutMs:90000});
+    renderPrecisionAudit(d);
+  }catch(e){
+    $('precision-status').textContent='体检失败：'+e.message;
+    $('precision-badge').textContent='失败';
+  }finally{
+    btn.disabled=false; btn.textContent='体检抓取精度';
+  }
+}
+async function startPrecisionRefresh(){
+  const btn=$('btn-precision-refresh'); btn.disabled=true; btn.textContent='补抓中';
+  $('refresh-panel').classList.add('show');
+  try{
+    const d=await json('/api/scrape-precision/refresh-focus?limit=12&workers=8',{method:'POST',timeoutMs:30000});
+    renderRefresh(d);
+    $('precision-status').textContent='已提交精准补抓：'+n((d.focus_domains||[]).length)+' 个域名';
+    pollRefresh();
+  }catch(e){
+    $('precision-status').textContent='精准补抓失败：'+e.message;
+  }finally{
+    btn.disabled=false; btn.textContent='补抓低精度域名';
+  }
+}
+function priceBand(v){
+  const x=Number(v||0);
+  if(!x) return '价格待补';
+  if(x<=25) return '$0-25';
+  if(x<=50) return '$25-50';
+  if(x<=100) return '$50-100';
+  if(x<=200) return '$100-200';
+  if(x<=500) return '$200-500';
+  return '$500+';
+}
+function topEntries(obj, limit=5){
+  return Object.entries(obj||{}).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,limit);
+}
+function renderPlatformTrendChip(label, value, cls=''){
+  return '<span class="trend-chip '+h(cls)+'" title="'+h(label)+'">'+h(label)+(value!=null?' '+n(value):'')+'</span>';
+}
+function renderPlatformTrends(d){
+  const cats=topEntries(d.category_breakdown,5);
+  const bands=topEntries(d.price_bands,6);
+  const signals=(d.trend_signals||[]).slice(0,5);
+  const high=(d.high_value_products||[]).length;
+  const total=Number(d.total_new_today||0);
+  const domains=Number(d.domains_with_new||d.scanned_domains||0);
+  const topCat=cats[0]||['--',0];
+  const ps=d.price_stats||{};
+  const meta=d.scan_meta||{};
+  $('platform-trend-badge').textContent=(d.cached?'本地快照':'实时')+' · '+shortTime(d.scan_time);
+  $('platform-trend-headline').textContent=total>0?'今日平台上新 '+n(total)+' 个，'+h(topCat[0])+' 最集中':'今日平台趋势待刷新';
+  $('platform-trend-sub').textContent=signals[0]||'新品、价格带和活跃店铺会自动汇总到这里。';
+  $('pt-new').textContent=n(total);
+  $('pt-new-note').textContent='昨日 '+n(d.total_new_yesterday||0);
+  $('pt-domains').textContent=n(domains);
+  $('pt-cats').textContent=n(cats.length);
+  $('pt-top-cat').textContent=String(topCat[0]||'--');
+  $('pt-median').textContent=money(ps.median);
+  $('pt-avg').textContent='均价 '+money(ps.avg);
+  $('pt-high').textContent=n(high);
+  $('pt-scan').textContent=n(meta.snapshot_files_scanned||d.scanned_domains||0);
+  $('pt-scan-note').textContent=meta.max_snapshot_age_days?'近 '+n(meta.max_snapshot_age_days)+' 天快照':'扫描覆盖';
+  $('pt-cat-list').innerHTML=cats.map(([label,value])=>renderPlatformTrendChip(label,value)).join('') || '<span class="trend-chip warn">暂无品类</span>';
+  $('pt-price-list').innerHTML=bands.map(([label,value])=>renderPlatformTrendChip(label,value,'info')).join('') || '<span class="trend-chip warn">暂无价格带</span>';
+  $('pt-signal-list').innerHTML=(signals.length?signals:['等待下一次快照刷新']).map(x=>renderPlatformTrendChip(x,null,'warn')).join('');
+}
+async function loadPlatformTrends(){
+  try{
+    const d=await json('/api/v2/today-fast?product_limit=120&score_limit=160',{timeoutMs:45000});
+    renderPlatformTrends(d);
+  }catch(e){
+    $('platform-trend-badge').textContent='读取失败';
+    $('platform-trend-headline').textContent='平台趋势读取失败';
+    $('platform-trend-sub').textContent=e.message;
+  }
+}
+function setLane(lane){
+  state.lane=lane;
+  document.querySelectorAll('.lane').forEach(btn=>btn.classList.toggle('active',btn.dataset.lane===lane));
+  renderTable();
+}
+async function loadCommand(){
+  setStatus('正在读取本地监控和利润判断');
+  try{
+    const d = await json('/api/dashboard/profit-command?limit=50', {timeoutMs:75000});
+    state.data=d;
+    renderAll();
+    loadPlatformTrends();
+    const m=d.monitor||{};
+    setStatus('<strong>已更新</strong><br>注册 '+n(m.registered_stores||m.stores||0)+' / '+n(m.registry_target||1000000)+'<br>'+h((d.generated_at||'').slice(0,19).replace('T',' ')));
+  }catch(e){
+    setStatus('<strong style="color:var(--red)">加载失败</strong><br>'+h(e.message));
+    $('tbody').innerHTML='<tr><td colspan="10"><div class="empty">加载失败：'+h(e.message)+'</div></td></tr>';
+  }
+}
+function renderAll(){
+  const d=state.data||{}, m=d.monitor||{}, f=d.funnel||{}, lanes=d.lanes||{};
+  const registered=Number(m.registered_stores||m.stores||0);
+  const snapshots=Number(m.snapshot_stores||0);
+  const queue=Number(m.scan_queue_pending||m.registry_without_snapshot||0);
+  const target=Number(m.registry_target||1000000);
+  $('k-stores').textContent=n(registered);
+  $('k-store-note').textContent='真实域名池 · 覆盖 '+Number(m.registry_coverage_pct||0).toFixed(3)+'%';
+  $('k-snapshots').textContent=n(snapshots);
+  $('k-snapshot-note').textContent='已抓产品数据 · 今日活跃 '+n(m.active_1d);
+  $('k-queue').textContent=n(queue);
+  $('k-queue-note').textContent='后台每轮最多扫一批，不卡页面';
+  $('k-target').textContent=n(target);
+  $('k-target-note').textContent='容量目标，真实域名导入增长';
+  $('k-products').textContent=n(m.products);
+  $('k-follow').textContent=n((lanes.can_follow_now||[]).length);
+  $('k-prepare').textContent=n((lanes.can_prepare||[]).length + (lanes.need_proof||[]).length);
+  $('k-avoid').textContent=n((lanes.cannot_follow||[]).length);
+  renderAutoPilotStatus(d.ai_autopilot||d.data_precision||{});
+  $('c-follow').textContent=n((lanes.can_follow_now||[]).length);
+  $('c-prepare').textContent=n((lanes.can_prepare||[]).length);
+  $('c-proof').textContent=n((lanes.need_proof||[]).length);
+  $('c-avoid').textContent=n((lanes.cannot_follow||[]).length);
+  $('c-low').textContent=n((lanes.low_priority||[]).length);
+  $('lane-total').textContent='候选 '+n(f.source_products||0);
+  const follow=(lanes.can_follow_now||[]).length, prep=(lanes.can_prepare||[]).length, proof=(lanes.need_proof||[]).length, avoid=(lanes.cannot_follow||[]).length;
+  if(follow>0){
+    $('money-call').textContent='今天强趋势优先跟 '+follow+' 个新品';
+    $('money-sub').textContent='独立站新品已自动入池；这些趋势最高，先准备 Shopify DRAFT 与小预算测试单。';
+    if(state.lane==='can_prepare') setLane('can_follow_now');
+  }else if(prep>0){
+    $('money-call').textContent='今天轻跟先拆 '+prep+' 个新品';
+    $('money-sub').textContent='这些品可以跟，先拆素材、价格锚点、PDP 和供应链，补齐后自动升级强跟。';
+    if(state.lane==='can_follow_now') setLane('can_prepare');
+  }else if(proof>0){
+    $('money-call').textContent='今天补证跟 '+proof+' 个新品';
+    $('money-sub').textContent='缺证据不等于不能跟；系统自动补趋势、广告、社区和供应链证据，按趋势升级。';
+    if(state.lane==='can_follow_now') setLane('need_proof');
+  }else if(avoid>0){
+    $('money-call').textContent='当前只拦 '+avoid+' 个硬风险产品';
+    $('money-sub').textContent='只有合规/IP/履约不可控或贡献毛利确定为负才暂不跟，其它新品继续入池。';
+    if(state.lane==='can_follow_now') setLane('cannot_follow');
+  }else{
+    $('money-call').textContent='当前没有强趋势，系统继续自动巡航';
+    $('money-sub').textContent='新品仍会进入跟进池；刷新竞品快照后按趋势和证据自动重排。';
+  }
+  $('rounds').innerHTML=(d.rounds||[]).map(r=>'<div class="round"><div class="top"><span>第'+h(r.round)+'轮 · '+h(r.name)+'</span><span>'+n(r.kept||0)+'</span></div><div class="flow">'+n(r.input||0)+' -> '+n(r.kept||0)+'</div><div class="rule">'+h(r.rule||'')+'</div></div>').join('');
+  $('source-time').textContent='利润判断来源：'+h((d.source_generated_at||d.generated_at||'').slice(0,19).replace('T',' '));
+  renderBrief();
+  renderTable();
+}
+function renderBrief(){
+  const brief=(state.data||{}).operator_brief||{};
+  $('brief-mode').textContent=brief.target_lane||brief.mode||'--';
+  $('brief-headline').textContent=brief.headline||'今天先看能赚钱的动作';
+  $('brief-lane').textContent='当前主队列：'+(brief.target_lane||'--');
+  const picks=(brief.follow_these||[]).slice(0,5);
+  $('brief-count').textContent=picks.length?('候选 '+n(picks.length)):'暂无可动作';
+  $('brief-follow').innerHTML=(picks.length?picks:['当前没有可直接动作的产品']).map(x=>'<div class="brief-item">'+h(x)+'</div>').join('');
+  $('brief-do').innerHTML=(brief.do_today||[]).slice(0,3).map(x=>'<div class="brief-line">'+h(x)+'</div>').join('');
+  const trends=(state.data&&state.data.monitoring_insights&&state.data.monitoring_insights.live_alerts)||[];
+  const trendLines=trends.slice(0,3).map(x=>(x.label||'信号')+' '+n(x.value||0)+'：'+(x.text||''));
+  $('brief-how').innerHTML=(trendLines.length?trendLines:(brief.how_to_follow||[]).slice(0,3)).map(x=>'<div class="brief-line">'+h(x)+'</div>').join('');
+}
+function renderTable(){
+  const d=state.data||{}, lanes=d.lanes||{}, items=[...(lanes[state.lane]||[])];
+  const meta=laneMeta[state.lane]||['队列',''];
+  $('table-title').textContent=meta[0];
+  const q=($('filter').value||'').toLowerCase();
+  const filtered=items.filter(x=>!q || String(x.title||'').toLowerCase().includes(q) || String(x.domain||'').toLowerCase().includes(q));
+  $('table-count').textContent=n(filtered.length)+' 条';
+  if(!filtered.length){
+    $('tbody').innerHTML='<tr><td colspan="10"><div class="empty">当前队列没有产品</div></td></tr>';
+    return;
+  }
+  $('tbody').innerHTML=filtered.map((x,i)=>{
+    const cls=x.status==='可以跟'||x.status==='马上跟'?'good':x.status==='先拆素材'?'warn':(x.status==='不碰'||x.status==='硬风险暂不跟')?'bad':x.status==='补证观察'?'info':'';
+    const gaps=(x.evidence_gaps||[]).slice(0,2).join('；');
+    const tags=renderDecisionTags(x.decision_tags);
+    const scorecard=renderScorecard(x.decision_scorecard);
+    const trendBits=[
+      x.trend_status?('趋势 '+x.trend_status):'趋势待验证',
+      x.trend_score?('分 '+n(x.trend_score)):'',
+      x.ad_heat|| (x.ad_count?('广告 '+n(x.ad_count)):''),
+      x.strict_validation?('验真 '+x.strict_validation):''
+    ].filter(Boolean).join(' · ');
+    const category=x.specific_category||x.product_type||x.category||'品类待补';
+    const judgement=tags?'<div class="decision-tags">'+tags+'</div>':'';
+    const scoreline=scorecard?'<div class="scorecard">'+scorecard+'</div>':'';
+    return '<tr>'+
+      '<td class="num">'+h(x.rank||i+1)+'</td>'+
+      '<td><a class="product" href="'+h(x.product_url||'#')+'" target="_blank" rel="noopener noreferrer">'+h(x.title||'')+'</a><div class="domain">'+h(x.domain||'')+'</div></td>'+
+      '<td><span class="chip '+cls+'">'+h(x.status||'')+'</span></td>'+
+      '<td class="num">'+money(x.price)+'</td>'+
+      '<td class="num"><strong>'+n(x.priority)+'</strong></td>'+
+      '<td class="num">'+n(x.ad_count)+'<div class="domain">'+h(x.ad_heat||'')+'</div></td>'+
+      '<td><span class="chip '+(x.strict_pass?'good':'warn')+'">'+h(x.strict_validation||'0/2')+'</span><div class="domain">'+h(x.trend_status||'')+' · '+h(x.trend_score||0)+'</div></td>'+
+      '<td class="num">'+money(x.target_cpa)+'</td>'+
+      '<td class="num">'+money(x.break_even_cpa)+'</td>'+
+      '<td class="reason"><div class="row-action">'+h(trendBits||'平台趋势待刷新')+'</div><div class="row-follow">'+h(category+' · '+priceBand(x.price))+'</div>'+judgement+scoreline+(gaps?'<div class="next">待补：'+h(gaps)+'</div>':'')+'</td>'+
+    '</tr>';
+  }).join('');
+}
+async function runDecision(){
+  const btn=$('btn-run'); btn.disabled=true; btn.textContent='重算中';
+  setStatus('正在重算三轮跟品判断');
+  try{
+    await json('/api/v2/workbench/closed-loop/run?cycles=3&limit=50&trend_top_n=50&fb_limit=5000&fb_exact_verify_limit=300&trend_geo=US',{method:'POST',timeoutMs:150000});
+    await loadCommand();
+  }catch(e){setStatus('<strong style="color:var(--red)">重算失败</strong><br>'+h(e.message))}
+  finally{btn.disabled=false;btn.textContent='重算跟品判断'}
+}
+async function startMonitorRefresh(){
+  const btn=$('btn-refresh'); btn.disabled=true; btn.textContent='刷新中';
+  $('refresh-panel').classList.add('show');
+  try{
+    const d=await json('/api/dashboard/background-refresh?mode=all&limit=0&workers=12',{method:'POST',timeoutMs:30000});
+    renderRefresh(d);
+    pollRefresh();
+  }catch(e){
+    $('refresh-message').textContent='启动失败：'+e.message;
+    btn.disabled=false; btn.textContent='刷新竞品快照';
+  }
+}
+function renderRefresh(d){
+  const total=Number(d.total||0), done=Number(d.completed||0), pct=total?Math.round(done/total*100):0;
+  $('refresh-badge').textContent=d.state||'idle';
+  $('refresh-message').textContent=d.message||'后台刷新';
+  $('refresh-count').textContent=n(done)+'/'+n(total)+' · '+pct+'%';
+  $('refresh-fill').style.width=pct+'%';
+}
+async function pollRefresh(){
+  try{
+    const d=await json('/api/dashboard/background-refresh/status',{timeoutMs:15000});
+    renderRefresh(d);
+    if(d.running){setTimeout(pollRefresh,2500);return}
+    $('btn-refresh').disabled=false; $('btn-refresh').textContent='刷新竞品快照';
+    await loadCommand();
+  }catch(e){
+    $('refresh-message').textContent='状态读取失败：'+e.message;
+    $('btn-refresh').disabled=false; $('btn-refresh').textContent='刷新竞品快照';
+  }
+}
+loadPlatformTrends();
+loadCommand();
+pollAutoPilotStatus();
+</script>
+</body>
+</html>""")
+
+
+@app.get("/classic", response_class=HTMLResponse)
+def dashboard_classic():
+    return HTMLResponse(r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shopify Ultimate v5.0 — 竞品情报监控中心</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6f7f4;color:#18201f;min-height:100vh;font-size:14px}
+:root{--c1:#12805c;--c2:#12805c;--c3:#2563eb;--c4:#b7791f;--c5:#c2413a;--c6:#0f766e;--bg:#f6f7f4;--s1:#ffffff;--s2:#ffffff;--b1:#dfe5df;--b2:#d5ded5;--t1:#18201f;--t2:#33413d;--t3:#66716f;--soft:#eef2ec;--shadow:0 10px 28px rgba(24,32,31,.08)}
+
+/* ── 顶部导航 ── */
+nav{background:var(--s1);border-bottom:1px solid var(--b1);padding:0 1.5rem;display:flex;align-items:center;justify-content:space-between;height:52px;position:sticky;top:0;z-index:100}
+nav .brand{display:flex;align-items:center;gap:12px}
+nav .brand h1{font-size:16px;font-weight:700;color:var(--c1);letter-spacing:-.3px}
+nav .brand .ver{font-size:11px;color:var(--t3);background:var(--b1);padding:2px 8px;border-radius:4px}
+nav .tabs{display:flex;gap:2px}
+nav .tab{padding:6px 16px;border-radius:6px;cursor:pointer;font-size:13px;color:var(--t2);transition:.15s;border:none;background:none}
+nav .tab:hover{color:var(--t1);background:var(--b1)}
+nav .tab.active{color:var(--c1);background:rgba(18,128,92,.1)}
+nav .live{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--t2)}
+nav .live .dot{width:7px;height:7px;border-radius:50%;background:var(--c2);animation:blink 2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+nav .live .ts{color:var(--t3)}
+
+/* ── 主布局 ── */
+.page{display:none;padding:1.5rem;max-width:1440px;margin:0 auto}
+.page.active{display:block}
+
+/* ── KPI 卡片 ── */
+.kpi-row{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:1.5rem}
+.kpi{background:var(--s2);border:1px solid var(--b1);border-radius:10px;padding:1.1rem 1.25rem;position:relative;overflow:hidden}
+.kpi::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.kpi:nth-child(1)::before{background:var(--c1)}.kpi:nth-child(2)::before{background:var(--c2)}
+.kpi:nth-child(3)::before{background:var(--c6)}.kpi:nth-child(4)::before{background:var(--c3)}
+.kpi:nth-child(5)::before{background:var(--c4)}.kpi:nth-child(6)::before{background:var(--c5)}
+.kpi .kl{font-size:11px;color:var(--t3);margin-bottom:4px;letter-spacing:.5px}
+.kpi .kv{font-size:26px;font-weight:700;color:var(--t1);line-height:1.2}
+.kpi .ks{font-size:11px;color:var(--t3);margin-top:2px}
+.kpi .delta{font-size:12px;font-weight:600}
+.d-up{color:var(--c2)}.d-down{color:var(--c5)}
+
+/* ── 双栏布局 ── */
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+.grid-7-3{display:grid;grid-template-columns:1fr 360px;gap:1rem}
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}
+
+/* ── 面板 ── */
+.panel{background:var(--s2);border:1px solid var(--b1);border-radius:10px;overflow:hidden}
+.p-head{padding:12px 16px;border-bottom:1px solid var(--b1);display:flex;align-items:center;justify-content:space-between;background:var(--s1)}
+.p-head h3{font-size:13px;font-weight:600;color:var(--t1);letter-spacing:.2px}
+.p-head .p-badge{font-size:10px;background:rgba(18,128,92,.1);color:var(--c1);padding:2px 8px;border-radius:99px}
+.p-body{overflow-y:auto}
+
+/* ── 表格 ── */
+.tbl{width:100%;border-collapse:collapse;font-size:12px}
+.tbl th{position:sticky;top:0;background:var(--s2);text-align:left;padding:8px 12px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--t3);border-bottom:1px solid var(--b1);cursor:pointer;user-select:none;white-space:nowrap}
+.tbl th:hover{color:var(--c1)}
+.tbl td{padding:7px 12px;border-bottom:1px solid rgba(223,229,223,.82);white-space:nowrap}
+.tbl tr:hover td{background:rgba(18,128,92,.045)}
+.tbl a{color:var(--c1);text-decoration:none;cursor:pointer}
+.tbl a:hover{text-decoration:underline}
+.tbl .num{text-align:right;font-family:"SF Mono","JetBrains Mono",monospace}
+.tbl .muted{color:var(--t3)}
+.tbl .highlight{color:var(--c2);font-weight:600}
+
+/* ── 排名条 ── */
+.rank-bar{display:flex;align-items:center;gap:10px;padding:6px 0}
+.rank-num{width:24px;text-align:center;font-weight:700;font-size:13px;flex-shrink:0}
+.rank-num.gold{color:var(--c4)}.rank-num.silver{color:var(--t2)}.rank-num.bronze{color:#cd7f32}
+.rank-info{flex:1;min-width:0}
+.rank-name{font-size:12px;color:var(--c1);cursor:pointer;overflow:hidden;text-overflow:ellipsis}
+.rank-name:hover{text-decoration:underline}
+.rank-meta{font-size:10px;color:var(--t3)}
+.rank-val{font-weight:600;font-size:12px;color:var(--t1);flex-shrink:0;text-align:right}
+
+/* ── 柱状图 ── */
+.bar-item{display:flex;align-items:center;gap:10px;padding:5px 0}
+.bar-label{width:80px;text-align:right;font-size:11px;color:var(--t2);flex-shrink:0}
+.bar-track{flex:1;height:22px;background:var(--soft);border-radius:4px;overflow:hidden;position:relative}
+.bar-fill{height:100%;border-radius:4px;transition:width .5s cubic-bezier(.4,0,.2,1)}
+.bar-fill .bar-text{position:absolute;right:6px;top:50%;transform:translateY(-50%);font-size:10px;color:#fff;font-weight:600}
+.bar-count{width:56px;font-size:11px;color:var(--t3);flex-shrink:0;text-align:right}
+
+/* ── 标签云 ── */
+.tags{display:flex;flex-wrap:wrap;gap:6px}
+.tag{font-size:11px;padding:4px 12px;border-radius:6px;cursor:pointer;transition:.15s}
+.tag.blue{background:rgba(18,128,92,.1);color:var(--c1)}
+.tag.green{background:rgba(16,185,129,.1);color:var(--c2)}
+.tag.purple{background:rgba(139,92,246,.1);color:var(--c3)}
+.tag:hover{filter:brightness(1.3)}
+
+/* ── 搜索框 ── */
+.search{width:100%;background:var(--bg);border:1px solid var(--b2);border-radius:6px;padding:8px 14px;color:var(--t1);font-size:13px;outline:none;transition:.15s}
+.search:focus{border-color:var(--c1)}.search::placeholder{color:var(--t3)}
+.search-sm{width:200px;padding:6px 10px;font-size:12px}
+
+/* ── 状态指示器 ── */
+.status-dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
+.status-dot.hot{background:var(--c5)}.status-dot.warm{background:var(--c4)}.status-dot.cool{background:var(--c2)}.status-dot.cold{background:var(--t3)}
+
+/* ── Modal ── */
+.ovl{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;display:flex;align-items:center;justify-content:center}
+.ovl.hidden{display:none}
+.modal{background:var(--s1);border:1px solid var(--b1);border-radius:12px;width:900px;max-height:82vh;display:flex;flex-direction:column}
+.m-head{padding:14px 20px;border-bottom:1px solid var(--b1);display:flex;justify-content:space-between;align-items:center}
+.m-head h3{font-size:15px;color:var(--c1)}.m-head .m-domain{font-size:12px;color:var(--t3)}
+.m-close{background:none;border:none;color:var(--t3);font-size:20px;cursor:pointer;padding:4px 8px;border-radius:4px}
+.m-close:hover{color:#fff;background:var(--b1)}
+.m-stats{display:grid;grid-template-columns:repeat(5,1fr);gap:1rem;padding:14px 20px;border-bottom:1px solid var(--b1)}
+.m-stat{text-align:center}.m-stat .v{font-size:20px;font-weight:700}.m-stat .l{font-size:10px;color:var(--t3);margin-top:2px}
+.m-body{overflow-y:auto;padding:0 20px 16px;flex:1}
+.m-body .tbl th{position:sticky;top:0;background:var(--s1)}
+.m-actions{padding:10px 20px;border-top:1px solid var(--b1);display:flex;gap:8px}
+
+/* ── 按钮 ── */
+.btn{padding:6px 14px;border-radius:6px;font-size:12px;font-weight:500;cursor:pointer;border:1px solid var(--b2);background:var(--s2);color:var(--t2);transition:.15s}
+.btn:hover{background:var(--b1);color:var(--t1)}
+.btn.primary{background:var(--c1);color:#fff;border-color:var(--c1)}
+.btn.primary:hover{background:#2563eb}
+.btn.warn{background:var(--c4);border-color:var(--c4);color:#111}
+.btn.warn:hover{background:var(--c4);color:#fff}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.btn.danger{color:var(--c5);border-color:rgba(239,68,68,.3)}.btn.danger:hover{background:rgba(239,68,68,.1)}
+.followable-page-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:1rem;flex-wrap:wrap}
+.followable-page-head h2{font-size:18px;color:var(--t1);letter-spacing:0}
+.followable-page-head p{font-size:12px;color:var(--t3);margin-top:4px;line-height:1.45}
+.followable-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.followable-select{background:var(--bg);border:1px solid var(--b2);border-radius:6px;padding:7px 10px;color:var(--t1);font-size:12px;outline:none}
+.closed-loop-strip{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:1rem}
+.closed-loop-card{background:var(--s2);border:1px solid var(--b1);border-radius:8px;padding:12px 13px;min-height:78px}
+.closed-loop-card .label{font-size:10px;color:var(--t3);letter-spacing:.4px;margin-bottom:7px}
+.closed-loop-card .value{font-size:24px;font-weight:800;color:var(--t1);line-height:1}
+.closed-loop-card .note{font-size:10px;color:var(--t3);margin-top:7px;line-height:1.35}
+.closed-loop-rounds{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:1rem}
+.closed-loop-round{background:var(--s2);border:1px solid var(--b1);border-radius:8px;padding:12px}
+.closed-loop-round .name{font-size:12px;font-weight:700;color:var(--t1);margin-bottom:6px}
+.closed-loop-round .flow{font-size:20px;font-weight:800;color:var(--c4);margin-bottom:6px}
+.closed-loop-round .rule{font-size:11px;color:var(--t3);line-height:1.45}
+.status-chip{display:inline-block;border-radius:4px;padding:3px 7px;font-size:10px;font-weight:800}
+.status-chip.follow{background:rgba(16,185,129,.16);color:var(--c2);border:1px solid rgba(16,185,129,.3)}
+.status-chip.teardown{background:rgba(245,158,11,.16);color:var(--c4);border:1px solid rgba(245,158,11,.3)}
+.status-chip.verify{background:rgba(6,182,212,.14);color:var(--c6);border:1px solid rgba(6,182,212,.25)}
+.status-chip.avoid{background:rgba(239,68,68,.14);color:var(--c5);border:1px solid rgba(239,68,68,.25)}
+.status-chip.low{background:rgba(100,116,139,.14);color:var(--t2);border:1px solid rgba(100,116,139,.25)}
+.refresh-panel{display:none;margin-bottom:1rem;border-color:rgba(245,158,11,.35)}
+.refresh-panel.show{display:block}
+.refresh-line{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px;font-size:12px;color:var(--t2)}
+.progress-track{height:8px;background:var(--b1);border-radius:99px;overflow:hidden}
+.progress-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--c4),var(--c2));transition:width .25s}
+.refresh-stats{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--t3);margin-top:8px}
+.refresh-stats strong{color:var(--t1)}
+.refresh-recent{font-size:11px;color:var(--t3);margin-top:8px;line-height:1.5}
+.registry-kpis{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}
+.pager{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--t3)}
+.pill{display:inline-flex;align-items:center;border:1px solid var(--b1);border-radius:99px;padding:4px 9px;background:var(--soft);color:var(--t2);font-size:11px}
+
+/* 与主仪表盘统一：浅底、白面板、绿色赚钱动作 */
+:root{--c1:#12805c;--c2:#12805c;--c3:#2563eb;--c4:#b7791f;--c5:#c2413a;--c6:#0f766e;--bg:#f6f7f4;--s1:#ffffff;--s2:#ffffff;--b1:#dfe5df;--b2:#d5ded5;--t1:#18201f;--t2:#33413d;--t3:#66716f;--soft:#eef2ec;--shadow:0 10px 28px rgba(24,32,31,.08)}
+body{background:var(--bg);color:var(--t1)}
+nav,.panel,.kpi,.modal,.closed-loop-card,.closed-loop-round{background:var(--s1);border-color:var(--b1);box-shadow:var(--shadow)}
+nav .brand h1,.tbl a,.rank-name{color:var(--c1)}
+nav .brand .ver,.lane-count{background:var(--soft);color:var(--t3)}
+nav .tab{color:var(--t2)}nav .tab:hover{color:var(--t1);background:var(--soft)}
+nav .tab.active{color:var(--c1);background:rgba(18,128,92,.1)}
+.page{background:transparent}
+.p-head,.tbl th,.m-body .tbl th{background:var(--s1);border-bottom-color:var(--b1)}
+.p-head h3,.kpi .kv,.rank-val,.m-head h3,.closed-loop-card .value,.closed-loop-round .name{color:var(--t1)}
+.p-head .p-badge{background:rgba(18,128,92,.1);color:var(--c1)}
+.tbl th{color:var(--t3)}.tbl th:hover{color:var(--c1)}
+.tbl td{border-bottom:1px solid rgba(223,229,223,.82);color:var(--t2)}
+.tbl tr:hover td{background:rgba(18,128,92,.045)}
+.bar-track,.progress-track{background:var(--soft)}
+.tag.blue{background:rgba(18,128,92,.1);color:var(--c1)}
+.search,.followable-select,select{background:var(--bg);border-color:var(--b2);color:var(--t1)}
+.search:focus,.followable-select:focus{border-color:var(--c1)}
+.ovl{background:rgba(24,32,31,.42)}
+.m-close:hover{background:var(--soft);color:var(--t1)}
+.btn{background:var(--s1);border-color:var(--b1);color:var(--t1)}
+.btn:hover{background:var(--soft);border-color:var(--b2);color:var(--t1)}
+.btn.primary,.btn.primary:hover{background:var(--c1);border-color:var(--c1);color:#fff}
+.btn.warn,.btn.warn:hover{background:var(--c4);border-color:var(--c4);color:#fff}
+.closed-loop-card,.closed-loop-round{box-shadow:none}
+
+/* ── 响应式 ── */
+@media(max-width:1200px){.kpi-row{grid-template-columns:repeat(3,1fr)}.grid-7-3{grid-template-columns:1fr}.grid-3{grid-template-columns:1fr}.closed-loop-strip{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:768px){.kpi-row{grid-template-columns:repeat(2,1fr)}.grid-2{grid-template-columns:1fr}.closed-loop-strip,.closed-loop-rounds{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="brand"><h1>Shopify Ultimate</h1><span class="ver">v5.0</span><span style="font-size:12px;color:var(--t3)">竞品情报监控中心</span></div>
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('overview')">📊 总览</button>
+    <button class="tab" onclick="switchTab('stores')">🏪 店铺列表</button>
+    <button class="tab" onclick="switchTab('rankings')">🏆 排行榜</button>
+    <button class="tab" onclick="switchTab('pricing')">💰 价格分析</button>
+    <button class="tab" onclick="switchTab('search')">🔍 产品搜索</button>
+    <button class="tab" onclick="switchTab('external')">🌐 独立站监控</button>
+    <button class="tab" onclick="switchTab('radar')">🎯 竞品雷达</button>
+    <button class="tab" onclick="switchTab('followable')">🧭 智能跟品队列</button>
+  </div>
+  <div class="live">
+    <button class="btn warn" onclick="startBackgroundRefresh()" id="btn-bg-refresh" title="后台抓取全部监控域名并更新本地快照">后台全量刷新</button>
+    <span id="nav-status">--</span>
+    <div class="dot"></div>
+    <span class="ts" id="nav-ts">加载中...</span>
+  </div>
+</nav>
+
+<!-- ═══════════════ 总览 Tab ═══════════════ -->
+<div class="page active" id="tab-overview">
+  <div class="panel refresh-panel" id="bg-refresh-panel">
+    <div class="p-head">
+      <h3>后台全量刷新抓取监控</h3>
+      <span class="p-badge" id="bg-refresh-badge">idle</span>
+    </div>
+    <div class="p-body" style="padding:14px 16px">
+      <div class="refresh-line">
+        <span id="bg-refresh-message">尚未启动后台刷新</span>
+        <span id="bg-refresh-progress">0/0 · 0%</span>
+      </div>
+      <div class="progress-track"><div class="progress-fill" id="bg-refresh-fill"></div></div>
+      <div class="refresh-stats">
+        <span>成功 <strong id="bg-ok">0</strong></span>
+        <span>失败 <strong id="bg-failed">0</strong></span>
+        <span>无数据 <strong id="bg-nodata">0</strong></span>
+        <span>新品 <strong id="bg-new">0</strong></span>
+        <span>更新 <strong id="bg-updated">0</strong></span>
+        <span>下架 <strong id="bg-removed">0</strong></span>
+        <span>改价 <strong id="bg-price">0</strong></span>
+        <span>耗时 <strong id="bg-elapsed">0s</strong></span>
+      </div>
+      <div class="refresh-recent" id="bg-refresh-recent"></div>
+    </div>
+  </div>
+
+  <div class="kpi-row registry-kpis">
+    <div class="kpi"><div class="kl">注册店铺</div><div class="kv" id="ov-registered">--</div><div class="ks">真实域名池</div></div>
+    <div class="kpi"><div class="kl">已抓快照</div><div class="kv" id="ov-stores">--</div><div class="ks">已有产品数据</div></div>
+    <div class="kpi"><div class="kl">待扫队列</div><div class="kv" id="ov-queue">--</div><div class="ks">按优先级分批扫</div></div>
+    <div class="kpi"><div class="kl">百万目标</div><div class="kv" id="ov-target">--</div><div class="ks"><span id="ov-coverage">--</span> 覆盖</div></div>
+    <div class="kpi"><div class="kl">产品总数</div><div class="kv" id="ov-prods">--</div><div class="ks">跨越所有店铺</div></div>
+    <div class="kpi"><div class="kl">今日活跃</div><div class="kv" id="ov-act1">--</div><div class="ks">24h 内有更新</div></div>
+    <div class="kpi"><div class="kl">近3天活跃</div><div class="kv" id="ov-act3">--</div><div class="ks">3 天内有更新</div></div>
+    <div class="kpi"><div class="kl">均价</div><div class="kv" id="ov-avg">--</div><div class="ks">市场均值</div></div>
+    <div class="kpi"><div class="kl">价格中位数</div><div class="kv" id="ov-med">--</div><div class="ks">50% 分位</div></div>
+  </div>
+
+  <div class="grid-2">
+    <div class="panel"><div class="p-head"><h3>价格分布</h3></div>
+      <div class="p-body" style="padding:16px"><div id="ov-bands"></div></div></div>
+    <div class="panel"><div class="p-head"><h3>店铺规模分级</h3></div>
+      <div class="p-body" style="padding:16px"><div id="ov-tiers"></div></div></div>
+  </div>
+
+  <div class="grid-7-3" style="margin-top:1rem">
+    <div class="panel"><div class="p-head"><h3>Top 20 产品最多店铺</h3><span class="p-badge">点击查看详情</span></div>
+      <div class="p-body" style="max-height:420px">
+        <table class="tbl"><thead><tr><th>#</th><th>店铺域名</th><th style="text-align:right">产品数</th><th style="text-align:right">最低价</th><th style="text-align:right">最高价</th><th style="text-align:right">均价</th><th>最近抓取</th></tr></thead>
+        <tbody id="ov-top20"></tbody></table>
+      </div></div>
+    <div class="panel"><div class="p-head"><h3>抓取活动 (14天)</h3></div>
+      <div class="p-body" style="padding:12px"><div id="ov-activity"></div></div></div>
+  </div>
+</div>
+
+<!-- ═══════════════ 店铺列表 Tab ═══════════════ -->
+<div class="page" id="tab-stores">
+  <div style="display:flex;gap:12px;align-items:center;margin-bottom:1rem">
+    <input class="search" placeholder="搜索店铺域名..." id="st-search" oninput="scheduleStoreTable()" style="flex:1;max-width:400px">
+    <span style="font-size:12px;color:var(--t3)" id="st-total">共 -- 家店铺</span>
+    <div class="pager">
+      <button class="btn" id="st-prev" onclick="prevStorePage()">上一页</button>
+      <span id="st-page">--</span>
+      <button class="btn" id="st-next" onclick="nextStorePage()">下一页</button>
+    </div>
+    <button class="btn primary" onclick="apiRefresh()">🔄 刷新缓存</button>
+  </div>
+  <div class="panel"><div class="p-body" style="max-height:calc(100vh - 180px)">
+    <table class="tbl"><thead><tr>
+      <th onclick="setStoreSort('domain')">域名 ▾</th>
+      <th onclick="setStoreSort('products')" style="text-align:right">产品数 ▾</th>
+      <th style="text-align:right">最低价</th><th style="text-align:right">Q25</th><th style="text-align:right">中位数</th><th style="text-align:right">Q75</th><th style="text-align:right">最高价</th><th style="text-align:right">均价</th>
+      <th onclick="setStoreSort('last_check')">最近抓取 ▾</th>
+      <th>操作</th>
+    </tr></thead><tbody id="st-tbody"></tbody></table>
+  </div></div>
+</div>
+
+<!-- ═══════════════ 排行榜 Tab ═══════════════ -->
+<div class="page" id="tab-rankings">
+  <div class="grid-2">
+    <div class="panel"><div class="p-head"><h3>🏆 产品数量 Top 20</h3></div>
+      <div class="p-body" style="padding:12px"><div id="rk-products"></div></div></div>
+    <div class="panel"><div class="p-head"><h3>💎 均价最高 Top 20（≥10产品）</h3></div>
+      <div class="p-body" style="padding:12px"><div id="rk-price-high"></div></div></div>
+  </div>
+  <div class="grid-2" style="margin-top:1rem">
+    <div class="panel"><div class="p-head"><h3>🏷️ 均价最低 Top 20（≥10产品）</h3></div>
+      <div class="p-body" style="padding:12px"><div id="rk-price-low"></div></div></div>
+    <div class="panel"><div class="p-head"><h3>📦 产品 SKU 数最多 Top 20</h3></div>
+      <div class="p-body" style="padding:12px"><div id="rk-range"></div></div></div>
+  </div>
+</div>
+
+<!-- ═══════════════ 价格分析 Tab ═══════════════ -->
+<div class="page" id="tab-pricing">
+  <div class="grid-2">
+    <div class="panel"><div class="p-head"><h3>价格带分布（全部产品）</h3><span class="p-badge" id="pc-total">--</span></div>
+      <div class="p-body" style="padding:16px"><div id="pc-bands"></div></div></div>
+    <div class="panel"><div class="p-head"><h3>店铺规模分布</h3></div>
+      <div class="p-body" style="padding:16px"><div id="pc-tiers"></div></div></div>
+  </div>
+  <div class="grid-7-3" style="margin-top:1rem">
+    <div class="panel"><div class="p-head"><h3>价格区间排行 — 各店铺价格跨度 Top 30</h3></div>
+      <div class="p-body" style="max-height:500px">
+        <table class="tbl"><thead><tr><th>#</th><th>店铺</th><th style="text-align:right">产品数</th><th style="text-align:right">最低</th><th style="text-align:right">Q25</th><th style="text-align:right">中位</th><th style="text-align:right">Q75</th><th style="text-align:right">最高</th><th style="text-align:right">价差倍数</th></tr></thead>
+        <tbody id="pc-table"></tbody></table>
+      </div></div>
+    <div class="panel"><div class="p-head"><h3>价格分段占比</h3></div>
+      <div class="p-body" style="padding:16px;text-align:center">
+        <div style="font-size:42px;font-weight:700;color:var(--c2)" id="pc-under50">--</div>
+        <div style="font-size:12px;color:var(--t3)">产品定价在 $50 以下</div>
+        <div style="margin-top:12px;font-size:13px;color:var(--t2)" id="pc-insight"></div>
+      </div></div>
+  </div>
+</div>
+
+<!-- ═══════════════ 产品搜索 Tab ═══════════════ -->
+<div class="page" id="tab-search">
+  <div style="display:flex;gap:12px;align-items:center;margin-bottom:1rem">
+    <input class="search" placeholder="输入产品关键词搜索全部 29 万+ 产品..." id="sq-input" style="flex:1;max-width:500px"
+      onkeydown="if(event.key==='Enter')doProductSearch()">
+    <button class="btn primary" onclick="doProductSearch()">🔍 搜索</button>
+    <span style="font-size:12px;color:var(--t3)" id="sq-count"></span>
+  </div>
+  <div class="panel"><div class="p-body" style="max-height:calc(100vh - 180px)">
+    <table class="tbl"><thead><tr>
+      <th style="width:35%">产品名称</th><th style="text-align:right">价格</th><th style="width:25%">所属店铺</th><th>Handle</th>
+    </tr></thead><tbody id="sq-tbody"><tr><td colspan="4" style="text-align:center;color:var(--t3);padding:40px">输入关键词开始搜索</td></tr></tbody></table>
+  </div></div>
+</div>
+
+<!-- ═══════════════ 独立站监控 Tab ═══════════════ -->
+<div class="page" id="tab-external">
+  <div class="kpi-row">
+    <div class="kpi"><div class="kl">FB 监控品牌</div><div class="kv" id="ex-total8000">--</div><div class="ks">来自 8000 端口</div></div>
+    <div class="kpi"><div class="kl">已有快照</div><div class="kv" id="ex-withsnap">--</div><div class="ks">已抓取产品数据</div></div>
+    <div class="kpi"><div class="kl">未抓取</div><div class="kv" id="ex-nosnap">--</div><div class="ks">等待首次抓取</div></div>
+    <div class="kpi"><div class="kl">覆盖率</div><div class="kv" id="ex-coverage">--</div><div class="ks">已抓取占比</div></div>
+    <div class="kpi"><div class="kl">监控列表</div><div class="kv" id="ex-watchlist">--</div><div class="ks">competitors_watchlist</div></div>
+    <div class="kpi"><div class="kl">本地快照</div><div class="kv" id="ex-snaps">--</div><div class="ks">snapshot 总数</div></div>
+  </div>
+
+  <div style="display:flex;gap:12px;align-items:center;margin-bottom:1rem">
+    <input class="search" placeholder="搜索域名..." id="ex-search" oninput="renderExternalTable()" style="flex:1;max-width:400px">
+    <select id="ex-filter" onchange="renderExternalTable()" style="background:var(--bg);border:1px solid var(--b2);border-radius:6px;padding:7px 12px;color:var(--t1);font-size:12px;outline:none">
+      <option value="all">全部品牌</option>
+      <option value="snapshot">已有快照</option>
+      <option value="no-snapshot">未抓取</option>
+      <option value="watchlist">监控列表内</option>
+    </select>
+    <button class="btn primary" onclick="loadExternalBrands()">🔄 刷新数据</button>
+    <button class="btn" onclick="seedRegistry8000()">同步到百万注册表</button>
+    <button class="btn" onclick="addSelectedToScrape()">📥 加入抓取队列</button>
+    <button class="btn" onclick="checkListingTimes()" style="color:var(--c6);border-color:rgba(6,182,212,.3)">📅 上架时间检测</button>
+    <span style="font-size:12px;color:var(--t3)" id="ex-count"></span>
+  </div>
+
+  <div class="panel"><div class="p-body" style="max-height:calc(100vh - 250px)">
+    <table class="tbl"><thead><tr>
+      <th style="width:30px"><input type="checkbox" id="ex-select-all" onchange="toggleSelectAll()"></th>
+      <th>域名</th><th>品牌名称</th><th style="text-align:right">FB 评分</th><th style="text-align:right">出现次数</th>
+      <th style="text-align:right">Orbit评分</th><th>等级</th><th>状态</th><th>操作</th>
+    </tr></thead><tbody id="ex-tbody"><tr><td colspan="9" style="text-align:center;color:var(--t3);padding:40px">加载中...</td></tr></tbody></table>
+  </div></div>
+
+  <!-- 上架时间检测结果 -->
+  <div class="panel" id="listing-panel" style="margin-top:1rem;display:none">
+    <div class="p-head"><h3>📅 产品上架时间检测结果</h3><span class="p-badge" id="listing-badge"></span></div>
+    <div class="p-body" style="max-height:450px">
+      <table class="tbl"><thead><tr>
+        <th>域名</th><th style="text-align:right">产品数</th><th>最早创建</th><th>最新创建</th><th>最早发布</th><th>最新发布</th><th style="text-align:right">上架频率</th><th>状态</th><th>操作</th>
+      </tr></thead><tbody id="listing-tbody"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ 竞品雷达 Tab ═══════════════ -->
+<div class="page" id="tab-radar">
+  <div class="kpi-row">
+    <div class="kpi"><div class="kl">发现新品</div><div class="kv" id="rd-new">--</div><div class="ks">本次扫描</div></div>
+    <div class="kpi"><div class="kl">🚀 立即测款</div><div class="kv" id="rd-tier1">--</div><div class="ks">≥80分</div></div>
+    <div class="kpi"><div class="kl">🔬 素材拆解</div><div class="kv" id="rd-tier2">--</div><div class="ks">60-79分</div></div>
+    <div class="kpi"><div class="kl">👀 加入观察</div><div class="kv" id="rd-tier3">--</div><div class="ks">40-59分</div></div>
+    <div class="kpi"><div class="kl">📝 仅记录</div><div class="kv" id="rd-tier4">--</div><div class="ks">0-39分</div></div>
+    <div class="kpi"><div class="kl">广告活跃</div><div class="kv" id="rd-ads">--</div><div class="ks">从8000端口</div></div>
+  </div>
+
+  <!-- 雷达子Tab -->
+  <div style="display:flex;gap:4px;margin-bottom:1rem">
+    <button class="btn" onclick="switchRadarTab('scan')" id="rdtab-scan" style="background:var(--c1);color:#fff;border-color:var(--c1)">🔍 全量扫描</button>
+    <button class="btn" onclick="switchRadarTab('ads')" id="rdtab-ads">📢 放量雷达</button>
+    <button class="btn" onclick="switchRadarTab('ai')" id="rdtab-ai">🤖 AI购物雷达</button>
+    <button class="btn" onclick="switchRadarTab('scores')" id="rdtab-scores">📊 评分榜</button>
+    <button class="btn" onclick="switchTab('followable')" style="margin-left:auto;color:var(--c4);border-color:rgba(245,158,11,.25)">🧭 智能跟品队列</button>
+  </div>
+
+  <!-- 扫描面板 -->
+  <div id="rd-panel-scan">
+    <div style="display:flex;gap:12px;align-items:center;margin-bottom:1rem">
+      <input class="search" placeholder="指定域名（逗号分隔，留空则扫全部）..." id="rd-domains" style="flex:1;max-width:500px">
+      <select id="rd-limit" style="background:var(--bg);border:1px solid var(--b2);border-radius:6px;padding:7px 12px;color:var(--t1);font-size:12px;outline:none">
+        <option value="20">扫前 20 家</option><option value="50" selected>扫前 50 家</option><option value="100">扫前 100 家</option>
+      </select>
+      <button class="btn primary" onclick="runFullScan()">🚀 一键全量扫描</button>
+      <button class="btn" onclick="runProductScan()" style="color:var(--c6);border-color:rgba(6,182,212,.3)">📦 仅新品雷达</button>
+      <span style="font-size:12px;color:var(--t3)" id="rd-scan-status"></span>
+    </div>
+
+    <div class="panel" id="rd-scan-results" style="display:none">
+      <div class="p-head"><h3>扫描结果</h3><span class="p-badge" id="rd-scan-badge"></span></div>
+      <div class="p-body" style="max-height:600px">
+        <table class="tbl"><thead><tr>
+          <th style="width:28px">#</th><th>产品名称</th><th>店铺</th><th style="text-align:right">价格</th><th style="text-align:right">评分</th><th>等级</th><th>具体分类</th><th>怎么跟</th><th>抓取/证据</th><th>评分依据</th>
+        </tr></thead><tbody id="rd-scan-tbody"><tr><td colspan="10" style="text-align:center;color:var(--t3);padding:40px">点击扫描按钮开始</td></tr></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 放量雷达面板 -->
+  <div id="rd-panel-ads" style="display:none">
+    <div style="display:flex;gap:12px;align-items:center;margin-bottom:1rem">
+      <button class="btn primary" onclick="loadAdSignals()">🔄 刷新放量数据</button>
+      <select id="ads-min" onchange="loadAdSignals()" style="background:var(--bg);border:1px solid var(--b2);border-radius:6px;padding:7px 12px;color:var(--t1);font-size:12px;outline:none">
+        <option value="50">≥50次出现</option><option value="100">≥100次</option><option value="200" selected>≥200次（放量中）</option><option value="500">≥500次（大规模）</option>
+      </select>
+      <span style="font-size:12px;color:var(--t3)" id="rd-ads-status"></span>
+    </div>
+
+    <div class="grid-3" style="margin-bottom:1rem">
+      <div class="panel"><div class="p-body" style="padding:12px;text-align:center">
+        <div style="font-size:36px;font-weight:700;color:var(--c5)" id="rd-ads-big">--</div>
+        <div style="font-size:12px;color:var(--t3)">🔥🔥🔥 大规模放量</div></div></div>
+      <div class="panel"><div class="p-body" style="padding:12px;text-align:center">
+        <div style="font-size:36px;font-weight:700;color:var(--c4)" id="rd-ads-mid">--</div>
+        <div style="font-size:12px;color:var(--t3)">🔥🔥 放量中</div></div></div>
+      <div class="panel"><div class="p-body" style="padding:12px;text-align:center">
+        <div style="font-size:36px;font-weight:700;color:var(--c2)" id="rd-ads-small">--</div>
+        <div style="font-size:12px;color:var(--t3)">🔥 起量中</div></div></div>
+    </div>
+
+    <div class="panel"><div class="p-body" style="max-height:550px">
+      <table class="tbl"><thead><tr>
+        <th style="width:28px">#</th><th>域名</th><th>品牌</th><th style="text-align:right">出现次数</th><th style="text-align:right">Orbit</th><th style="text-align:right">AI评分</th><th>等级</th><th>放量阶段</th>
+      </tr></thead><tbody id="rd-ads-tbody"><tr><td colspan="8" style="text-align:center;color:var(--t3);padding:40px">点击刷新按钮</td></tr></tbody></table>
+    </div></div>
+  </div>
+
+  <!-- AI 购物雷达面板 -->
+  <div id="rd-panel-ai" style="display:none">
+    <div class="grid-2" style="margin-bottom:1rem">
+      <div class="panel"><div class="p-head"><h3>生成检测 Prompt</h3></div>
+        <div class="p-body" style="padding:1rem">
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <input class="search" placeholder="品类/关键词 (如: hair removal device)" id="ai-kw" style="margin:0">
+            <input class="search" placeholder="品牌名 (如: groundingwell)" id="ai-brand" style="margin:0">
+            <div style="display:flex;gap:8px">
+              <input class="search" placeholder="价格上限" id="ai-price" value="50" style="width:80px;margin:0">
+              <input class="search" placeholder="痛点 (如: anti-aging)" id="ai-pain" style="flex:1;margin:0">
+            </div>
+            <button class="btn primary" onclick="generateAIPrompts()">🎯 生成 Prompt 模板</button>
+          </div>
+          <div id="ai-prompts-out" style="margin-top:12px;font-size:12px;color:var(--t2);max-height:300px;overflow-y:auto"></div>
+        </div></div>
+      <div class="panel"><div class="p-head"><h3>AI 购物监控状态</h3></div>
+        <div class="p-body" style="padding:1rem">
+          <div id="ai-status-out" style="font-size:12px;color:var(--t2);max-height:300px;overflow-y:auto">
+            <button class="btn" onclick="loadAIStatus()" style="margin-bottom:8px">🔄 加载状态</button>
+          </div>
+        </div></div>
+    </div>
+
+    <div class="panel"><div class="p-head"><h3>📋 标准 AI 购物检测 Prompt 模板</h3></div>
+      <div class="p-body" style="padding:1rem">
+        <div style="font-size:12px;color:var(--t3);margin-bottom:8px">在 ChatGPT / Perplexity / Gemini 中使用以下 Prompt，记录结果后通过 API 回传</div>
+        <table class="tbl"><thead><tr><th>#</th><th>Prompt 模板</th><th>平台</th><th>国家</th><th>记录项</th></tr></thead>
+        <tbody id="ai-tmpl-tbody"></tbody></table>
+      </div></div>
+
+    <!-- AI 监控快速记录 -->
+    <div class="panel" style="margin-top:1rem"><div class="p-head"><h3>📝 快速记录 AI 检测结果</h3></div>
+      <div class="p-body" style="padding:1rem">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input class="search" placeholder="品牌名" id="ai-log-brand" style="width:160px;margin:0">
+          <input class="search" placeholder="检测结果 (shown/not_shown)" id="ai-log-status" style="width:200px;margin:0">
+          <input class="search" placeholder="排名(#3)" id="ai-log-rank" style="width:80px;margin:0">
+          <button class="btn primary" onclick="logAIResult()">📝 记录</button>
+        </div>
+      </div></div>
+  </div>
+
+  <!-- 评分榜面板 -->
+  <div id="rd-panel-scores" style="display:none">
+    <div style="display:flex;gap:12px;align-items:center;margin-bottom:1rem">
+      <button class="btn primary" onclick="loadScores()">🔄 刷新评分榜</button>
+      <span style="font-size:12px;color:var(--t3)" id="rd-scores-count"></span>
+    </div>
+    <div class="panel"><div class="p-body" style="max-height:600px">
+      <table class="tbl"><thead><tr>
+        <th style="width:28px">#</th><th>域名</th><th style="text-align:right">综合评分</th><th style="text-align:right">发现新品数</th><th style="text-align:right">累计新品</th><th>最近扫描</th><th>操作</th>
+      </tr></thead><tbody id="rd-scores-tbody"><tr><td colspan="7" style="text-align:center;color:var(--t3);padding:40px">点击刷新按钮</td></tr></tbody></table>
+    </div></div>
+  </div>
+</div>
+
+<!-- ═══════════════ 智能跟品队列 Tab ═══════════════ -->
+<div class="page" id="tab-followable">
+  <div class="followable-page-head">
+    <div>
+      <h2>28闭环跟品台</h2>
+      <p>8011先筛最重要20%，再回查8000是否有投广告，最后只保留马上跟、先拆素材、补证观察和不碰。</p>
+    </div>
+    <div class="followable-controls">
+      <select id="followable-min-score-home" class="followable-select" onchange="loadFollowableHome()">
+        <option value="80">马上跟优先 (≥80分)</option>
+        <option value="60" selected>行动队列 (≥60分)</option>
+        <option value="40">观察补证 (≥40分)</option>
+      </select>
+      <button class="btn" onclick="loadFollowableHome()">刷新闭环</button>
+      <button class="btn warn" onclick="runClosedLoopHome()" id="btn-run-closed-loop" style="font-weight:600">循环三次</button>
+      <a href="/v2" style="color:var(--c6);font-size:12px;text-decoration:none">查看实战台 →</a>
+    </div>
+  </div>
+  <div class="closed-loop-strip" id="closed-loop-strip">
+    <div class="closed-loop-card"><div class="label">监控候选</div><div class="value">--</div><div class="note">来自8011快照</div></div>
+    <div class="closed-loop-card"><div class="label">重要20%</div><div class="value">--</div><div class="note">只看关键品</div></div>
+    <div class="closed-loop-card"><div class="label">8000有广告</div><div class="value">--</div><div class="note">竞品已投放</div></div>
+    <div class="closed-loop-card"><div class="label">强趋势跟</div><div class="value">--</div><div class="note">优先测试</div></div>
+    <div class="closed-loop-card"><div class="label">轻跟先拆</div><div class="value">--</div><div class="note">素材/供应链</div></div>
+    <div class="closed-loop-card"><div class="label">硬风险</div><div class="value">--</div><div class="note">暂不跟</div></div>
+  </div>
+  <div class="closed-loop-rounds" id="closed-loop-rounds"></div>
+  <div class="panel" style="border:2px solid var(--c4);background:linear-gradient(135deg, rgba(245,158,11,.05) 0%, rgba(245,158,11,.02) 100%)">
+    <div class="p-head">
+      <h3>闭环行动队列</h3>
+      <span class="p-badge" id="closed-loop-badge">等待加载</span>
+    </div>
+    <div class="p-body" style="max-height:calc(100vh - 210px);overflow-y:auto">
+      <table class="tbl">
+        <thead><tr>
+          <th style="width:28px">#</th>
+          <th>产品</th>
+          <th>状态</th>
+          <th class="num">价格</th>
+          <th class="num">28优先级</th>
+          <th class="num">广告数</th>
+          <th>广告热度</th>
+          <th>验真</th>
+          <th>趋势</th>
+          <th>平台趋势</th>
+          <th>操作</th>
+        </tr></thead>
+        <tbody id="followable-home-tbody">
+          <tr><td colspan="11" style="text-align:center;color:var(--t3);padding:40px">
+            <div>正在读取28闭环跟品结果</div>
+            <div style="font-size:11px;margin-top:4px;color:var(--t3)">可点击“循环三次”重新跑 8011 → 8000 → 跟品动作分流</div>
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════ 店铺详情 Modal ═══════════════ -->
+<div class="ovl hidden" id="modal"><div class="modal">
+  <div class="m-head">
+    <div><h3 id="md-title">--</h3><span class="m-domain" id="md-domain">--</span></div>
+    <button class="m-close" onclick="closeModal()">✕</button>
+  </div>
+  <div class="m-stats">
+    <div class="m-stat"><div class="v" style="color:var(--c1)" id="md-prods">--</div><div class="l">产品总数</div></div>
+    <div class="m-stat"><div class="v" style="color:var(--c2)" id="md-min">--</div><div class="l">最低价</div></div>
+    <div class="m-stat"><div class="v" style="color:var(--c6)" id="md-med">--</div><div class="l">中位数</div></div>
+    <div class="m-stat"><div class="v" style="color:var(--c3)" id="md-avg">--</div><div class="l">均价</div></div>
+    <div class="m-stat"><div class="v" style="color:var(--c5)" id="md-max">--</div><div class="l">最高价</div></div>
+  </div>
+  <div class="m-body">
+    <table class="tbl"><thead><tr><th>#</th><th>产品名称</th><th style="text-align:right">价格</th><th>Handle</th></tr></thead>
+    <tbody id="md-tbody"></tbody></table>
+  </div>
+  <div class="m-actions">
+    <button class="btn" onclick="exportStoreCSV()">📥 导出 CSV</button>
+    <button class="btn" onclick="closeModal()">关闭</button>
+  </div>
+</div></div>
+
+<script>
+// ═══════════════ 全局状态 ═══════════════
+let allStores = [], curPage = 'overview', currentModalStore = null;
+let storeSort = 'products', storeOrder = 'desc';
+let loadAllInFlight = null;
+let storePage = {limit: 100, offset: 0, total: 0, loading: false, timer: null};
+const bandColors = ['#12805c','#0f766e','#b7791f','#c2413a','#2563eb','#d97706'];
+
+async function api(path, opts) {
+  const timeoutMs = (opts && opts.timeoutMs) || 15000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const fetchOpts = {...(opts || {}), signal: controller.signal};
+  delete fetchOpts.timeoutMs;
+  try {
+    const r = await fetch(path, fetchOpts);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('请求超时，请稍后重试');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function h(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmt(v) { return Number(v || 0).toLocaleString(); }
+function jsq(v) { return JSON.stringify(String(v == null ? '' : v)); }
+
+function closedLoopChipClass(status) {
+  if (status === '马上跟') return 'follow';
+  if (status === '先拆素材') return 'teardown';
+  if (status === '补证观察') return 'verify';
+  if (status === '不碰') return 'avoid';
+  return 'low';
+}
+
+function renderClosedLoopHome(r, minScore) {
+  const summary = r.summary || {};
+  const strip = document.getElementById('closed-loop-strip');
+  const rounds = document.getElementById('closed-loop-rounds');
+  const badge = document.getElementById('closed-loop-badge');
+  const tbody = document.getElementById('followable-home-tbody');
+  const cards = [
+    ['监控候选', summary.source_products || 0, '来自8011快照'],
+    ['重要20%', summary.important_20 || 0, '最值得看的品'],
+    ['8000有广告', summary.important_20_with_ads || 0, '竞品已投放'],
+    ['强趋势跟', summary.follow_now || 0, '优先测试'],
+    ['轻跟先拆', summary.teardown_first || 0, '素材/供应链'],
+    ['硬风险', summary.avoid || 0, '暂不跟'],
+  ];
+  if (strip) {
+    strip.innerHTML = cards.map(card =>
+      '<div class="closed-loop-card"><div class="label">' + h(card[0]) + '</div><div class="value">' + Number(card[1] || 0).toLocaleString() + '</div><div class="note">' + h(card[2]) + '</div></div>'
+    ).join('');
+  }
+  if (rounds) {
+    rounds.innerHTML = (r.rounds || []).map(round =>
+      '<div class="closed-loop-round"><div class="name">第' + h(round.round) + '轮 · ' + h(round.name) + '</div>' +
+      '<div class="flow">' + Number(round.input || 0).toLocaleString() + ' → ' + Number(round.kept || 0).toLocaleString() + '</div>' +
+      '<div class="rule">' + h(round.rule || '') + '</div></div>'
+    ).join('');
+  }
+  if (badge) {
+    badge.textContent = '三轮闭环 · ' + (r.source_generated_at || r.generated_at || '').slice(0, 19).replace('T', ' ');
+  }
+
+  const items = (r.items || [])
+    .filter(item => Number(item.priority || item.follow_priority_score || item.score || 0) >= minScore)
+    .slice(0, 50);
+  if (!items.length) {
+    tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--t3);padding:40px">当前没有达到 ' + minScore + ' 分的闭环行动项。可以降低分数，或点击“循环三次”重新跑 8011 → 8000 → 跟品动作分流。</td></tr>';
+    return;
+  }
+  tbody.innerHTML = items.map((item, i) => {
+    const status = item.follow_status || '低优先';
+    const chip = closedLoopChipClass(status);
+    const proof = Number(item.strict_validation_count || 0) + '/' + Number(item.required_validation_count || 2);
+    const trend = item.trend_status || 'unverified';
+    const gaps = (item.evidence_gaps || []).slice(0, 2).join(' · ');
+    const reason = item.follow_reason || gaps || item.decision || '';
+    const rankColor = item.important_20 ? 'var(--c4)' : 'var(--t3)';
+    return '<tr>' +
+      '<td style="font-weight:700;color:' + rankColor + '">' + h(item.rank || (i + 1)) + '</td>' +
+      '<td><a class="product-link" href="' + h(item.product_url || '#') + '" target="_blank" rel="noopener noreferrer" title="' + h(item.title || '') + '">' + h(item.title || '') + '</a><div class="meta-row">' + h(item.domain || '') + (item.important_20 ? ' · 重要20%' : '') + '</div></td>' +
+      '<td><span class="status-chip ' + chip + '">' + h(status) + '</span></td>' +
+      '<td class="num highlight">$' + Number(item.price || 0).toLocaleString() + '</td>' +
+      '<td class="num" style="font-weight:700;color:' + (Number(item.priority || 0) >= 80 ? 'var(--c2)' : 'var(--c4)') + '">' + Number(item.priority || 0) + '</td>' +
+      '<td class="num">' + Number(item.ad_count || 0).toLocaleString() + '</td>' +
+      '<td>' + h(item.ad_heat || '') + '<div class="meta-row">Orbit ' + h(item.orbit_score || 0) + ' · AI ' + h(item.ai_score || 0) + '</div></td>' +
+      '<td><span style="color:' + (item.strict_pass ? 'var(--c2)' : 'var(--c4)') + '">' + proof + '</span><div class="meta-row">' + h(item.ad_status || '') + '</div></td>' +
+      '<td>' + h(trend) + '<div class="meta-row">Score ' + h(item.trend_score || 0) + '</div></td>' +
+      '<td>' + h(String(reason).slice(0, 110)) + (gaps ? '<div class="meta-row">缺：' + h(String(gaps).slice(0, 90)) + '</div>' : '') + '</td>' +
+      '<td><a href="/v2" style="color:var(--c6);text-decoration:none">看动作</a></td>' +
+    '</tr>';
+  }).join('');
+}
+
+async function loadFollowableHome() {
+  const tbody = document.getElementById('followable-home-tbody');
+  if (!tbody) return;
+  const minScore = parseInt(document.getElementById('followable-min-score-home')?.value || '60', 10);
+  tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--t3);padding:40px">正在读取28闭环跟品台...</td></tr>';
+  try {
+    const r = await api('/api/v2/workbench/closed-loop?cycles=3&limit=50', {timeoutMs:20000});
+    if (!r || !r.ok) {
+      tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--t3);padding:40px">暂无28闭环结果，点击“循环三次”先跑 8011 → 8000 → 跟品动作分流。</td></tr>';
+      return;
+    }
+    renderClosedLoopHome(r, minScore);
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--c5);padding:40px">加载失败: ' + h(e.message) + '</td></tr>';
+  }
+}
+
+async function runClosedLoopHome() {
+  const btn = document.getElementById('btn-run-closed-loop');
+  const tbody = document.getElementById('followable-home-tbody');
+  const minScore = parseInt(document.getElementById('followable-min-score-home')?.value || '60', 10);
+  if (btn) { btn.disabled = true; btn.textContent = '三轮循环中'; }
+  if (tbody) tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--t3);padding:40px">正在循环三次：8011竞品快照 → 8000广告投放 → 跟品动作分流...</td></tr>';
+  try {
+    const r = await api('/api/v2/workbench/closed-loop/run?cycles=3&limit=50&trend_top_n=50&fb_limit=5000&fb_exact_verify_limit=300&trend_geo=US', {method:'POST', timeoutMs:120000});
+    if (!r || !r.ok) throw new Error((r && r.error) || '闭环运行失败');
+    renderClosedLoopHome(r, minScore);
+  } catch(e) {
+    if (tbody) tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:var(--c5);padding:40px">循环失败: ' + h(e.message) + '</td></tr>';
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '循环三次'; }
+  }
+}
+
+async function apiRefresh() {
+  const status = document.getElementById('nav-status');
+  if (status) status.textContent = '正在刷新数据...';
+  try {
+    await api('/api/dashboard/refresh', {method:'POST', timeoutMs:30000});
+    await loadAll(true);
+  } catch(e) {
+    if (status) status.textContent = '刷新失败: ' + e.message;
+  }
+}
+
+let bgRefreshTimer = null;
+
+async function startBackgroundRefresh() {
+  const btn = document.getElementById('btn-bg-refresh');
+  btn.disabled = true;
+  btn.textContent = '后台刷新中';
+  try {
+    const d = await api('/api/dashboard/background-refresh?mode=all&limit=0&workers=12', {method:'POST'});
+    renderBackgroundRefresh(d);
+    scheduleBackgroundRefreshPoll();
+  } catch(e) {
+    renderBackgroundRefresh({ok:false, running:false, state:'failed', message:'启动失败: '+e.message, total:0, completed:0});
+    btn.disabled = false;
+    btn.textContent = '后台全量刷新';
+  }
+}
+
+function scheduleBackgroundRefreshPoll() {
+  if (bgRefreshTimer) clearTimeout(bgRefreshTimer);
+  bgRefreshTimer = setTimeout(pollBackgroundRefresh, 2500);
+}
+
+async function pollBackgroundRefresh() {
+  try {
+    const d = await api('/api/dashboard/background-refresh/status');
+    renderBackgroundRefresh(d);
+    if (d.running) {
+      scheduleBackgroundRefreshPoll();
+    } else {
+      const btn = document.getElementById('btn-bg-refresh');
+      btn.disabled = false;
+      btn.textContent = '后台全量刷新';
+      if (d.state === 'completed') await loadAll(true);
+    }
+  } catch(e) {
+    scheduleBackgroundRefreshPoll();
+  }
+}
+
+function renderBackgroundRefresh(d) {
+  const panel = document.getElementById('bg-refresh-panel');
+  panel.classList.add('show');
+  const total = d.total || 0;
+  const completed = d.completed || 0;
+  const pct = total ? Math.min(100, Math.round(completed / total * 1000) / 10) : 0;
+  document.getElementById('bg-refresh-badge').textContent = d.state || 'idle';
+  document.getElementById('bg-refresh-message').textContent = d.message || '';
+  document.getElementById('bg-refresh-progress').textContent = completed.toLocaleString() + '/' + total.toLocaleString() + ' · ' + pct + '%';
+  document.getElementById('bg-refresh-fill').style.width = pct + '%';
+  document.getElementById('bg-ok').textContent = (d.ok_count || 0).toLocaleString();
+  document.getElementById('bg-failed').textContent = (d.failed_count || 0).toLocaleString();
+  document.getElementById('bg-nodata').textContent = (d.no_data_count || 0).toLocaleString();
+  document.getElementById('bg-new').textContent = (d.new_products || 0).toLocaleString();
+  document.getElementById('bg-updated').textContent = (d.updated_products || 0).toLocaleString();
+  document.getElementById('bg-removed').textContent = (d.removed_products || 0).toLocaleString();
+  document.getElementById('bg-price').textContent = (d.price_changes || 0).toLocaleString();
+  document.getElementById('bg-elapsed').textContent = (d.elapsed_seconds || 0) + 's';
+  const recent = (d.recent_results || []).slice(-5).reverse();
+  document.getElementById('bg-refresh-recent').innerHTML = recent.length
+    ? '最近：' + recent.map(r => `${h(r.domain)} <span style="color:${r.status === 'ok' ? 'var(--c2)' : r.status === 'no_data' ? 'var(--c4)' : 'var(--c5)'}">${h(r.status)}</span>`).join(' · ')
+    : '';
+}
+
+// ── 加载 ──
+function showLoadError(e) {
+  const msg = '加载失败: ' + (e && e.message ? e.message : e);
+  const status = document.getElementById('nav-status');
+  if (status) status.textContent = msg;
+  const topTable = document.getElementById('ov-top20');
+  if (topTable) topTable.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--c5);padding:32px">' + h(msg) + '</td></tr>';
+}
+
+async function loadAll(force = false) {
+  if (loadAllInFlight && !force) return loadAllInFlight;
+  loadAllInFlight = loadAllUnsafe().catch(e => { showLoadError(e); return null; }).finally(() => { loadAllInFlight = null; });
+  return loadAllInFlight;
+}
+
+async function loadAllUnsafe() {
+  const [s, top] = await Promise.all([api('/api/dashboard/summary'), api('/api/dashboard/top-stores?n=20')]);
+
+  // 导航状态
+  const registered = s.total_registered_stores || s.total_stores || 0;
+  document.getElementById('nav-status').textContent = fmt(registered) + ' 注册店铺 · ' + fmt(s.total_stores || 0) + ' 已抓快照';
+  document.getElementById('nav-ts').textContent = new Date(s.generated_at).toLocaleTimeString('zh-CN');
+
+  // 总览 KPI
+  document.getElementById('ov-registered').textContent = fmt(registered);
+  document.getElementById('ov-stores').textContent = fmt(s.total_snapshot_stores || s.total_stores);
+  document.getElementById('ov-queue').textContent = fmt(s.scan_queue_pending || 0);
+  document.getElementById('ov-target').textContent = fmt(s.registry_target || 1000000);
+  document.getElementById('ov-coverage').textContent = Number(s.registry_coverage_pct || 0).toFixed(3) + '%';
+  document.getElementById('ov-prods').textContent = fmt(s.total_products);
+  document.getElementById('ov-act1').textContent = s.active_1d;
+  document.getElementById('ov-act3').textContent = s.active_3d;
+  document.getElementById('ov-avg').textContent = '$' + s.avg_price.toLocaleString();
+  document.getElementById('ov-med').textContent = '$' + s.median_price.toLocaleString();
+
+  // 价格分布
+  renderBars('ov-bands', s.price_bands, bandColors);
+  renderBars('ov-tiers', s.store_tiers, [bandColors[0], bandColors[1], '#f59e0b', '#ef4444', '#64748b']);
+
+  // Top 20 表格
+  const top20 = top.top_by_products.slice(0, 20);
+  document.getElementById('ov-top20').innerHTML = top20.map((s,i) => `
+    <tr><td style="font-weight:700;color:${i<3?'var(--c4)':'var(--t3)'}">${i+1}</td>
+    <td><a onclick="openDetail('${s.domain}')">${s.domain}</a></td>
+    <td class="num" style="font-weight:600">${s.product_count.toLocaleString()}</td>
+    <td class="num">$${s.p_min}</td><td class="num">$${s.p_max}</td><td class="num">$${s.p_avg}</td>
+    <td class="muted">${s.last_check||''}</td></tr>`).join('');
+
+  // 活动时间线
+  renderActivity(s.activity);
+
+  // 排行榜
+  renderRanking('rk-products', top.top_by_products, 'product_count', '个产品');
+  const byPrice = top.top_by_price.filter(s => s.product_count >= 10);
+  renderRanking('rk-price-high', byPrice.slice(0, 20), 'p_avg', '均价');
+  renderRanking('rk-price-low', [...byPrice].reverse().slice(0, 20), 'p_avg', '均价');
+  renderRanking('rk-range', top.top_by_products.slice(0, 20), null, '价差');
+
+  // 价格分析
+  document.getElementById('pc-total').textContent = s.total_products.toLocaleString() + ' 个产品';
+  renderBars('pc-bands', s.price_bands, bandColors);
+  renderBars('pc-tiers', s.store_tiers, [bandColors[0], bandColors[1], '#f59e0b', '#ef4444', '#64748b']);
+  const rangeStores = [...top.top_by_products].filter(s => s.p_min > 0).sort((a,b) => (b.p_max/Math.max(b.p_min,0.01)) - (a.p_max/Math.max(a.p_min,0.01))).slice(0, 30);
+  document.getElementById('pc-table').innerHTML = rangeStores.map((s,i) => `
+    <tr><td style="font-weight:700;color:${i<3?'var(--c4)':'var(--t3)'}">${i+1}</td>
+    <td><a onclick="openDetail('${s.domain}')">${s.domain}</a></td>
+    <td class="num">${s.product_count}</td><td class="num">$${s.p_min}</td><td class="num">$${s.p_q25}</td>
+    <td class="num">$${s.p_med}</td><td class="num">$${s.p_q75}</td><td class="num">$${s.p_max}</td>
+    <td class="num highlight">${(s.p_max/Math.max(s.p_min,0.01)).toFixed(0)}x</td></tr>`).join('');
+  const under50 = s.all_prices_sorted ? s.all_prices_sorted.filter(p => p < 50).length : 0;
+  const under50Pct = s.total_products > 0 ? (under50/s.total_products*100).toFixed(1) : 0;
+  document.getElementById('pc-under50').textContent = under50Pct + '%';
+  document.getElementById('pc-insight').textContent =
+    under50Pct > 50 ? '过半产品定价在 $50 以下 —— 低价市场竞争激烈，考虑差异化或提升客单价' :
+    under50Pct > 30 ? '约三分之一产品在 $50 以下，中高端市场仍有空间' : '市场偏中高端，$50 以下产品占比较低';
+
+  // 店铺列表
+  if (document.getElementById('tab-stores')?.classList.contains('active') || !storePage.total) {
+    await renderStoreTable();
+  }
+  if (document.getElementById('tab-followable')?.classList.contains('active')) {
+    loadFollowableHome();
+  }
+}
+
+function renderBars(id, data, colors) {
+  const max = Math.max(...Object.values(data), 1);
+  document.getElementById(id).innerHTML = Object.entries(data).map(([label, count], i) => `
+    <div class="bar-item"><span class="bar-label">${label}</span>
+    <div class="bar-track"><div class="bar-fill" style="width:${Math.max(count/max*100,1.5)}%;background:${colors[i%colors.length]}">
+    <span class="bar-text">${count.toLocaleString()}</span></div></div></div>`).join('');
+}
+
+function renderActivity(data) {
+  const entries = Object.entries(data); if (!entries.length) return;
+  const max = Math.max(...entries.map(([_,c]) => c), 1);
+  document.getElementById('ov-activity').innerHTML = entries.map(([date, count]) => {
+    const d = new Date(date); const dayNames = ['周日','周一','周二','周三','周四','周五','周六'];
+    return `<div class="bar-item"><span class="bar-label">${date.slice(5)} ${dayNames[d.getDay()]}</span>
+    <div class="bar-track"><div class="bar-fill" style="width:${Math.max(count/max*100,2)}%;background:var(--c1)">
+    <span class="bar-text">${count}家</span></div></div></div>`;
+  }).join('');
+}
+
+function renderRanking(id, stores, key, unit) {
+  let html = '';
+  stores.forEach((s, i) => {
+    const cls = i === 0 ? 'gold' : i === 1 ? 'silver' : i === 2 ? 'bronze' : '';
+    let val;
+    if (key === 'p_avg') val = '$' + s[key].toLocaleString();
+    else if (key === 'product_count') val = s[key].toLocaleString();
+    else val = '$' + (s.p_max - s.p_min).toLocaleString();
+    html += `<div class="rank-bar">
+      <span class="rank-num ${cls}">${i+1}</span>
+      <div class="rank-info"><span class="rank-name" onclick="openDetail('${s.domain}')">${s.domain}</span>
+      <span class="rank-meta">${s.product_count} 产品 · $${s.p_min}–$${s.p_max}</span></div>
+      <span class="rank-val">${val} ${unit||''}</span></div>`;
+  });
+  document.getElementById(id).innerHTML = html;
+}
+
+async function renderStoreTable() {
+  const tbody = document.getElementById('st-tbody');
+  if (!tbody || storePage.loading) return;
+  storePage.loading = true;
+  tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--t3);padding:32px">正在读取百万注册表分页...</td></tr>';
+  const q = (document.getElementById('st-search')?.value || '').trim();
+  try {
+    const params = new URLSearchParams({
+      limit: String(storePage.limit),
+      offset: String(storePage.offset),
+      sort: storeSort,
+      order: storeOrder,
+      search: q,
+    });
+    const d = await api('/api/dashboard/stores?' + params.toString(), {timeoutMs:30000});
+    allStores = d.stores || [];
+    storePage.total = Number(d.total || 0);
+    storePage.offset = Number(d.offset || storePage.offset || 0);
+    updateStorePager();
+    if (!allStores.length) {
+      tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--t3);padding:32px">没有匹配店铺</td></tr>';
+      return;
+    }
+    tbody.innerHTML = allStores.map(s => {
+      const hasSnapshot = !!s.has_snapshot || Number(s.product_count || 0) > 0;
+      const status = s.last_check ? (new Date(s.last_check) > new Date(Date.now()-86400000) ? 'hot' : new Date(s.last_check) > new Date(Date.now()-259200000) ? 'warm' : 'cool') : 'cold';
+      const q25 = Number(s.p_q25 || s.p_med || 0);
+      const q75 = Number(s.p_q75 || s.p_med || 0);
+      const rawDomain = String(s.domain || '');
+      const domain = h(rawDomain);
+      const domainArg = jsq(rawDomain);
+      return `<tr>
+        <td><a onclick="${hasSnapshot ? `openDetail(${domainArg})` : `seedDomainThenScan(${domainArg})`}">${domain}</a> ${hasSnapshot ? '<span class="pill">已抓</span>' : '<span class="pill">待扫</span>'}</td>
+        <td class="num" style="font-weight:600">${fmt(s.product_count)}</td>
+        <td class="num">$${Number(s.p_min || 0).toLocaleString()}</td><td class="num">$${q25.toLocaleString()}</td><td class="num">$${Number(s.p_med || 0).toLocaleString()}</td>
+        <td class="num">$${q75.toLocaleString()}</td><td class="num">$${Number(s.p_max || 0).toLocaleString()}</td><td class="num" style="font-weight:600">$${Number(s.p_avg || 0).toLocaleString()}</td>
+        <td class="muted"><span class="status-dot ${status}"></span>${h(s.last_check || s.status || '待扫')}</td>
+        <td>${hasSnapshot ? `<a onclick="openDetail(${domainArg})">详情</a>` : `<a style="color:var(--c4)" onclick="seedDomainThenScan(${domainArg})">抓取</a>`}</td></tr>`;
+    }).join('');
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--c5);padding:32px">加载失败: ' + h(e.message) + '</td></tr>';
+  } finally {
+    storePage.loading = false;
+  }
+}
+
+function updateStorePager() {
+  const start = storePage.total ? storePage.offset + 1 : 0;
+  const end = Math.min(storePage.offset + storePage.limit, storePage.total);
+  const totalText = '共 ' + fmt(storePage.total) + ' 家店铺';
+  const totalEl = document.getElementById('st-total');
+  const pageEl = document.getElementById('st-page');
+  const prev = document.getElementById('st-prev');
+  const next = document.getElementById('st-next');
+  if (totalEl) totalEl.textContent = totalText;
+  if (pageEl) pageEl.textContent = fmt(start) + '-' + fmt(end);
+  if (prev) prev.disabled = storePage.offset <= 0 || storePage.loading;
+  if (next) next.disabled = storePage.offset + storePage.limit >= storePage.total || storePage.loading;
+}
+
+function scheduleStoreTable() {
+  clearTimeout(storePage.timer);
+  storePage.timer = setTimeout(() => {
+    storePage.offset = 0;
+    renderStoreTable();
+  }, 250);
+}
+
+function setStoreSort(sort) {
+  if (storeSort === sort) storeOrder = storeOrder === 'desc' ? 'asc' : 'desc';
+  else { storeSort = sort; storeOrder = 'desc'; }
+  storePage.offset = 0;
+  renderStoreTable();
+}
+
+function prevStorePage() {
+  storePage.offset = Math.max(0, storePage.offset - storePage.limit);
+  renderStoreTable();
+}
+
+function nextStorePage() {
+  if (storePage.offset + storePage.limit < storePage.total) {
+    storePage.offset += storePage.limit;
+    renderStoreTable();
+  }
+}
+
+async function seedRegistry8000() {
+  const btns = [...document.querySelectorAll('button')].filter(b => (b.textContent || '').includes('同步到百万注册表'));
+  btns.forEach(b => { b.disabled = true; b.dataset.oldText = b.textContent; b.textContent = '同步中...'; });
+  try {
+    const d = await api('/api/dashboard/store-registry/seed?source=8000&limit=1000000&page_size=5000', {method:'POST', timeoutMs:120000});
+    const total = d.registry?.total_registered_stores || 0;
+    const target = d.registry?.target || 1000000;
+    const imported = d.details?.imported_or_updated || d.details?.brands_8000?.imported_or_updated || 0;
+    document.getElementById('nav-status').textContent = '已同步 ' + fmt(total) + '/' + fmt(target) + ' 真实域名 · 本次更新 ' + fmt(imported);
+    storePage.offset = 0;
+    await loadAll(true);
+    if (document.getElementById('tab-external')?.classList.contains('active')) loadExternalBrands();
+  } catch(e) {
+    document.getElementById('nav-status').textContent = '同步失败: ' + e.message;
+    alert('同步失败: ' + e.message);
+  } finally {
+    btns.forEach(b => { b.disabled = false; b.textContent = b.dataset.oldText || '同步到百万注册表'; });
+  }
+}
+
+async function seedDomainThenScan(domain) {
+  const rawDomain = String(domain || '').trim().toLowerCase();
+  if (!rawDomain) return;
+  const status = document.getElementById('nav-status');
+  if (status) status.textContent = '正在抓取 ' + rawDomain + ' ...';
+  try {
+    await api('/api/dashboard/store-registry/import', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({domains:[rawDomain], source:'manual_scan'}),
+      timeoutMs:30000,
+    });
+    const r = await fetch('/monitor/scrape', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({domains:[rawDomain]}),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const result = d[rawDomain] || Object.values(d || {})[0] || {};
+    if (status) status.textContent = rawDomain + ' 抓取结果: ' + (result.status || 'unknown') + ' · 产品 ' + fmt(result.product_count || 0);
+    await loadAll(true);
+    if ((result.status || '') === 'ok') openDetail(rawDomain);
+  } catch(e) {
+    if (status) status.textContent = rawDomain + ' 抓取失败: ' + e.message;
+  }
+}
+
+// ── 店铺详情 ──
+async function openDetail(domain) {
+  currentModalStore = domain;
+  document.getElementById('modal').classList.remove('hidden');
+  document.getElementById('md-title').textContent = domain;
+  document.getElementById('md-domain').textContent = '加载中...';
+  try {
+    const d = await api('/api/dashboard/store/' + domain);
+    document.getElementById('md-domain').textContent = '最后抓取: ' + (d.last_check || '未知');
+    document.getElementById('md-prods').textContent = d.product_count.toLocaleString();
+    document.getElementById('md-min').textContent = '$' + d.price_stats.min.toLocaleString();
+    document.getElementById('md-med').textContent = '$' + d.price_stats.median.toLocaleString();
+    document.getElementById('md-avg').textContent = '$' + d.price_stats.avg.toLocaleString();
+    document.getElementById('md-max').textContent = '$' + d.price_stats.max.toLocaleString();
+    document.getElementById('md-tbody').innerHTML = d.products.slice(0, 500).map((p, i) => `
+      <tr><td>${i+1}</td><td>${p.title||'--'}</td>
+      <td class="num" style="font-weight:600">$${(p.price||0).toLocaleString()}</td>
+      <td class="muted">${p.handle||''}</td></tr>`).join('');
+  } catch(e) { document.getElementById('md-tbody').innerHTML = '<tr><td colspan="4" style="color:var(--c5)">加载失败</td></tr>'; }
+}
+
+function closeModal() { document.getElementById('modal').classList.add('hidden'); currentModalStore = null; }
+
+function exportStoreCSV() {
+  if (!currentModalStore) return;
+  fetch('/api/dashboard/store/' + currentModalStore).then(r => r.json()).then(d => {
+    let csv = '序号,产品名称,价格,Handle\n';
+    d.products.forEach((p, i) => { csv += `${i+1},"${(p.title||'').replace(/"/g,'""')}",${p.price||0},${p.handle||''}\n`; });
+    const blob = new Blob(['﻿' + csv], {type:'text/csv;charset=utf-8'});
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+    a.download = currentModalStore + '_products.csv'; a.click();
+  });
+}
+
+// ── 产品搜索 ──
+async function doProductSearch() {
+  const q = document.getElementById('sq-input').value.trim();
+  if (!q) return;
+  document.getElementById('sq-count').textContent = '搜索中...';
+  const d = await api('/api/dashboard/search-products?q=' + encodeURIComponent(q) + '&limit=100');
+  document.getElementById('sq-count').textContent = '找到 ' + d.results.length + ' 个结果';
+  document.getElementById('sq-tbody').innerHTML = d.results.length === 0
+    ? '<tr><td colspan="4" style="text-align:center;color:var(--t3);padding:40px">未找到匹配产品</td></tr>'
+    : d.results.map(r => `<tr><td>${r.title}</td><td class="num" style="font-weight:600">$${(r.price||0).toLocaleString()}</td>
+    <td><a onclick="openDetail('${r.store}')">${r.store}</a></td><td class="muted">${r.handle||''}</td></tr>`).join('');
+}
+
+// ── Tab 切换 ──
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('tab-' + tab).classList.add('active');
+  document.querySelectorAll('.tab').forEach(t => { if (t.textContent.includes({'overview':'总览','stores':'店铺列表','rankings':'排行榜','pricing':'价格分析','search':'产品搜索','external':'独立站监控','radar':'竞品雷达','followable':'智能跟品队列'}[tab])) t.classList.add('active'); });
+  if (tab === 'stores') renderStoreTable();
+  if (tab === 'external') loadExternalBrands();
+  if (tab === 'radar') switchRadarTab('scan');
+  if (tab === 'followable') loadFollowableHome();
+}
+
+// ── 独立站监控（从 8000 端口读取） ──
+let externalBrands = [], extSelected = new Set();
+
+async function loadExternalBrands() {
+  document.getElementById('ex-tbody').innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--t3);padding:40px">⏳ 从 127.0.0.1:8000 加载品牌数据...</td></tr>';
+  try {
+    const d = await api('/api/dashboard/external-brands?limit=5000');
+    if (!d.ok) { document.getElementById('ex-tbody').innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--c5);padding:40px">❌ 无法连接 8000 端口: ' + d.error + '</td></tr>'; return; }
+    externalBrands = d.brands;
+    document.getElementById('ex-total8000').textContent = d.total_from_8000.toLocaleString();
+    document.getElementById('ex-withsnap').textContent = d.with_snapshot.toLocaleString();
+    document.getElementById('ex-nosnap').textContent = d.without_snapshot.toLocaleString();
+    document.getElementById('ex-coverage').textContent = (d.total_from_8000 > 0 ? (d.with_snapshot/d.total_from_8000*100).toFixed(1) : 0) + '%';
+    document.getElementById('ex-watchlist').textContent = externalBrands.filter(b => b.in_watchlist).length.toLocaleString();
+    document.getElementById('ex-snaps').textContent = d.with_snapshot.toLocaleString();
+    document.getElementById('ex-count').textContent = '共 ' + d.total_from_8000 + ' 个品牌';
+    renderExternalTable();
+  } catch(e) { document.getElementById('ex-tbody').innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--c5);padding:40px">❌ 加载失败: ' + e.message + '</td></tr>'; }
+}
+
+function renderExternalTable() {
+  const q = (document.getElementById('ex-search')?.value || '').toLowerCase();
+  const filter = document.getElementById('ex-filter')?.value || 'all';
+  let list = externalBrands.filter(b => !q || (b.domain||'').toLowerCase().includes(q) || (b.canonical_name||'').toLowerCase().includes(q));
+  if (filter === 'snapshot') list = list.filter(b => b.has_snapshot);
+  else if (filter === 'no-snapshot') list = list.filter(b => !b.has_snapshot);
+  else if (filter === 'watchlist') list = list.filter(b => b.in_watchlist);
+
+  const gradeColors = { 'WATCH': 'var(--c5)', 'SOLID': 'var(--c2)', 'HOT': 'var(--c4)', 'NEW': 'var(--c6)' };
+  document.getElementById('ex-tbody').innerHTML = list.length === 0
+    ? '<tr><td colspan="9" style="text-align:center;color:var(--t3);padding:40px">无匹配结果</td></tr>'
+    : list.slice(0, 500).map(b => `<tr>
+      <td><input type="checkbox" ${extSelected.has(b.domain)?'checked':''} onchange="toggleSelect('${b.domain}')"></td>
+      <td><a onclick="openDetail('${b.domain}')">${b.domain}</a> ${b.has_snapshot?'✅':''} ${b.in_watchlist?'📋':''}</td>
+      <td>${b.canonical_name||'--'}</td>
+      <td class="num">${b.ai_score||'--'}</td>
+      <td class="num">${(b.appearance_count||0).toLocaleString()}</td>
+      <td class="num">${b.orbit_score||'--'}</td>
+      <td style="color:${gradeColors[b.grade]||'var(--t2)'};font-weight:600">${b.grade||'--'}</td>
+      <td>${b.status||'--'}</td>
+      <td>${b.has_snapshot ? `<a onclick="openDetail('${b.domain}')">查看</a>` : `<a style="color:var(--c4)" onclick="scrapeThis('${b.domain}')">抓取</a>`}</td>
+    </tr>`).join('');
+}
+
+function toggleSelect(domain) { extSelected.has(domain) ? extSelected.delete(domain) : extSelected.add(domain); }
+function toggleSelectAll() { const all = document.getElementById('ex-select-all').checked;
+  const visible = [...document.querySelectorAll('#ex-tbody input[type=checkbox]')];
+  if (all) visible.forEach(cb => extSelected.add(cb.closest('tr')?.querySelector('a')?.textContent?.split(' ')[0] || ''));
+  else extSelected.clear();
+  renderExternalTable();
+}
+
+async function addSelectedToScrape() {
+  if (extSelected.size === 0) { alert('请先勾选要抓取的域名'); return; }
+  const domains = [...extSelected];
+  alert('开始抓取 ' + domains.length + ' 个域名，请稍候...');
+  for (const d of domains) {
+    try {
+      const r = await fetch('/monitor/scrape', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({domains:[d]}) });
+      const j = await r.json(); console.log(d, j);
+    } catch(e) { console.error(d, e); }
+  }
+  extSelected.clear();
+  loadExternalBrands();
+  loadAll();
+}
+
+async function scrapeThis(domain) {
+  try {
+    const r = await fetch('/monitor/scrape', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({domains:[domain]}) });
+    const j = await r.json(); console.log(domain, j);
+    loadExternalBrands(); loadAll();
+  } catch(e) { console.error(e); }
+}
+
+// ── 上架时间检测 ──
+async function checkListingTimes() {
+  const panel = document.getElementById('listing-panel');
+  panel.style.display = 'block';
+  const tbody = document.getElementById('listing-tbody');
+  tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--t3);padding:40px">⏳ 正在检测产品上架时间（从 Shopify products.json 读取，最多 20 个域名）...</td></tr>';
+
+  // 收集要检测的域名：优先勾选的，否则取当前筛选列表
+  let domains = [...extSelected];
+  if (domains.length === 0) {
+    const q = (document.getElementById('ex-search')?.value || '').toLowerCase();
+    const filter = document.getElementById('ex-filter')?.value || 'all';
+    let list = externalBrands.filter(b => !q || (b.domain||'').toLowerCase().includes(q));
+    if (filter === 'snapshot') list = list.filter(b => b.has_snapshot);
+    else if (filter === 'no-snapshot') list = list.filter(b => !b.has_snapshot);
+    else if (filter === 'watchlist') list = list.filter(b => b.in_watchlist);
+    domains = list.slice(0, 20).map(b => b.domain);
+  }
+  if (domains.length === 0) { tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--c5);padding:40px">没有要检测的域名</td></tr>'; return; }
+
+  const d = await api('/api/dashboard/check-listing-times?domains=' + encodeURIComponent(domains.slice(0, 20).join(',')) + '&limit=20');
+  document.getElementById('listing-badge').textContent = d.success_count + '/' + d.total_checked + ' 成功';
+  if (!d.results || d.results.length === 0) { tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--c5);padding:40px">无结果</td></tr>'; return; }
+
+  tbody.innerHTML = d.results.map(r => {
+    if (!r.ok) return `<tr><td>${r.domain}</td><td colspan="7" style="color:var(--c5)">❌ ${r.error||'请求失败'}</td><td><a style="color:var(--c4)" onclick="scrapeThis('${r.domain}')">抓取</a></td></tr>`;
+    const newest = r.newest_created || '';
+    const daysAgo = newest ? Math.round((Date.now() - new Date(newest).getTime()) / 86400000) : null;
+    const freshnessIcon = daysAgo !== null ? (daysAgo <= 7 ? '🔥' : daysAgo <= 30 ? '🟢' : daysAgo <= 90 ? '🟡' : '⚪') : '';
+    return `<tr>
+      <td><a onclick="openDetail('${r.domain}')">${r.domain}</a></td>
+      <td class="num" style="font-weight:600">${r.product_count}</td>
+      <td>${r.oldest_created||'--'}</td>
+      <td>${r.newest_created||'--'} ${freshnessIcon}${daysAgo!==null?' '+daysAgo+'天前':''}</td>
+      <td>${r.oldest_published||'--'}</td>
+      <td>${r.newest_published||'--'}</td>
+      <td class="num">${r.cadence_days ? '每'+r.cadence_days+'天' : '--'}</td>
+      <td style="color:${r.active?'var(--c2)':'var(--t3)'};font-weight:600">${r.active?'活跃':'静态'}</td>
+      <td><a onclick="openDetail('${r.domain}')">详情</a></td>
+    </tr>`;
+  }).join('');
+  panel.scrollIntoView({behavior:'smooth'});
+}
+
+// ── 竞品雷达 ──
+let currentRadarTab = 'scan';
+
+function radarProductUrl(p) {
+  const raw = p.product_url || p.url || '';
+  if (raw) return raw;
+  const domain = String(p.domain || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  const handle = String(p.handle || p.product_handle || '').replace(/^\/+|\/+$/g, '');
+  if (domain && handle) return 'https://' + domain + '/products/' + encodeURIComponent(handle);
+  return domain ? 'https://' + domain : '#';
+}
+
+function renderRadarScanRows(picks, emptyText) {
+  const tbody = document.getElementById('rd-scan-tbody');
+  picks = picks || [];
+  if (!picks.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--c2);padding:40px">' + h(emptyText || '未发现新品') + '</td></tr>';
+    return;
+  }
+  tbody.innerHTML = picks.map((p,i) => {
+    const tierColor = p.tier&&p.tier.includes('测款')?'var(--c5)':p.tier&&p.tier.includes('拆解')?'var(--c4)':p.tier&&p.tier.includes('观察')?'var(--c6)':'var(--t3)';
+    const title = p.product_title || p.title || '--';
+    const cat = p.specific_category || p.micro_category || p.product_type || '待细分';
+    const rawCat = p.product_type_raw && p.product_type_raw !== cat ? ' · 原 ' + p.product_type_raw : '';
+    const shape = p.product_shape || p.core_mechanism || '';
+    const follow = p.how_to_follow || p.follow_playbook || p.creative_angle || '先补抓描述/图片/标签，再判断跟法。';
+    const intensity = p.follow_intensity || (p.score >= 82 ? '优先轻跟' : p.score >= 65 ? '轻跟先拆' : '观察/补证');
+    const depth = p.extraction_depth || '抓取不足';
+    const confidence = Number(p.category_confidence || 0);
+    const missing = (p.missing_fields || []).slice(0,3).join(' / ');
+    const focus = (p.monitoring_focus_fields || []).slice(0,3).join(' / ');
+    const reasons = (p.reasons || []).slice(0,3).join(' · ');
+    const kws = (p.micro_matched_keywords || p.matched_keywords || []).slice(0,3).join(', ');
+    return `<tr>
+      <td style="font-weight:700;color:${i<3?'var(--c4)':'var(--t3)'}">${i+1}</td>
+      <td style="white-space:normal;min-width:210px"><a class="product-link" href="${h(radarProductUrl(p))}" target="_blank" rel="noopener noreferrer" title="${h(title)}">${h(title)}</a></td>
+      <td><a onclick="openDetail(${jsq(p.domain||'')})">${h(p.domain||'')}</a><div class="meta-row">${Number(p.store_product_count||0).toLocaleString()} SKU</div></td>
+      <td class="num">$${Number(p.price||0).toLocaleString()}</td>
+      <td class="num highlight">${h(p.score||0)}</td>
+      <td style="color:${tierColor};font-weight:600">${h(p.tier||'--')}</td>
+      <td style="white-space:normal;min-width:150px"><strong style="color:var(--t1)">${h(cat)}</strong><div class="meta-row">${h(shape || '形态待补')} · 置信 ${confidence}%${h(rawCat)}</div><div class="meta-row">${h(kws || '关键词待补')}</div></td>
+      <td style="white-space:normal;min-width:240px"><strong style="color:var(--c6)">${h(intensity)}</strong><div class="meta-row">${h(follow).slice(0,160)}</div></td>
+      <td style="white-space:normal;min-width:170px"><strong style="color:${confidence<35?'var(--c5)':'var(--t2)'}">${h(depth)}</strong><div class="meta-row">${h(focus || '新品/价格/Offer/素材')}</div>${missing ? '<div class="meta-row" style="color:var(--c5)">缺 ' + h(missing) + '</div>' : ''}</td>
+      <td style="white-space:normal;min-width:230px;font-size:11px;color:var(--t3)">${h(reasons || p.monitoring_reason || '')}</td>
+    </tr>`;
+  }).join('');
+}
+
+function switchRadarTab(tab) {
+  currentRadarTab = tab;
+  ['scan','ads','ai','scores'].forEach(t => {
+    document.getElementById('rd-panel-'+t).style.display = t===tab?'block':'none';
+    const btn = document.getElementById('rdtab-'+t);
+    if (t===tab) { btn.style.background='var(--c1)'; btn.style.color='#fff'; btn.style.borderColor='var(--c1)'; }
+    else { btn.style.background=''; btn.style.color=''; btn.style.borderColor=''; }
+  });
+  if (tab==='ads') loadAdSignals();
+  if (tab==='ai') { loadAITemplates(); loadAIStatus(); }
+  if (tab==='scores') loadScores();
+}
+
+// 新品雷达扫描
+async function runFullScan() {
+  const limit = document.getElementById('rd-limit').value;
+  const domains = document.getElementById('rd-domains').value.trim();
+  document.getElementById('rd-scan-status').textContent = '⏳ 扫描中...';
+  document.getElementById('rd-scan-results').style.display = 'block';
+  document.getElementById('rd-scan-tbody').innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--t3);padding:40px">⏳ 正在扫描新品 + 放量信号 + AI检测... </td></tr>';
+
+  let url = '/api/radar/full-scan?limit=' + limit;
+  if (domains) url += '&domains=' + encodeURIComponent(domains);
+
+  try {
+    const d = await api(url, {method:'POST', timeoutMs:180000});
+    updateRadarKPIs(d);
+    document.getElementById('rd-scan-status').textContent = '✅ 完成';
+    document.getElementById('rd-scan-badge').textContent = d.radar_1_products?.new_products_found + ' 个新品';
+
+    // 显示新品列表
+    const picks = d.radar_1_products?.top_picks || [];
+    renderRadarScanRows(picks, '未发现新品（或所有站点已是最新）');
+
+    // 显示放量信号摘要
+    const adTop = d.radar_2_ads?.top_signals || [];
+    if (adTop.length > 0) {
+      document.getElementById('rd-ads').textContent = d.radar_2_ads?.active_ad_brands || 0;
+    }
+
+    // AI 购物提醒
+    if (d.radar_3_ai_shopping?.reminders?.length > 0) {
+      console.log('AI 购物提醒:', d.radar_3_ai_shopping.reminders);
+    }
+  } catch(e) {
+    document.getElementById('rd-scan-status').textContent = '❌ 失败';
+    document.getElementById('rd-scan-tbody').innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--c5);padding:40px">❌ 扫描失败: ' + h(e.message) + '</td></tr>';
+  }
+}
+
+async function runProductScan() {
+  const limit = document.getElementById('rd-limit').value;
+  const domains = document.getElementById('rd-domains').value.trim();
+  document.getElementById('rd-scan-status').textContent = '⏳ 仅新品扫描...';
+  document.getElementById('rd-scan-results').style.display = 'block';
+  document.getElementById('rd-scan-tbody').innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--t3);padding:40px">⏳ 扫描 Shopify / 非Shopify 兜底产品 diff...</td></tr>';
+
+  let url = '/api/radar/scan?limit=' + limit;
+  if (domains) url += '&domains=' + encodeURIComponent(domains);
+
+  try {
+    const d = await api(url, {method:'POST', timeoutMs:180000});
+    updateRadarKPIs({radar_1_products: {new_products_found: d.total_new_products, tier_summary: d.tier_summary}});
+    document.getElementById('rd-scan-status').textContent = '✅ 完成';
+    document.getElementById('rd-scan-badge').textContent = d.total_new_products + ' 个新品';
+    renderRadarScanRows(d.top_picks || [], '未发现新品');
+  } catch(e) {
+    document.getElementById('rd-scan-status').textContent = '❌ 失败';
+    document.getElementById('rd-scan-tbody').innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--c5);padding:40px">❌ 扫描失败: ' + h(e.message) + '</td></tr>';
+  }
+}
+
+function updateRadarKPIs(d) {
+  const r = d.radar_1_products || d;
+  document.getElementById('rd-new').textContent = (r.new_products_found||d.total_new_products||0).toLocaleString();
+  const ts = r.tier_summary || {};
+  document.getElementById('rd-tier1').textContent = ts['🚀 立即测款'] || 0;
+  document.getElementById('rd-tier2').textContent = ts['🔬 素材拆解'] || 0;
+  document.getElementById('rd-tier3').textContent = ts['👀 加入观察'] || 0;
+  document.getElementById('rd-tier4').textContent = ts['📝 仅记录'] || 0;
+  document.getElementById('rd-ads').textContent = (d.radar_2_ads?.active_ad_brands || '--');
+}
+
+// 放量雷达
+async function loadAdSignals() {
+  const min = document.getElementById('ads-min')?.value || 200;
+  document.getElementById('rd-ads-tbody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--t3);padding:40px">⏳ 加载中...</td></tr>';
+  try {
+    const d = await api('/api/radar/ad-signals?limit=100&min_appearances=' + min);
+    document.getElementById('rd-ads-status').textContent = d.total_active + ' 个活跃品牌';
+    const ss = d.stage_summary || {};
+    document.getElementById('rd-ads-big').textContent = ss['🔥🔥🔥 大规模放量'] || 0;
+    document.getElementById('rd-ads-mid').textContent = (ss['🔥🔥 放量中']||0) + (ss['🔥 起量中']||0);
+    document.getElementById('rd-ads-small').textContent = (ss['🟡 测试放量']||0) + (ss['🟢 初测']||0);
+    document.getElementById('rd-ads-tbody').innerHTML = (d.brands||[]).map((b,i) => {
+      const sc = b.stage||'';
+      const scColor = sc.includes('大规模')?'var(--c5)':sc.includes('放量中')?'var(--c4)':sc.includes('起量')?'var(--c6)':sc.includes('测试')?'var(--c2)':'var(--t3)';
+      return `<tr><td style="font-weight:700;color:${i<3?'var(--c4)':'var(--t3)'}">${i+1}</td>
+        <td><a onclick="openDetail('${b.domain}')">${b.domain}</a>${b.has_snapshot?' ✅':''}</td>
+        <td>${b.brand||'--'}</td><td class="num highlight">${(b.appearances||0).toLocaleString()}</td>
+        <td class="num">${b.orbit||0}</td><td class="num">${b.ai_score||0}</td><td>${b.grade||'--'}</td>
+        <td style="color:${scColor};font-weight:600">${sc}</td></tr>`;
+    }).join('') || '<tr><td colspan="8" style="text-align:center;color:var(--t3);padding:40px">无符合条件的品牌</td></tr>';
+  } catch(e) {
+    document.getElementById('rd-ads-tbody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--c5);padding:40px">❌ 8000 端口不可用</td></tr>';
+  }
+}
+
+// AI 购物雷达
+function loadAITemplates() {
+  const templates = [
+    ["best {category} for {pain_point} under ${price}", "ChatGPT/Perplexity/Gemini", "US", "是否出现/排名/URL/价格"],
+    ["I need a product to solve {problem}.", "ChatGPT/Perplexity/Gemini", "US", "是否推荐/排名/URL"],
+    ["What are the best {category} from independent brands?", "ChatGPT/Perplexity/Gemini", "US", "是否出现/品牌/URL"],
+    ["Compare {competitor} with alternatives under ${price}.", "ChatGPT/Perplexity/Gemini", "US", "是否出现/竞品/价格"],
+    ["Where can I buy {product_name}?", "ChatGPT/Perplexity/Gemini", "US", "是否出现/URL/商品卡"],
+    ["Recommend Shopify DTC brands selling {category}.", "ChatGPT/Perplexity/Gemini", "US", "品牌/URL/排名"],
+    ["top rated {category} for beginners", "ChatGPT/Perplexity/Gemini", "US", "是否出现/品牌/URL"],
+    ["{category} buying guide independent brands", "ChatGPT/Perplexity/Gemini", "US", "是否出现/品牌/排名"],
+  ];
+  document.getElementById('ai-tmpl-tbody').innerHTML = templates.map((t,i) =>
+    `<tr><td>${i+1}</td><td style="font-family:monospace;font-size:12px">${t[0]}</td><td>${t[1]}</td><td>${t[2]}</td><td>${t[3]}</td></tr>`
+  ).join('');
+}
+
+async function generateAIPrompts() {
+  const kw = document.getElementById('ai-kw').value || 'beauty device';
+  const brand = document.getElementById('ai-brand').value || '';
+  const price = document.getElementById('ai-price').value || '50';
+  const pain = document.getElementById('ai-pain').value || '';
+  const d = await api('/api/radar/ai-shopping/generate-prompts?keyword='+encodeURIComponent(kw)+'&brand='+encodeURIComponent(brand)+'&price='+price+'&problem='+encodeURIComponent(pain));
+  document.getElementById('ai-prompts-out').innerHTML = '<div style="margin-bottom:8px;color:var(--c1);font-weight:600">📋 请在 ChatGPT / Perplexity / Gemini 中使用以下 Prompt：</div>'
+    + d.prompts.map((p,i) => `<div style="margin-bottom:6px;padding:6px 10px;background:var(--bg);border-radius:6px">
+    <span style="color:var(--t3)">#${i+1}</span> <span style="color:var(--t1)">"${p.filled}"</span><br>
+    <span style="font-size:10px;color:var(--t3)">平台: ${p.model} · 国家: ${p.country}</span></div>`).join('')
+    + '<div style="margin-top:8px;font-size:11px;color:var(--c6)">记录字段: 是否出现 | 排名 | 引用URL | 是否显示价格 | 是否商品卡 | 是否可购买</div>';
+}
+
+async function loadAIStatus() {
+  try {
+    const d = await api('/api/radar/ai-shopping/status');
+    const brands = d.brands || {};
+    const entries = Object.entries(brands);
+    document.getElementById('ai-status-out').innerHTML = entries.length === 0
+      ? '<div style="color:var(--t3)">暂无 AI 购物检测数据。<br>点击左侧"生成 Prompt 模板"开始检测。</div>'
+      : '<table class="tbl"><thead><tr><th>品牌</th><th style="text-align:right">检测次数</th><th style="text-align:right">出现次数</th><th style="text-align:right">出现率</th><th>最近检测</th></tr></thead>'
+        + entries.map(([b,s]) => `<tr><td>${b}</td><td class="num">${s.total_checks}</td><td class="num highlight">${s.shown_count}</td><td class="num">${s.show_rate}</td><td>${s.last_check||''}</td></tr>`).join('')
+        + '</table>';
+  } catch(e) {}
+}
+
+async function logAIResult() {
+  const brand = document.getElementById('ai-log-brand').value.trim();
+  const status = document.getElementById('ai-log-status').value.trim();
+  const rank = document.getElementById('ai-log-rank').value.trim();
+  if (!brand || !status) { alert('请填写品牌名和检测结果'); return; }
+  const r = await fetch('/api/radar/ai-shopping/log', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({brand:brand, keyword:brand, results:[{
+      whether_shown: status.toLowerCase().includes('shown'), rank: rank||null, status: status
+    }]})
+  });
+  const j = await r.json();
+  if (j.ok) { alert('✅ 已记录 ' + brand); loadAIStatus(); }
+}
+
+// 评分榜
+async function loadScores() {
+  document.getElementById('rd-scores-tbody').innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--t3);padding:40px">⏳ 加载中...</td></tr>';
+  try {
+    const d = await api('/api/radar/scores');
+    document.getElementById('rd-scores-count').textContent = d.total_domains_scored + ' 家已评分';
+    document.getElementById('rd-scores-tbody').innerHTML = (d.domains||[]).slice(0,100).map((s,i) => {
+      const sc = s.top_score||0;
+      const scColor = sc>=80?'var(--c5)':sc>=60?'var(--c4)':sc>=40?'var(--c6)':'var(--t3)';
+      return `<tr><td style="font-weight:700;color:${i<3?'var(--c4)':'var(--t3)'}">${i+1}</td>
+        <td><a onclick="openDetail('${s.domain}')">${s.domain}</a></td>
+        <td class="num" style="color:${scColor};font-weight:700">${sc}</td>
+        <td class="num">${s.new_products_found||0}</td><td class="num">${s.total_new_ever||0}</td>
+        <td>${s.last_scan||''}</td><td><a onclick="openDetail('${s.domain}')">详情</a></td></tr>`;
+    }).join('') || '<tr><td colspan="7" style="text-align:center;color:var(--t3);padding:40px">暂无评分数据</td></tr>';
+  } catch(e) {
+    document.getElementById('rd-scores-tbody').innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--c5);padding:40px">加载失败</td></tr>';
+  }
+}
+
+// ── 键盘 ──
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ── 启动 ──
+loadAll();
+pollBackgroundRefresh();
+setInterval(loadAll, 60000);
+</script>
+</body>
+</html>""")
+
+
+# ═══════════════════════════════════════════════════════════
+#  Health
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+
+# ═══════════════════════════════════════════════════════════
+#  MONITOR endpoints
+# ═══════════════════════════════════════════════════════════
+
+class ScrapeRequest(BaseModel):
+    domains: list[str]
+
+@app.post("/monitor/scrape")
+def api_monitor_scrape(req: ScrapeRequest):
+    session = su.get_session(); results = {}
+    for domain in req.domains:
+        domain = su.normalize_domain(domain)
+        if not domain:
+            continue
+        try:
+            products = su.fetch_all_products(domain, session, best_effort=True)
+            if products:
+                su.save_snapshot(domain, [su.parse_product(p) for p in products])
+                results[domain] = {
+                    "domain": domain,
+                    "status": "ok",
+                    "product_count": len(products),
+                    "best_effort": any(bool(p.get("_best_effort")) for p in products),
+                }
+            else: results[domain] = {"status": "no_data", "product_count": 0}
+        except Exception as e: results[domain] = {"domain": domain, "status": "error", "error": str(e)}
+        _store_registry_mark_refresh_result({**results[domain], "domain": domain})
+    _load_all(force=True); return results
+
+@app.post("/monitor/check")
+def api_monitor_check(req: ScrapeRequest):
+    session = su.get_session(); results = {}
+    for domain in req.domains:
+        domain = su.normalize_domain(domain)
+        if not domain:
+            continue
+        try:
+            products = su.fetch_all_products(domain, session, best_effort=True)
+            if products:
+                changes = su.detect_changes(domain, products)
+                su.save_snapshot(domain, [su.parse_product(p) for p in products])
+                updated = changes.get("updated_products", changes.get("updated", [])) or []
+                price_changes = changes.get("price_changes")
+                if price_changes is None:
+                    price_changes = [item for item in updated if item.get("old_price") != item.get("new_price")]
+                results[domain] = {"domain": domain, "status": "ok", "product_count": len(products),
+                    "new_products": len(changes.get("new", [])),
+                    "removed_products": len(changes.get("removed", [])),
+                    "price_changes": len(price_changes or []), "changes": changes}
+            else: results[domain] = {"domain": domain, "status": "no_data", "product_count": 0}
+        except Exception as e: results[domain] = {"domain": domain, "status": "error", "error": str(e)}
+        _store_registry_mark_refresh_result({**results[domain], "domain": domain})
+    _load_all(force=True); return results
+
+@app.post("/monitor/export")
+def api_monitor_export(req: ScrapeRequest):
+    session = su.get_session(); results = {}
+    for domain in req.domains:
+        domain = su.normalize_domain(domain)
+        try:
+            products = su.fetch_all_products(domain, session)
+            if products:
+                su.monitor_export_excel(domain, products, su.fetch_collections(domain, session), su.fetch_shop_info(domain, session))
+                su.monitor_export_html(domain, products)
+                results[domain] = {"status": "ok", "product_count": len(products)}
+            else: results[domain] = {"status": "no_data"}
+        except Exception as e: results[domain] = {"status": "error", "error": str(e)}
+    return results
+
+
+# ═══════════════════════════════════════════════════════════
+#  DISCOVERY endpoints
+# ═══════════════════════════════════════════════════════════
+
+class DiscoverySearchRequest(BaseModel):
+    keyword: str; max_products: int = 30
+
+class DiscoveryBatchRequest(BaseModel): keywords: list[str]; max_per_kw: int = 20
+class VerifyRequest(BaseModel): keyword: str
+class VerifyBatchRequest(BaseModel): xlsx_path: str; top_n: int = 0
+
+@app.post("/discovery/search")
+def api_discovery_search(req: DiscoverySearchRequest):
+    products, brands = su.search_products(req.keyword, req.max_products)
+    return {"keyword": req.keyword, "product_count": len(products), "brand_count": len(brands),
+            "products": [su.flatten_product(p) for p in products], "brands": brands}
+
+@app.post("/discovery/batch")
+def api_discovery_batch(req: DiscoveryBatchRequest):
+    all_products, all_brands, seen = [], [], set()
+    for kw in req.keywords:
+        products, brands = su.search_products(kw, req.max_per_kw)
+        for p in products:
+            if p["upid"] not in seen: seen.add(p["upid"]); all_products.append(p)
+        for b in brands:
+            if b not in all_brands: all_brands.append(b)
+        time.sleep(su.random.uniform(2, 4))
+    return {"keywords": req.keywords, "product_count": len(all_products), "brand_count": len(all_brands),
+            "products": [su.flatten_product(p) for p in all_products], "brands": all_brands}
+
+@app.get("/discovery/inspire")
+def api_discovery_inspire():
+    words = []
+    for _ in range(5):
+        w = su.get_inspire()
+        if w: words.append(w)
+        time.sleep(1)
+    return {"keywords": words}
+
+@app.post("/discovery/verify")
+def api_discovery_verify(req: VerifyRequest):
+    return su.verify_shopify(req.keyword, max_products=15)
+
+@app.post("/discovery/verify-batch")
+def api_discovery_verify_batch(req: VerifyBatchRequest):
+    return {"status": "ok", "output_path": su.verify_batch_xlsx(req.xlsx_path, req.top_n)}
+
+
+# ═══════════════════════════════════════════════════════════
+#  MANAGER endpoints
+# ═══════════════════════════════════════════════════════════
+
+class CreateProductRequest(BaseModel): json_path: Optional[str] = None; xlsx_path: Optional[str] = None; row: int = 2
+class UpdateProductRequest(BaseModel): product_id: str; json_path: str
+class DeleteProductRequest(BaseModel): product_id: str
+class BulkImportRequest(BaseModel): xlsx_path: str; limit: int = 0
+class ThemePushRequest(BaseModel): theme_dir: str
+class ThemePullRequest(BaseModel): theme_dir: str
+
+@app.get("/manager/info")
+def api_manager_info(): return {"output": "所有店铺数据见仪表盘"}
+@app.get("/manager/products")
+def api_manager_products(limit: int = Query(default=10, le=250)): su.cmd_products(limit); return {"status": "ok"}
+@app.post("/manager/create-product")
+def api_manager_create_product(req: CreateProductRequest):
+    if req.json_path: result = su.cmd_create_product_from_json(req.json_path)
+    elif req.xlsx_path: result = su.cmd_create_product_from_xlsx(req.xlsx_path, req.row)
+    else: raise HTTPException(status_code=400, detail="Need json_path or xlsx_path")
+    return {"status": "ok", "product": result}
+@app.post("/manager/update-product")
+def api_manager_update_product(req: UpdateProductRequest): su.cmd_update_product(req.product_id, req.json_path); return {"status": "ok"}
+@app.post("/manager/delete-product")
+def api_manager_delete_product(req: DeleteProductRequest): su.cmd_delete_product(req.product_id); return {"status": "ok"}
+@app.get("/manager/themes")
+def api_manager_themes(): su.cmd_themes(); return {"status": "ok"}
+@app.post("/manager/theme-push")
+def api_manager_theme_push(req: ThemePushRequest): su.cmd_theme_push(req.theme_dir); return {"status": "ok"}
+@app.post("/manager/theme-pull")
+def api_manager_theme_pull(req: ThemePullRequest): su.cmd_theme_pull(req.theme_dir); return {"status": "ok"}
+@app.get("/manager/collections")
+def api_manager_collections(limit: int = Query(default=10, le=250)): su.cmd_collections(limit); return {"status": "ok"}
+@app.post("/manager/bulk-import")
+def api_manager_bulk_import(req: BulkImportRequest): su.cmd_bulk_import(req.xlsx_path, req.limit); return {"status": "ok"}
+
+
+# ═══════════════════════════════════════════════════════════
+#  ANALYSIS endpoint
+# ═══════════════════════════════════════════════════════════
+
+class AnalyzeRequest(BaseModel): domains: list[str]; cost: float = 100.0
+
+@app.post("/analyze")
+def api_analyze(req: AnalyzeRequest):
+    if len(req.domains) < 1: raise HTTPException(status_code=400, detail="Need at least 1 domain")
+    session = su.get_session(); stores = {}
+    for d in req.domains:
+        d = su.normalize_domain(d); products = su.fetch_all_products(d, session)
+        if products: stores[d] = products
+    if not stores: raise HTTPException(status_code=404, detail="No data for any domain")
+    report = su.run_business_analysis(my_domain=req.domains[0],
+        competitor_domains=req.domains[1:] if len(req.domains) > 1 else [],
+        data_dir=str(su.DATA_DIR), stores_data=stores, cost=req.cost)
+    return {"report": report, "text_report": su.format_business_report(report)}
+
+
+# ═══════════════════════════════════════════════════════════
+#  v6.0 竞品情报 API
+# ═══════════════════════════════════════════════════════════
+
+@app.get("/api/intel/tiers")
+def api_intel_tiers():
+    """返回竞品分级数据"""
+    tier_path = MONITOR_DIR / "competitor_tiers.json"
+    if not tier_path.exists():
+        raise HTTPException(status_code=404, detail="竞品分级数据不存在，请先运行刷新")
+    return json.loads(tier_path.read_text(encoding="utf-8"))
+
+
+@app.post("/api/intel/landing-page")
+def api_intel_landing_page(domain: str = Query(...)):
+    """采集指定域名的着陆页情报"""
+    domain = su.normalize_domain(domain)
+    intel = su.fetch_landing_page_intel(domain)
+    changes = su.detect_lp_changes(domain)
+    return {"intel": intel, "changes": changes}
+
+
+@app.post("/api/intel/landing-page/batch")
+def api_intel_landing_page_batch(domains: str = Query(...), workers: int = Query(4, ge=1, le=8)):
+    """批量采集着陆页情报"""
+    domain_list = [su.normalize_domain(d) for d in domains.split(",") if d.strip()]
+    if not domain_list:
+        raise HTTPException(status_code=400, detail="需要至少 1 个域名")
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {executor.submit(su.fetch_landing_page_intel, d): d for d in domain_list}
+        for future in concurrent.futures.as_completed(future_map):
+            domain = future_map[future]
+            try:
+                intel = future.result()
+                changes = su.detect_lp_changes(domain)
+                results.append({"domain": domain, "intel": intel, "changes": changes})
+            except Exception as e:
+                results.append({"domain": domain, "error": str(e)[:100]})
+
+    return {"count": len(results), "results": results}
+
+
+@app.get("/api/intel/dashboard")
+def api_intel_dashboard():
+    """竞品情报仪表盘 — 汇总所有情报数据"""
+    tier_path = MONITOR_DIR / "competitor_tiers.json"
+    tiers = json.loads(tier_path.read_text(encoding="utf-8")) if tier_path.exists() else {}
+
+    # 收集所有着陆页情报
+    landing_intels = []
+    for f in sorted(MONITOR_DIR.glob("*_landing_intel.json")):
+        try:
+            intel = json.loads(f.read_text(encoding="utf-8"))
+            landing_intels.append(intel)
+        except:
+            pass
+
+    # 汇总分析
+    discount_domains = [i for i in landing_intels if i.get("popup", {}).get("discount_pct", 0) > 0]
+    urgency_domains = [i for i in landing_intels if i.get("urgency")]
+    subscription_domains = [i for i in landing_intels if i.get("subscription", {}).get("available")]
+
+    # 价格情报
+    price_drops = []
+    for f in sorted(MONITOR_DIR.glob("*_snapshot.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            domain = f.stem.replace("_snapshot", "")
+            products = data.get("products", {})
+            for pid, p in products.items():
+                price = p.get("price", 0)
+                if price and price > 0 and price < 10:
+                    price_drops.append({"domain": domain, "product": p.get("title", ""), "price": price})
+        except:
+            pass
+
+    return {
+        "tiers": {
+            "tier1_count": len(tiers.get("tier1", [])),
+            "tier2_count": len(tiers.get("tier2", [])),
+            "tier3_count": len(tiers.get("tier3", [])),
+        },
+        "landing_page_intel": {
+            "total_scanned": len(landing_intels),
+            "with_discount": len(discount_domains),
+            "with_urgency": len(urgency_domains),
+            "with_subscription": len(subscription_domains),
+            "top_discounts": sorted(
+                [{"domain": i["domain"], "discount": i["popup"]["discount_pct"]}
+                 for i in discount_domains],
+                key=lambda x: x["discount"], reverse=True
+            )[:10],
+        },
+        "price_intel": {
+            "low_price_products": price_drops[:20],
+        },
+        "recent_changes": [],
+    }
+
+
+@app.get("/api/intel/report")
+def api_intel_report(domain: str = Query(...)):
+    """单个竞品的完整情报报告"""
+    domain = su.normalize_domain(domain)
+
+    intel_path = MONITOR_DIR / f"{domain}_landing_intel.json"
+    landing = json.loads(intel_path.read_text(encoding="utf-8")) if intel_path.exists() else None
+
+    snap_path = MONITOR_DIR / f"{domain}_snapshot.json"
+    snapshot = json.loads(snap_path.read_text(encoding="utf-8")) if snap_path.exists() else None
+
+    ad_tracking = su.detect_ad_tracking(domain)
+    changes = su.detect_lp_changes(domain)
+
+    return {
+        "domain": domain,
+        "landing_intel": landing,
+        "product_snapshot": {
+            "product_count": snapshot.get("product_count", 0) if snapshot else 0,
+            "last_check": snapshot.get("last_check", "") if snapshot else "",
+        },
+        "ad_tracking": ad_tracking,
+        "recent_changes": changes,
+    }
+
+
+@app.post("/api/intel/fb-ads")
+def api_intel_fb_ads(domain: str = Query(...)):
+    """采集指定域名的 FB Ad Library 广告数据"""
+    domain = su.normalize_domain(domain)
+    ads = su.fetch_fb_ad_library(domain)
+    velocity = su.analyze_ad_velocity(domain)
+    return {"ads": ads, "velocity_changes": velocity}
+
+
+@app.post("/api/intel/fb-ads/batch")
+def api_intel_fb_ads_batch(domains: str = Query(...), workers: int = Query(3, ge=1, le=5)):
+    """批量采集 FB Ad Library 广告数据"""
+    domain_list = [su.normalize_domain(d) for d in domains.split(",") if d.strip()]
+    if not domain_list:
+        raise HTTPException(status_code=400, detail="需要至少 1 个域名")
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {executor.submit(su.fetch_fb_ad_library, d): d for d in domain_list}
+        for future in concurrent.futures.as_completed(future_map):
+            domain = future_map[future]
+            try:
+                ads = future.result()
+                velocity = su.analyze_ad_velocity(domain)
+                results.append({"domain": domain, "ads": ads, "velocity_changes": velocity})
+            except Exception as e:
+                results.append({"domain": domain, "error": str(e)[:100]})
+
+    return {"count": len(results), "results": results}
+
+
+@app.get("/api/intel/alerts")
+def api_intel_alerts():
+    """返回竞品情报告警"""
+    alerts = []
+    monitor_dir = MONITOR_DIR
+
+    for f in sorted(monitor_dir.glob("*_lp_history.json")):
+        try:
+            domain = f.stem.replace("_lp_history", "")
+            history = json.loads(f.read_text(encoding="utf-8"))
+            if len(history) < 2:
+                continue
+            current = history[-1]
+            previous = history[-2]
+
+            old_disc = previous.get("popup", {}).get("discount_pct", 0)
+            new_disc = current.get("popup", {}).get("discount_pct", 0)
+            if old_disc != new_disc and (old_disc > 0 or new_disc > 0):
+                alerts.append({
+                    "type": "discount_change",
+                    "domain": domain,
+                    "severity": "high" if abs(new_disc - old_disc) > 30 else "medium",
+                    "message": f"{domain}: 折扣从 {old_disc}% 变为 {new_disc}%",
+                    "timestamp": current.get("captured_at", ""),
+                })
+
+            old_hero = previous.get("hero", {}).get("main_heading", "")
+            new_hero = current.get("hero", {}).get("main_heading", "")
+            if old_hero != new_hero and old_hero and new_hero:
+                alerts.append({
+                    "type": "hero_change",
+                    "domain": domain,
+                    "severity": "medium",
+                    "message": f"{domain}: 首页主推从 '{old_hero[:30]}' 变为 '{new_hero[:30]}'",
+                    "timestamp": current.get("captured_at", ""),
+                })
+        except:
+            pass
+
+    for f in sorted(monitor_dir.glob("*_fb_ad_history.json")):
+        try:
+            domain = f.stem.replace("_fb_ad_history", "")
+            history = json.loads(f.read_text(encoding="utf-8"))
+            if len(history) < 2:
+                continue
+            current = history[-1]
+            previous = history[-2]
+
+            old_count = previous.get("active_ads", 0)
+            new_count = current.get("active_ads", 0)
+            if old_count > 0 and new_count > 0:
+                pct = ((new_count - old_count) / old_count) * 100
+                if pct > 100:
+                    alerts.append({
+                        "type": "ad_surge",
+                        "domain": domain,
+                        "severity": "high",
+                        "message": f"{domain}: 广告量激增 {pct:.0f}%（{old_count} → {new_count}）— 可能找到 winner！",
+                        "timestamp": current.get("captured_at", ""),
+                    })
+        except:
+            pass
+
+    severity_order = {"high": 0, "medium": 1, "low": 2}
+    alerts.sort(key=lambda x: severity_order.get(x.get("severity", "low"), 9))
+
+    return {"count": len(alerts), "alerts": alerts}
+
+
+@app.post("/api/intel/full-scan")
+def api_intel_full_scan(tier: str = Query("tier1", regex="^tier[123]$"), workers: int = Query(4, ge=1, le=8)):
+    """全量情报扫描：着陆页 + FB Ad Library + 产品快照"""
+    tier_path = MONITOR_DIR / "competitor_tiers.json"
+    if not tier_path.exists():
+        raise HTTPException(status_code=404, detail="竞品分级数据不存在")
+
+    tiers = json.loads(tier_path.read_text(encoding="utf-8"))
+    domains = [d["domain"] for d in tiers.get(tier, [])]
+
+    if not domains:
+        raise HTTPException(status_code=404, detail=f"{tier} 无域名")
+
+    max_per_scan = 50
+    domains = domains[:max_per_scan]
+
+    results = {"landing_page": [], "fb_ads": [], "alerts": []}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(su.fetch_landing_page_intel, d): d for d in domains}
+        for future in concurrent.futures.as_completed(futures):
+            domain = futures[future]
+            try:
+                intel = future.result()
+                changes = su.detect_lp_changes(domain)
+                results["landing_page"].append({"domain": domain, "ok": True, "changes": changes})
+            except Exception as e:
+                results["landing_page"].append({"domain": domain, "ok": False, "error": str(e)[:80]})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, 3)) as executor:
+        futures = {executor.submit(su.fetch_fb_ad_library, d): d for d in domains}
+        for future in concurrent.futures.as_completed(futures):
+            domain = futures[future]
+            try:
+                ads = future.result()
+                results["fb_ads"].append({"domain": domain, "ok": True, "active_ads": ads.get("active_ads", 0)})
+            except Exception as e:
+                results["fb_ads"].append({"domain": domain, "ok": False, "error": str(e)[:80]})
+
+    try:
+        alert_result = api_intel_alerts()
+        results["alerts"] = alert_result.get("alerts", [])
+    except:
+        pass
+
+    return {
+        "tier": tier,
+        "domains_scanned": len(domains),
+        "landing_page_ok": sum(1 for r in results["landing_page"] if r.get("ok")),
+        "fb_ads_ok": sum(1 for r in results["fb_ads"] if r.get("ok")),
+        "alerts": len(results["alerts"]),
+        "results": results,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8001, log_level="warning", access_log=False)

@@ -1,0 +1,11 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Amazon 选品关键词 — 每行一个, #开头为注释
+# 编辑此文件添加你的关键词, 脚本自动读取
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 示例关键词 (取消注释即可使用)
+# massage gun deep tissue
+# red light therapy panel
+# laser engraver wood metal
+# galaxy projector star light
+# standing desk electric adjustable

@@ -1,0 +1,2873 @@
+{
+  "total_scanned": 4716,
+  "shopify_count": 675,
+  "non_shopify_count": 507,
+  "error_count": 3534,
+  "elapsed_seconds": 94.5,
+  "shopify_domains": [
+    {
+      "domain": "lignosus.com",
+      "products": 2
+    },
+    {
+      "domain": "1890naturalbath.com",
+      "products": 1
+    },
+    {
+      "domain": "24builds.com",
+      "products": 1
+    },
+    {
+      "domain": "abbyorganizes.com",
+      "products": 1
+    },
+    {
+      "domain": "acemend.com",
+      "products": 1
+    },
+    {
+      "domain": "absorbmore.com",
+      "products": 1
+    },
+    {
+      "domain": "69golf.com",
+      "products": 1
+    },
+    {
+      "domain": "2ndamenedc.com",
+      "products": 1
+    },
+    {
+      "domain": "advancedtrichology.com",
+      "products": 1
+    },
+    {
+      "domain": "1lovehealth.com",
+      "products": 1
+    },
+    {
+      "domain": "8sheep.com",
+      "products": 1
+    },
+    {
+      "domain": "acehubstore.com",
+      "products": 1
+    },
+    {
+      "domain": "agentnateur.com",
+      "products": 1
+    },
+    {
+      "domain": "2pood.com",
+      "products": 1
+    },
+    {
+      "domain": "3wliners.com",
+      "products": 1
+    },
+    {
+      "domain": "acssart.com",
+      "products": 1
+    },
+    {
+      "domain": "acuzoneco.com",
+      "products": 1
+    },
+    {
+      "domain": "aerocupp.com",
+      "products": 1
+    },
+    {
+      "domain": "actbestbike.com",
+      "products": 1
+    },
+    {
+      "domain": "aceumasters.com",
+      "products": 1
+    },
+    {
+      "domain": "add-ondesign.com",
+      "products": 1
+    },
+    {
+      "domain": "africanjoyflix.com",
+      "products": 1
+    },
+    {
+      "domain": "aeyla.co.uk",
+      "products": 1
+    },
+    {
+      "domain": "accusly.com",
+      "products": 1
+    },
+    {
+      "domain": "ahtopmall.com",
+      "products": 1
+    },
+    {
+      "domain": "aidlora.com",
+      "products": 1
+    },
+    {
+      "domain": "airofit.com",
+      "products": 1
+    },
+    {
+      "domain": "alen.com",
+      "products": 1
+    },
+    {
+      "domain": "airestech.com",
+      "products": 1
+    },
+    {
+      "domain": "alerixa.store",
+      "products": 1
+    },
+    {
+      "domain": "ahlwo.com",
+      "products": 1
+    },
+    {
+      "domain": "all4funtoys.com",
+      "products": 1
+    },
+    {
+      "domain": "alleviatetherapy.com",
+      "products": 1
+    },
+    {
+      "domain": "algaecal.com",
+      "products": 1
+    },
+    {
+      "domain": "allfound.co.uk",
+      "products": 1
+    },
+    {
+      "domain": "alignextechnology.com",
+      "products": 1
+    },
+    {
+      "domain": "alphainfuse.com",
+      "products": 1
+    },
+    {
+      "domain": "alphagripz.com",
+      "products": 1
+    },
+    {
+      "domain": "alphahero.co",
+      "products": 1
+    },
+    {
+      "domain": "altfragrances.com",
+      "products": 1
+    },
+    {
+      "domain": "alvetashoponline.com",
+      "products": 1
+    },
+    {
+      "domain": "amazingyou.com",
+      "products": 1
+    },
+    {
+      "domain": "alvex.online",
+      "products": 1
+    },
+    {
+      "domain": "alohafromskin.com",
+      "products": 1
+    },
+    {
+      "domain": "alpinerecover.com",
+      "products": 1
+    },
+    {
+      "domain": "alythera.com",
+      "products": 1
+    },
+    {
+      "domain": "amirobeauty.com",
+      "products": 1
+    },
+    {
+      "domain": "ancestralsupplements.com",
+      "products": 1
+    },
+    {
+      "domain": "amoils.com",
+      "products": 1
+    },
+    {
+      "domain": "ancientremedies.com",
+      "products": 1
+    },
+    {
+      "domain": "ancientremediesrevived.com",
+      "products": 1
+    },
+    {
+      "domain": "antepes.com",
+      "products": 1
+    },
+    {
+      "domain": "anacondafightwear.co",
+      "products": 1
+    },
+    {
+      "domain": "anovaculinary.com",
+      "products": 1
+    },
+    {
+      "domain": "anthbot.com",
+      "products": 1
+    },
+    {
+      "domain": "apebornfitness.com",
+      "products": 1
+    },
+    {
+      "domain": "apexcarbon.ca",
+      "products": 1
+    },
+    {
+      "domain": "anyutacouture.com",
+      "products": 1
+    },
+    {
+      "domain": "aouhra.com",
+      "products": 1
+    },
+    {
+      "domain": "anacondaperformance.com",
+      "products": 1
+    },
+    {
+      "domain": "araamcollection.com",
+      "products": 1
+    },
+    {
+      "domain": "apex-wellness.store",
+      "products": 1
+    },
+    {
+      "domain": "armcare.com",
+      "products": 1
+    },
+    {
+      "domain": "arthurandrew.com",
+      "products": 1
+    },
+    {
+      "domain": "arrae.com",
+      "products": 1
+    },
+    {
+      "domain": "artuvate.co",
+      "products": 1
+    },
+    {
+      "domain": "arttoyfamilia.com",
+      "products": 1
+    },
+    {
+      "domain": "ascent-bicycle.com",
+      "products": 1
+    },
+    {
+      "domain": "aromalief.com",
+      "products": 1
+    },
+    {
+      "domain": "artisanstraps.com",
+      "products": 1
+    },
+    {
+      "domain": "asoleo.com",
+      "products": 1
+    },
+    {
+      "domain": "asarai.com",
+      "products": 1
+    },
+    {
+      "domain": "artzymerch.com",
+      "products": 1
+    },
+    {
+      "domain": "ashwamag.com",
+      "products": 1
+    },
+    {
+      "domain": "askechogolf.com",
+      "products": 1
+    },
+    {
+      "domain": "ashbtop.com",
+      "products": 1
+    },
+    {
+      "domain": "ashlen.co",
+      "products": 1
+    },
+    {
+      "domain": "atsdiesel.com",
+      "products": 1
+    },
+    {
+      "domain": "astravitality.com",
+      "products": 1
+    },
+    {
+      "domain": "athousandroses.com.au",
+      "products": 1
+    },
+    {
+      "domain": "athletikco.com",
+      "products": 1
+    },
+    {
+      "domain": "auk.com",
+      "products": 1
+    },
+    {
+      "domain": "atmospure.co",
+      "products": 1
+    },
+    {
+      "domain": "aureonlabs.com",
+      "products": 1
+    },
+    {
+      "domain": "aurivo.us",
+      "products": 1
+    },
+    {
+      "domain": "aurimood.com",
+      "products": 1
+    },
+    {
+      "domain": "aurivita.co",
+      "products": 1
+    },
+    {
+      "domain": "aurlux.co",
+      "products": 1
+    },
+    {
+      "domain": "autoseatzone.com",
+      "products": 1
+    },
+    {
+      "domain": "auroraglaze.com",
+      "products": 1
+    },
+    {
+      "domain": "avalaine.com",
+      "products": 1
+    },
+    {
+      "domain": "aurora-health.nl",
+      "products": 1
+    },
+    {
+      "domain": "auvulis.com",
+      "products": 1
+    },
+    {
+      "domain": "autofull.com",
+      "products": 1
+    },
+    {
+      "domain": "avocadogreenmattress.com",
+      "products": 1
+    },
+    {
+      "domain": "averastore.co",
+      "products": 1
+    },
+    {
+      "domain": "avexastore.co",
+      "products": 1
+    },
+    {
+      "domain": "axoralegacy.com",
+      "products": 1
+    },
+    {
+      "domain": "averiastore.com",
+      "products": 1
+    },
+    {
+      "domain": "axzenia.com",
+      "products": 1
+    },
+    {
+      "domain": "babybub.com",
+      "products": 1
+    },
+    {
+      "domain": "babygains.nl",
+      "products": 1
+    },
+    {
+      "domain": "back9relief.com",
+      "products": 1
+    },
+    {
+      "domain": "backherousa.com",
+      "products": 1
+    },
+    {
+      "domain": "backambaby.com",
+      "products": 1
+    },
+    {
+      "domain": "bagallery.com",
+      "products": 1
+    },
+    {
+      "domain": "aznolt.com",
+      "products": 1
+    },
+    {
+      "domain": "back9lab.com",
+      "products": 1
+    },
+    {
+      "domain": "balmbare.com",
+      "products": 1
+    },
+    {
+      "domain": "ballboyzsoap.com",
+      "products": 1
+    },
+    {
+      "domain": "banish.com",
+      "products": 1
+    },
+    {
+      "domain": "banyanbotanicals.com",
+      "products": 1
+    },
+    {
+      "domain": "banasuer.com",
+      "products": 1
+    },
+    {
+      "domain": "balmega.com",
+      "products": 1
+    },
+    {
+      "domain": "barewillow.com",
+      "products": 1
+    },
+    {
+      "domain": "bankspower.com",
+      "products": 1
+    },
+    {
+      "domain": "bakven.com",
+      "products": 1
+    },
+    {
+      "domain": "balmyworld.com",
+      "products": 1
+    },
+    {
+      "domain": "basedsupplies.com",
+      "products": 1
+    },
+    {
+      "domain": "barbersmania.com",
+      "products": 1
+    },
+    {
+      "domain": "basicjane.com",
+      "products": 1
+    },
+    {
+      "domain": "baskandlatherco.com",
+      "products": 1
+    },
+    {
+      "domain": "bauerfeindsports.ca",
+      "products": 1
+    },
+    {
+      "domain": "bbpdconsignment.com",
+      "products": 1
+    },
+    {
+      "domain": "bare-cases.com",
+      "products": 1
+    },
+    {
+      "domain": "bawldy.com",
+      "products": 1
+    },
+    {
+      "domain": "baxalene.com",
+      "products": 1
+    },
+    {
+      "domain": "bbhugme.com",
+      "products": 1
+    },
+    {
+      "domain": "beautybella.net",
+      "products": 1
+    },
+    {
+      "domain": "bearefoot.com",
+      "products": 1
+    },
+    {
+      "domain": "beatbot.com",
+      "products": 1
+    },
+    {
+      "domain": "baybilux.com",
+      "products": 1
+    },
+    {
+      "domain": "bearaby.com",
+      "products": 1
+    },
+    {
+      "domain": "beautywithyuri.com",
+      "products": 1
+    },
+    {
+      "domain": "bedjet.com",
+      "products": 1
+    },
+    {
+      "domain": "beautysleepclub.com",
+      "products": 1
+    },
+    {
+      "domain": "beautyandtheboutique.com",
+      "products": 1
+    },
+    {
+      "domain": "bekyndbeauty.com",
+      "products": 1
+    },
+    {
+      "domain": "bedgear.com",
+      "products": 1
+    },
+    {
+      "domain": "bemagictreasures.com",
+      "products": 1
+    },
+    {
+      "domain": "benefabproducts.com",
+      "products": 1
+    },
+    {
+      "domain": "belffin.com",
+      "products": 1
+    },
+    {
+      "domain": "besque.co",
+      "products": 1
+    },
+    {
+      "domain": "beooshop.com",
+      "products": 1
+    },
+    {
+      "domain": "bellabooty.com",
+      "products": 1
+    },
+    {
+      "domain": "besynchro.com",
+      "products": 1
+    },
+    {
+      "domain": "bettervoice.store",
+      "products": 1
+    },
+    {
+      "domain": "betterware.com.mx",
+      "products": 1
+    },
+    {
+      "domain": "bikesonline.com",
+      "products": 1
+    },
+    {
+      "domain": "beyond-power.com",
+      "products": 1
+    },
+    {
+      "domain": "bigcountrytoys.com",
+      "products": 1
+    },
+    {
+      "domain": "bio-well.com",
+      "products": 1
+    },
+    {
+      "domain": "betterwild.com",
+      "products": 1
+    },
+    {
+      "domain": "bioblade.store",
+      "products": 1
+    },
+    {
+      "domain": "betterguards.com",
+      "products": 1
+    },
+    {
+      "domain": "birdieboss.com",
+      "products": 1
+    },
+    {
+      "domain": "biorootlabs.com",
+      "products": 1
+    },
+    {
+      "domain": "blacklyte.com",
+      "products": 1
+    },
+    {
+      "domain": "blackmountainpicks.com",
+      "products": 1
+    },
+    {
+      "domain": "blackstonelabs.com",
+      "products": 1
+    },
+    {
+      "domain": "blackgirlvitamins.co",
+      "products": 1
+    },
+    {
+      "domain": "bgnie.com",
+      "products": 1
+    },
+    {
+      "domain": "bleame.com",
+      "products": 1
+    },
+    {
+      "domain": "bling-furnitureshop.com",
+      "products": 1
+    },
+    {
+      "domain": "blazzedfitness.com",
+      "products": 1
+    },
+    {
+      "domain": "bleoraco.com",
+      "products": 1
+    },
+    {
+      "domain": "blackknightgames.ca",
+      "products": 1
+    },
+    {
+      "domain": "blowy.com.au",
+      "products": 1
+    },
+    {
+      "domain": "blissy.com",
+      "products": 1
+    },
+    {
+      "domain": "bluettipower.com",
+      "products": 1
+    },
+    {
+      "domain": "blissopet.com",
+      "products": 1
+    },
+    {
+      "domain": "bloomreveal.com",
+      "products": 1
+    },
+    {
+      "domain": "blumibaby.com",
+      "products": 1
+    },
+    {
+      "domain": "bloon-paris.com",
+      "products": 1
+    },
+    {
+      "domain": "bliakory.shop",
+      "products": 1
+    },
+    {
+      "domain": "boltiton.com",
+      "products": 1
+    },
+    {
+      "domain": "bombshellextensions.com",
+      "products": 1
+    },
+    {
+      "domain": "bodyandbra.com",
+      "products": 1
+    },
+    {
+      "domain": "botaniqueparis.com",
+      "products": 1
+    },
+    {
+      "domain": "bolstietravelpillow.com",
+      "products": 1
+    },
+    {
+      "domain": "bonexlabs.com",
+      "products": 1
+    },
+    {
+      "domain": "brazynlife.com",
+      "products": 1
+    },
+    {
+      "domain": "brickarsenal.co",
+      "products": 1
+    },
+    {
+      "domain": "breathesans.com",
+      "products": 1
+    },
+    {
+      "domain": "breagans.com",
+      "products": 1
+    },
+    {
+      "domain": "brezedoo.com",
+      "products": 1
+    },
+    {
+      "domain": "brightlegs.com",
+      "products": 1
+    },
+    {
+      "domain": "brickwar2.com",
+      "products": 1
+    },
+    {
+      "domain": "braveagles.com",
+      "products": 1
+    },
+    {
+      "domain": "brickhousenutrition.com",
+      "products": 1
+    },
+    {
+      "domain": "brightlifedirect.com",
+      "products": 1
+    },
+    {
+      "domain": "breezyhorizon.com",
+      "products": 1
+    },
+    {
+      "domain": "brightfindsshop.com",
+      "products": 1
+    },
+    {
+      "domain": "browncountytoychest.com",
+      "products": 1
+    },
+    {
+      "domain": "braceability.com",
+      "products": 1
+    },
+    {
+      "domain": "bruunbeauty.com",
+      "products": 1
+    },
+    {
+      "domain": "bunionfix.co",
+      "products": 1
+    },
+    {
+      "domain": "bunnito.com",
+      "products": 1
+    },
+    {
+      "domain": "burneek.com",
+      "products": 1
+    },
+    {
+      "domain": "byanavrin.com",
+      "products": 1
+    },
+    {
+      "domain": "bradley-weston.com",
+      "products": 1
+    },
+    {
+      "domain": "callixe.com",
+      "products": 1
+    },
+    {
+      "domain": "bruntworkwear.com",
+      "products": 1
+    },
+    {
+      "domain": "capediablo.com",
+      "products": 1
+    },
+    {
+      "domain": "capistorez.com",
+      "products": 1
+    },
+    {
+      "domain": "calmifydrink.com",
+      "products": 1
+    },
+    {
+      "domain": "casper.com",
+      "products": 1
+    },
+    {
+      "domain": "celinva.com",
+      "products": 1
+    },
+    {
+      "domain": "catycatherine.com",
+      "products": 1
+    },
+    {
+      "domain": "cervaria.com",
+      "products": 1
+    },
+    {
+      "domain": "cdrlifestyle.com",
+      "products": 1
+    },
+    {
+      "domain": "checkout.shop.hillspet.com",
+      "products": 1
+    },
+    {
+      "domain": "cleansupplementusa.com",
+      "products": 1
+    },
+    {
+      "domain": "chefpreserve.com",
+      "products": 1
+    },
+    {
+      "domain": "cleanplanet.store",
+      "products": 1
+    },
+    {
+      "domain": "cirvano.com",
+      "products": 1
+    },
+    {
+      "domain": "clearlifeco.com",
+      "products": 1
+    },
+    {
+      "domain": "click-blocks.com",
+      "products": 1
+    },
+    {
+      "domain": "cloudslides.com",
+      "products": 1
+    },
+    {
+      "domain": "cleanskinclub.com",
+      "products": 1
+    },
+    {
+      "domain": "cocobeauty.com",
+      "products": 1
+    },
+    {
+      "domain": "coldcrafts.com",
+      "products": 1
+    },
+    {
+      "domain": "cloudnineclothing.ca",
+      "products": 1
+    },
+    {
+      "domain": "comfysimplicity.com",
+      "products": 1
+    },
+    {
+      "domain": "comfortclinicusa.com",
+      "products": 1
+    },
+    {
+      "domain": "compendiummedicine.com",
+      "products": 1
+    },
+    {
+      "domain": "comfrt.com",
+      "products": 1
+    },
+    {
+      "domain": "comfyfins.com",
+      "products": 1
+    },
+    {
+      "domain": "copperfitusa.com",
+      "products": 1
+    },
+    {
+      "domain": "cool-jams.com",
+      "products": 1
+    },
+    {
+      "domain": "cosmetific.com",
+      "products": 1
+    },
+    {
+      "domain": "costenia.com",
+      "products": 1
+    },
+    {
+      "domain": "crossoversymmetry.com",
+      "products": 1
+    },
+    {
+      "domain": "cricbaby.com",
+      "products": 1
+    },
+    {
+      "domain": "conceptcollective.co",
+      "products": 1
+    },
+    {
+      "domain": "crystalclearbeauty.org",
+      "products": 1
+    },
+    {
+      "domain": "cozyearth.com",
+      "products": 1
+    },
+    {
+      "domain": "cuddliopets.com",
+      "products": 1
+    },
+    {
+      "domain": "cuppings.co",
+      "products": 1
+    },
+    {
+      "domain": "darkolifting.com",
+      "products": 1
+    },
+    {
+      "domain": "customdeskcreations.com",
+      "products": 1
+    },
+    {
+      "domain": "davincified.com",
+      "products": 1
+    },
+    {
+      "domain": "dermrays.com",
+      "products": 1
+    },
+    {
+      "domain": "dermaqueen.shop",
+      "products": 1
+    },
+    {
+      "domain": "dermazen.com",
+      "products": 1
+    },
+    {
+      "domain": "danegolf.com",
+      "products": 1
+    },
+    {
+      "domain": "dannicowoodworks.com",
+      "products": 1
+    },
+    {
+      "domain": "danfie.store",
+      "products": 1
+    },
+    {
+      "domain": "dermachom.com",
+      "products": 1
+    },
+    {
+      "domain": "dermaflash.com",
+      "products": 1
+    },
+    {
+      "domain": "diyative.com",
+      "products": 1
+    },
+    {
+      "domain": "dolcate.com",
+      "products": 1
+    },
+    {
+      "domain": "dropshop.phillips.com",
+      "products": 1
+    },
+    {
+      "domain": "dslaboratories.com",
+      "products": 1
+    },
+    {
+      "domain": "drpenus.store",
+      "products": 1
+    },
+    {
+      "domain": "dreamwaveco.com",
+      "products": 1
+    },
+    {
+      "domain": "dermalea.com",
+      "products": 1
+    },
+    {
+      "domain": "earthbreeze.com",
+      "products": 1
+    },
+    {
+      "domain": "drivse.com",
+      "products": 1
+    },
+    {
+      "domain": "earthlinenaturals.com",
+      "products": 1
+    },
+    {
+      "domain": "elavate.com",
+      "products": 1
+    },
+    {
+      "domain": "elerae.com",
+      "products": 1
+    },
+    {
+      "domain": "elixora.co",
+      "products": 1
+    },
+    {
+      "domain": "eloacare.com",
+      "products": 1
+    },
+    {
+      "domain": "elsory.com",
+      "products": 1
+    },
+    {
+      "domain": "elvaralumiere.com",
+      "products": 1
+    },
+    {
+      "domain": "enginemaps.com",
+      "products": 1
+    },
+    {
+      "domain": "emmafy.com",
+      "products": 1
+    },
+    {
+      "domain": "ekkovision.com",
+      "products": 1
+    },
+    {
+      "domain": "evercushion.com",
+      "products": 1
+    },
+    {
+      "domain": "evesupplements.com",
+      "products": 1
+    },
+    {
+      "domain": "everyneeding.com",
+      "products": 1
+    },
+    {
+      "domain": "ergobaby.com",
+      "products": 1
+    },
+    {
+      "domain": "evorola.com",
+      "products": 1
+    },
+    {
+      "domain": "fansidea.com",
+      "products": 1
+    },
+    {
+      "domain": "faithfulfamilyfarmer.com",
+      "products": 1
+    },
+    {
+      "domain": "fasciasticks.com",
+      "products": 1
+    },
+    {
+      "domain": "evirelle.com",
+      "products": 1
+    },
+    {
+      "domain": "dungeonadvent.com",
+      "products": 1
+    },
+    {
+      "domain": "feetures.com",
+      "products": 1
+    },
+    {
+      "domain": "felineskinscience.com",
+      "products": 1
+    },
+    {
+      "domain": "finalputt.com",
+      "products": 1
+    },
+    {
+      "domain": "fit2run.com",
+      "products": 1
+    },
+    {
+      "domain": "flexstrap.co",
+      "products": 1
+    },
+    {
+      "domain": "floxol.com",
+      "products": 1
+    },
+    {
+      "domain": "followyourlegend.com",
+      "products": 1
+    },
+    {
+      "domain": "footpeers.com",
+      "products": 1
+    },
+    {
+      "domain": "frostbuddy.com",
+      "products": 1
+    },
+    {
+      "domain": "froyaorganics.com",
+      "products": 1
+    },
+    {
+      "domain": "freshfrenzy.co",
+      "products": 1
+    },
+    {
+      "domain": "furypetcare.com",
+      "products": 1
+    },
+    {
+      "domain": "gamelabusa.com",
+      "products": 1
+    },
+    {
+      "domain": "flykitt.com",
+      "products": 1
+    },
+    {
+      "domain": "getaerovac.com",
+      "products": 1
+    },
+    {
+      "domain": "flyhugz.com",
+      "products": 1
+    },
+    {
+      "domain": "getaeki.com",
+      "products": 1
+    },
+    {
+      "domain": "getflytex.co",
+      "products": 1
+    },
+    {
+      "domain": "getbiom.co",
+      "products": 1
+    },
+    {
+      "domain": "gethorizum.com",
+      "products": 1
+    },
+    {
+      "domain": "getionix.com",
+      "products": 1
+    },
+    {
+      "domain": "gethealthcore.com",
+      "products": 1
+    },
+    {
+      "domain": "getlirae.com",
+      "products": 1
+    },
+    {
+      "domain": "getmorningwould.shop",
+      "products": 1
+    },
+    {
+      "domain": "getluneco.com",
+      "products": 1
+    },
+    {
+      "domain": "getnovopure.com",
+      "products": 1
+    },
+    {
+      "domain": "getrelivia.com",
+      "products": 1
+    },
+    {
+      "domain": "getpurrvita.com",
+      "products": 1
+    },
+    {
+      "domain": "gettallboy.com",
+      "products": 1
+    },
+    {
+      "domain": "getvenura.com",
+      "products": 1
+    },
+    {
+      "domain": "getskelda.com",
+      "products": 1
+    },
+    {
+      "domain": "getblush.shop",
+      "products": 1
+    },
+    {
+      "domain": "getwidestep.com",
+      "products": 1
+    },
+    {
+      "domain": "glizmos.net",
+      "products": 1
+    },
+    {
+      "domain": "glwria.com",
+      "products": 1
+    },
+    {
+      "domain": "glamarashop.com",
+      "products": 1
+    },
+    {
+      "domain": "golfmotive.com",
+      "products": 1
+    },
+    {
+      "domain": "gravityblankets.com",
+      "products": 1
+    },
+    {
+      "domain": "gravityglidersco.com",
+      "products": 1
+    },
+    {
+      "domain": "gripzilla.co",
+      "products": 1
+    },
+    {
+      "domain": "grdnr.store",
+      "products": 1
+    },
+    {
+      "domain": "greenlado.com",
+      "products": 1
+    },
+    {
+      "domain": "groundingflow.com",
+      "products": 1
+    },
+    {
+      "domain": "groundingforce.com",
+      "products": 1
+    },
+    {
+      "domain": "gymsets.co.uk",
+      "products": 1
+    },
+    {
+      "domain": "grove.co",
+      "products": 1
+    },
+    {
+      "domain": "groundinghealthbenefits.com",
+      "products": 1
+    },
+    {
+      "domain": "harvestright.com",
+      "products": 1
+    },
+    {
+      "domain": "health-jewelsbrand.com",
+      "products": 1
+    },
+    {
+      "domain": "happywoofsandpurrs.com",
+      "products": 1
+    },
+    {
+      "domain": "healthismlife.com",
+      "products": 1
+    },
+    {
+      "domain": "healthravio.store",
+      "products": 1
+    },
+    {
+      "domain": "hairglowinc.com",
+      "products": 1
+    },
+    {
+      "domain": "helanvi.com",
+      "products": 1
+    },
+    {
+      "domain": "hears.com",
+      "products": 1
+    },
+    {
+      "domain": "hellocalmare.com",
+      "products": 1
+    },
+    {
+      "domain": "heolio.com",
+      "products": 1
+    },
+    {
+      "domain": "higherdose.com",
+      "products": 1
+    },
+    {
+      "domain": "hike-care.com",
+      "products": 1
+    },
+    {
+      "domain": "hikebalance.com",
+      "products": 1
+    },
+    {
+      "domain": "homerunpet.com",
+      "products": 1
+    },
+    {
+      "domain": "homeoftechessentials.com",
+      "products": 1
+    },
+    {
+      "domain": "holist.us",
+      "products": 1
+    },
+    {
+      "domain": "hiquo.co",
+      "products": 1
+    },
+    {
+      "domain": "honexcompany.com",
+      "products": 1
+    },
+    {
+      "domain": "hoperings.com",
+      "products": 1
+    },
+    {
+      "domain": "horsehalo.co",
+      "products": 1
+    },
+    {
+      "domain": "hugsleep.com",
+      "products": 1
+    },
+    {
+      "domain": "hplcare.com",
+      "products": 1
+    },
+    {
+      "domain": "hydragun.com",
+      "products": 1
+    },
+    {
+      "domain": "hugterra.com",
+      "products": 1
+    },
+    {
+      "domain": "hyperice.com",
+      "products": 1
+    },
+    {
+      "domain": "hydrohbottle.com",
+      "products": 1
+    },
+    {
+      "domain": "icwrap.com",
+      "products": 1
+    },
+    {
+      "domain": "hudabeauty.com",
+      "products": 1
+    },
+    {
+      "domain": "im8health.com",
+      "products": 1
+    },
+    {
+      "domain": "igniowave.com",
+      "products": 1
+    },
+    {
+      "domain": "hushedsocks.com",
+      "products": 1
+    },
+    {
+      "domain": "innoglam.com",
+      "products": 1
+    },
+    {
+      "domain": "inoviastore.com",
+      "products": 1
+    },
+    {
+      "domain": "ionlayer.com",
+      "products": 1
+    },
+    {
+      "domain": "isotunes.com",
+      "products": 1
+    },
+    {
+      "domain": "itoolmax.com",
+      "products": 1
+    },
+    {
+      "domain": "jelliebend.com",
+      "products": 1
+    },
+    {
+      "domain": "join-eby.com",
+      "products": 1
+    },
+    {
+      "domain": "karatekitty.com",
+      "products": 1
+    },
+    {
+      "domain": "justkiddingstore.com",
+      "products": 1
+    },
+    {
+      "domain": "journal.groundingwell.com",
+      "products": 1
+    },
+    {
+      "domain": "joovv.com",
+      "products": 1
+    },
+    {
+      "domain": "kensuifitness.com",
+      "products": 1
+    },
+    {
+      "domain": "kbhmotors.com",
+      "products": 1
+    },
+    {
+      "domain": "kenrelief.com",
+      "products": 1
+    },
+    {
+      "domain": "keyarsenal.com",
+      "products": 1
+    },
+    {
+      "domain": "kineon.io",
+      "products": 1
+    },
+    {
+      "domain": "kidxpert.com",
+      "products": 1
+    },
+    {
+      "domain": "kinoralabs.com",
+      "products": 1
+    },
+    {
+      "domain": "kittyspout.com",
+      "products": 1
+    },
+    {
+      "domain": "kavoraonline.com",
+      "products": 1
+    },
+    {
+      "domain": "kliyra.com",
+      "products": 1
+    },
+    {
+      "domain": "kovaria.com",
+      "products": 1
+    },
+    {
+      "domain": "konjoun.com",
+      "products": 1
+    },
+    {
+      "domain": "kyfe.com",
+      "products": 1
+    },
+    {
+      "domain": "landing.smartmarketer.com",
+      "products": 1
+    },
+    {
+      "domain": "lasoraofficial.com",
+      "products": 1
+    },
+    {
+      "domain": "kynela.com",
+      "products": 1
+    },
+    {
+      "domain": "lawlessgarage.com",
+      "products": 1
+    },
+    {
+      "domain": "lesomagic.com",
+      "products": 1
+    },
+    {
+      "domain": "lazy-seal.com",
+      "products": 1
+    },
+    {
+      "domain": "lectricebikes.com",
+      "products": 1
+    },
+    {
+      "domain": "levenrose.com",
+      "products": 1
+    },
+    {
+      "domain": "lhanel.co",
+      "products": 1
+    },
+    {
+      "domain": "leyadoll.com",
+      "products": 1
+    },
+    {
+      "domain": "lakany.com",
+      "products": 1
+    },
+    {
+      "domain": "lifeformco.com",
+      "products": 1
+    },
+    {
+      "domain": "licollie.com",
+      "products": 1
+    },
+    {
+      "domain": "livesans.com",
+      "products": 1
+    },
+    {
+      "domain": "livehealthillie.com",
+      "products": 1
+    },
+    {
+      "domain": "loalife.com",
+      "products": 1
+    },
+    {
+      "domain": "lotuswheel.com",
+      "products": 1
+    },
+    {
+      "domain": "lucier.shop",
+      "products": 1
+    },
+    {
+      "domain": "luadra.com",
+      "products": 1
+    },
+    {
+      "domain": "luckycatcollective.com",
+      "products": 1
+    },
+    {
+      "domain": "lullera.com",
+      "products": 1
+    },
+    {
+      "domain": "ltwwellness.com",
+      "products": 1
+    },
+    {
+      "domain": "lumineorganics.com",
+      "products": 1
+    },
+    {
+      "domain": "lumenpick.com",
+      "products": 1
+    },
+    {
+      "domain": "lumidori.com",
+      "products": 1
+    },
+    {
+      "domain": "lupps.co",
+      "products": 1
+    },
+    {
+      "domain": "lyrasleep.com",
+      "products": 1
+    },
+    {
+      "domain": "magicbrushofficial.com",
+      "products": 1
+    },
+    {
+      "domain": "lymphoria.co",
+      "products": 1
+    },
+    {
+      "domain": "magnali.com",
+      "products": 1
+    },
+    {
+      "domain": "mamabearoasis.com",
+      "products": 1
+    },
+    {
+      "domain": "martubegift.com",
+      "products": 1
+    },
+    {
+      "domain": "martivex.com",
+      "products": 1
+    },
+    {
+      "domain": "luxeveria.shop",
+      "products": 1
+    },
+    {
+      "domain": "maternity-yard.com",
+      "products": 1
+    },
+    {
+      "domain": "marcivo.com",
+      "products": 1
+    },
+    {
+      "domain": "mapleandbloomco.com",
+      "products": 1
+    },
+    {
+      "domain": "marmally.com",
+      "products": 1
+    },
+    {
+      "domain": "medicalsaunas.com",
+      "products": 1
+    },
+    {
+      "domain": "med-watch.us",
+      "products": 1
+    },
+    {
+      "domain": "mavetto.com",
+      "products": 1
+    },
+    {
+      "domain": "medeqfitness.com",
+      "products": 1
+    },
+    {
+      "domain": "megelin.com",
+      "products": 1
+    },
+    {
+      "domain": "merachfit.com",
+      "products": 1
+    },
+    {
+      "domain": "meowant.com",
+      "products": 1
+    },
+    {
+      "domain": "minebuilds.co",
+      "products": 1
+    },
+    {
+      "domain": "mimibelt.com",
+      "products": 1
+    },
+    {
+      "domain": "mine-blocks.co.uk",
+      "products": 1
+    },
+    {
+      "domain": "miniblaster.co",
+      "products": 1
+    },
+    {
+      "domain": "mirelio.shop",
+      "products": 1
+    },
+    {
+      "domain": "mixpotion.co",
+      "products": 1
+    },
+    {
+      "domain": "miravitafr.com",
+      "products": 1
+    },
+    {
+      "domain": "lullaleisure.com",
+      "products": 1
+    },
+    {
+      "domain": "mobilitee.co",
+      "products": 1
+    },
+    {
+      "domain": "montessorigeneration.com",
+      "products": 1
+    },
+    {
+      "domain": "mokuomo.com",
+      "products": 1
+    },
+    {
+      "domain": "moochinpooch.com",
+      "products": 1
+    },
+    {
+      "domain": "motionblaster.shop",
+      "products": 1
+    },
+    {
+      "domain": "muir-way.com",
+      "products": 1
+    },
+    {
+      "domain": "mounttocoast.com",
+      "products": 1
+    },
+    {
+      "domain": "mycalmi.com",
+      "products": 1
+    },
+    {
+      "domain": "mybreathly.com",
+      "products": 1
+    },
+    {
+      "domain": "myhemios.com",
+      "products": 1
+    },
+    {
+      "domain": "musq.store",
+      "products": 1
+    },
+    {
+      "domain": "mykitsch.com",
+      "products": 1
+    },
+    {
+      "domain": "myoro.co",
+      "products": 1
+    },
+    {
+      "domain": "mynerdyteacher.com",
+      "products": 1
+    },
+    {
+      "domain": "mykalm.co",
+      "products": 1
+    },
+    {
+      "domain": "mynuora.com",
+      "products": 1
+    },
+    {
+      "domain": "myrestelle.com",
+      "products": 1
+    },
+    {
+      "domain": "mysoothelab.com",
+      "products": 1
+    },
+    {
+      "domain": "mysealify.com",
+      "products": 1
+    },
+    {
+      "domain": "naturecosmetix.com",
+      "products": 1
+    },
+    {
+      "domain": "naturvahealth.com",
+      "products": 1
+    },
+    {
+      "domain": "nature-health.net",
+      "products": 1
+    },
+    {
+      "domain": "neurivolab.com",
+      "products": 1
+    },
+    {
+      "domain": "nenhi.com",
+      "products": 1
+    },
+    {
+      "domain": "neuro-bella.com",
+      "products": 1
+    },
+    {
+      "domain": "myshieldsystem.com",
+      "products": 1
+    },
+    {
+      "domain": "mycorehero.com",
+      "products": 1
+    },
+    {
+      "domain": "nexxage.com",
+      "products": 1
+    },
+    {
+      "domain": "nextreliefusa.com",
+      "products": 1
+    },
+    {
+      "domain": "niuniudaddy.com",
+      "products": 1
+    },
+    {
+      "domain": "nooche.com",
+      "products": 1
+    },
+    {
+      "domain": "noom-literie.com",
+      "products": 1
+    },
+    {
+      "domain": "nordicsculpt.com",
+      "products": 1
+    },
+    {
+      "domain": "northpeakgear.com",
+      "products": 1
+    },
+    {
+      "domain": "nooche.co",
+      "products": 1
+    },
+    {
+      "domain": "norma-design.eu",
+      "products": 1
+    },
+    {
+      "domain": "north511.com",
+      "products": 1
+    },
+    {
+      "domain": "novella-health.com",
+      "products": 1
+    },
+    {
+      "domain": "novetoys.com",
+      "products": 1
+    },
+    {
+      "domain": "nualey.com",
+      "products": 1
+    },
+    {
+      "domain": "northend.shop",
+      "products": 1
+    },
+    {
+      "domain": "nueme.co",
+      "products": 1
+    },
+    {
+      "domain": "nursestrong.co",
+      "products": 1
+    },
+    {
+      "domain": "nurseyard.com",
+      "products": 1
+    },
+    {
+      "domain": "nursebabes.com",
+      "products": 1
+    },
+    {
+      "domain": "nutraboost-us.com",
+      "products": 1
+    },
+    {
+      "domain": "nutrimuse.store",
+      "products": 1
+    },
+    {
+      "domain": "nutrivohealth.com",
+      "products": 1
+    },
+    {
+      "domain": "nuveshop.com",
+      "products": 1
+    },
+    {
+      "domain": "nuzzypen.com",
+      "products": 1
+    },
+    {
+      "domain": "nuveraofficial.com",
+      "products": 1
+    },
+    {
+      "domain": "nymock.com",
+      "products": 1
+    },
+    {
+      "domain": "nymoly.com",
+      "products": 1
+    },
+    {
+      "domain": "oloraofficial.com",
+      "products": 1
+    },
+    {
+      "domain": "oraclering.com",
+      "products": 1
+    },
+    {
+      "domain": "orethis.com",
+      "products": 1
+    },
+    {
+      "domain": "ornexis.com",
+      "products": 1
+    },
+    {
+      "domain": "orrenaturals.com",
+      "products": 1
+    },
+    {
+      "domain": "ornatera.com",
+      "products": 1
+    },
+    {
+      "domain": "orthorelieve.com",
+      "products": 1
+    },
+    {
+      "domain": "othemo.com",
+      "products": 1
+    },
+    {
+      "domain": "owletcare.com",
+      "products": 1
+    },
+    {
+      "domain": "oxyfit.store",
+      "products": 1
+    },
+    {
+      "domain": "outfitrer.com",
+      "products": 1
+    },
+    {
+      "domain": "oyoskincare.com",
+      "products": 1
+    },
+    {
+      "domain": "oveltrix.com",
+      "products": 1
+    },
+    {
+      "domain": "parentsarehuman.com",
+      "products": 1
+    },
+    {
+      "domain": "pappisseamosscompany.com",
+      "products": 1
+    },
+    {
+      "domain": "palmorigin.com",
+      "products": 1
+    },
+    {
+      "domain": "ostrichpillow.com",
+      "products": 1
+    },
+    {
+      "domain": "papmd.com",
+      "products": 1
+    },
+    {
+      "domain": "peaksaunas.com",
+      "products": 1
+    },
+    {
+      "domain": "palmers-boutique-newyork.com",
+      "products": 1
+    },
+    {
+      "domain": "perelelhealth.com",
+      "products": 1
+    },
+    {
+      "domain": "penroseskin.com",
+      "products": 1
+    },
+    {
+      "domain": "pinpointdevices.com",
+      "products": 1
+    },
+    {
+      "domain": "piventra.com",
+      "products": 1
+    },
+    {
+      "domain": "plungecrafters.com",
+      "products": 1
+    },
+    {
+      "domain": "podcompany.com",
+      "products": 1
+    },
+    {
+      "domain": "polarhaircare.com",
+      "products": 1
+    },
+    {
+      "domain": "plushstep.com",
+      "products": 1
+    },
+    {
+      "domain": "pokerprovoke.com",
+      "products": 1
+    },
+    {
+      "domain": "ploise.com",
+      "products": 1
+    },
+    {
+      "domain": "polardiveusa.com",
+      "products": 1
+    },
+    {
+      "domain": "poresight.com",
+      "products": 1
+    },
+    {
+      "domain": "prettyfarmgirl.com",
+      "products": 1
+    },
+    {
+      "domain": "prevalnt.com",
+      "products": 1
+    },
+    {
+      "domain": "primalqueen.com",
+      "products": 1
+    },
+    {
+      "domain": "powerplate.com",
+      "products": 1
+    },
+    {
+      "domain": "pickleprotect.shop",
+      "products": 1
+    },
+    {
+      "domain": "pubbets.net",
+      "products": 1
+    },
+    {
+      "domain": "proheal-innovations.com",
+      "products": 1
+    },
+    {
+      "domain": "pstrelab.shop",
+      "products": 1
+    },
+    {
+      "domain": "pulsetto.tech",
+      "products": 1
+    },
+    {
+      "domain": "puptexshop.com",
+      "products": 1
+    },
+    {
+      "domain": "pwdrs.com",
+      "products": 1
+    },
+    {
+      "domain": "pureveen.com",
+      "products": 1
+    },
+    {
+      "domain": "qomfortco.com",
+      "products": 1
+    },
+    {
+      "domain": "purestrikegear.com",
+      "products": 1
+    },
+    {
+      "domain": "puresportsnutrition.com",
+      "products": 1
+    },
+    {
+      "domain": "q30.com",
+      "products": 1
+    },
+    {
+      "domain": "pwrposture.com",
+      "products": 1
+    },
+    {
+      "domain": "qontroler.com",
+      "products": 1
+    },
+    {
+      "domain": "rarepet.co",
+      "products": 1
+    },
+    {
+      "domain": "rainorshinegolf.com",
+      "products": 1
+    },
+    {
+      "domain": "redgreen.com",
+      "products": 1
+    },
+    {
+      "domain": "realgoodessentials.com",
+      "products": 1
+    },
+    {
+      "domain": "reabtec.com",
+      "products": 1
+    },
+    {
+      "domain": "qlifebike.com",
+      "products": 1
+    },
+    {
+      "domain": "redlineskin.com",
+      "products": 1
+    },
+    {
+      "domain": "relivex-usa.com",
+      "products": 1
+    },
+    {
+      "domain": "relaxe.co",
+      "products": 1
+    },
+    {
+      "domain": "replacementboatparts.com",
+      "products": 1
+    },
+    {
+      "domain": "renvira.shop",
+      "products": 1
+    },
+    {
+      "domain": "repfitness.com",
+      "products": 1
+    },
+    {
+      "domain": "rest.com",
+      "products": 1
+    },
+    {
+      "domain": "respyria.com",
+      "products": 1
+    },
+    {
+      "domain": "revari.co",
+      "products": 1
+    },
+    {
+      "domain": "restural.com",
+      "products": 1
+    },
+    {
+      "domain": "revya.co",
+      "products": 1
+    },
+    {
+      "domain": "retexes.com",
+      "products": 1
+    },
+    {
+      "domain": "revimuscare.com",
+      "products": 1
+    },
+    {
+      "domain": "rezuri.com",
+      "products": 1
+    },
+    {
+      "domain": "ritual.com",
+      "products": 1
+    },
+    {
+      "domain": "ridgeproductswelding.com",
+      "products": 1
+    },
+    {
+      "domain": "rigazza.com",
+      "products": 1
+    },
+    {
+      "domain": "risevitals.com",
+      "products": 1
+    },
+    {
+      "domain": "roskia.com",
+      "products": 1
+    },
+    {
+      "domain": "ryaris.com",
+      "products": 1
+    },
+    {
+      "domain": "runnerrecover.com",
+      "products": 1
+    },
+    {
+      "domain": "safetria.com",
+      "products": 1
+    },
+    {
+      "domain": "savelix.com",
+      "products": 1
+    },
+    {
+      "domain": "sarzu.shop",
+      "products": 1
+    },
+    {
+      "domain": "sandcloud.com",
+      "products": 1
+    },
+    {
+      "domain": "saunareports.org",
+      "products": 1
+    },
+    {
+      "domain": "seatcoversolutions.com",
+      "products": 1
+    },
+    {
+      "domain": "scrubzz.com",
+      "products": 1
+    },
+    {
+      "domain": "selavra.com",
+      "products": 1
+    },
+    {
+      "domain": "senroza.com",
+      "products": 1
+    },
+    {
+      "domain": "sedonawellness.com",
+      "products": 1
+    },
+    {
+      "domain": "selenepets.com",
+      "products": 1
+    },
+    {
+      "domain": "serenithy.com",
+      "products": 1
+    },
+    {
+      "domain": "setay.store",
+      "products": 1
+    },
+    {
+      "domain": "senzio.store",
+      "products": 1
+    },
+    {
+      "domain": "shevitalityshop.com",
+      "products": 1
+    },
+    {
+      "domain": "shopaense.com",
+      "products": 1
+    },
+    {
+      "domain": "shopavatore.com",
+      "products": 1
+    },
+    {
+      "domain": "shopbambuground.com",
+      "products": 1
+    },
+    {
+      "domain": "shopbrizo.com",
+      "products": 1
+    },
+    {
+      "domain": "shopchirho.com",
+      "products": 1
+    },
+    {
+      "domain": "shopeverly.shop",
+      "products": 1
+    },
+    {
+      "domain": "sh-fitness.store",
+      "products": 1
+    },
+    {
+      "domain": "shopicove.com",
+      "products": 1
+    },
+    {
+      "domain": "shopentirestore.com",
+      "products": 1
+    },
+    {
+      "domain": "shophealthypetz.com",
+      "products": 1
+    },
+    {
+      "domain": "serelleshop.com",
+      "products": 1
+    },
+    {
+      "domain": "shopneurolyfe.com",
+      "products": 1
+    },
+    {
+      "domain": "shopskomodo.com",
+      "products": 1
+    },
+    {
+      "domain": "shopkivori.us",
+      "products": 1
+    },
+    {
+      "domain": "shopluuma.com",
+      "products": 1
+    },
+    {
+      "domain": "shopsoleva.store",
+      "products": 1
+    },
+    {
+      "domain": "shoplumen.store",
+      "products": 1
+    },
+    {
+      "domain": "shopveloragoods.com",
+      "products": 1
+    },
+    {
+      "domain": "shopzoki.com",
+      "products": 1
+    },
+    {
+      "domain": "shoptravlr.com",
+      "products": 1
+    },
+    {
+      "domain": "shopvelantis.com",
+      "products": 1
+    },
+    {
+      "domain": "sighrelief.com",
+      "products": 1
+    },
+    {
+      "domain": "shoris.store",
+      "products": 1
+    },
+    {
+      "domain": "sireli.shop",
+      "products": 1
+    },
+    {
+      "domain": "skinesa.com",
+      "products": 1
+    },
+    {
+      "domain": "siraatskitchen.com",
+      "products": 1
+    },
+    {
+      "domain": "simplesnatched.com",
+      "products": 1
+    },
+    {
+      "domain": "sillybeetoys.com",
+      "products": 1
+    },
+    {
+      "domain": "shopcuralis.com",
+      "products": 1
+    },
+    {
+      "domain": "slimspaonline.com",
+      "products": 1
+    },
+    {
+      "domain": "slumblr.com",
+      "products": 1
+    },
+    {
+      "domain": "slyner.com",
+      "products": 1
+    },
+    {
+      "domain": "sleepagainpillows.com",
+      "products": 1
+    },
+    {
+      "domain": "smartoonkids.com",
+      "products": 1
+    },
+    {
+      "domain": "smoothspine.com",
+      "products": 1
+    },
+    {
+      "domain": "snoozuofficial.com",
+      "products": 1
+    },
+    {
+      "domain": "snoozlet.com",
+      "products": 1
+    },
+    {
+      "domain": "smudgeandcocoa.com",
+      "products": 1
+    },
+    {
+      "domain": "smartwaypetsupplies.com",
+      "products": 1
+    },
+    {
+      "domain": "solara-co.com",
+      "products": 1
+    },
+    {
+      "domain": "solawave.co",
+      "products": 1
+    },
+    {
+      "domain": "sonaharu.com",
+      "products": 1
+    },
+    {
+      "domain": "solezyhealth.com",
+      "products": 1
+    },
+    {
+      "domain": "soleida.com",
+      "products": 1
+    },
+    {
+      "domain": "solasculp.com",
+      "products": 1
+    },
+    {
+      "domain": "solvoraus.com",
+      "products": 1
+    },
+    {
+      "domain": "spartassupps.com",
+      "products": 1
+    },
+    {
+      "domain": "soovera.com",
+      "products": 1
+    },
+    {
+      "domain": "spinevarelief.com",
+      "products": 1
+    },
+    {
+      "domain": "spnutrition-us.com",
+      "products": 1
+    },
+    {
+      "domain": "spinewellnessmag.com",
+      "products": 1
+    },
+    {
+      "domain": "stealthhealthcookbook.com",
+      "products": 1
+    },
+    {
+      "domain": "stepprs.com",
+      "products": 1
+    },
+    {
+      "domain": "stimulyx.com",
+      "products": 1
+    },
+    {
+      "domain": "stoko.com",
+      "products": 1
+    },
+    {
+      "domain": "steporbit.com",
+      "products": 1
+    },
+    {
+      "domain": "sunnyskyline.com",
+      "products": 1
+    },
+    {
+      "domain": "superbspine.com",
+      "products": 1
+    },
+    {
+      "domain": "swasabers.com",
+      "products": 1
+    },
+    {
+      "domain": "sweetdreamed.com",
+      "products": 1
+    },
+    {
+      "domain": "swellfree.co",
+      "products": 1
+    },
+    {
+      "domain": "takeultra.com",
+      "products": 1
+    },
+    {
+      "domain": "synelux.com",
+      "products": 1
+    },
+    {
+      "domain": "swiftpickstore.com",
+      "products": 1
+    },
+    {
+      "domain": "sylvane.com",
+      "products": 1
+    },
+    {
+      "domain": "teazys.com",
+      "products": 1
+    },
+    {
+      "domain": "the-vita-watch.com",
+      "products": 1
+    },
+    {
+      "domain": "teamsupercrew.com",
+      "products": 1
+    },
+    {
+      "domain": "thefamilysplace.com",
+      "products": 1
+    },
+    {
+      "domain": "thecloudly.com",
+      "products": 1
+    },
+    {
+      "domain": "theearthlingco.com",
+      "products": 1
+    },
+    {
+      "domain": "thegivenget.com",
+      "products": 1
+    },
+    {
+      "domain": "theglowcompany.co",
+      "products": 1
+    },
+    {
+      "domain": "thehearing.co",
+      "products": 1
+    },
+    {
+      "domain": "stepnura.com",
+      "products": 1
+    },
+    {
+      "domain": "thehairg.com",
+      "products": 1
+    },
+    {
+      "domain": "thelovingliner.com",
+      "products": 1
+    },
+    {
+      "domain": "themellowdog.com",
+      "products": 1
+    },
+    {
+      "domain": "theraice.com",
+      "products": 1
+    },
+    {
+      "domain": "thepawparade.com",
+      "products": 1
+    },
+    {
+      "domain": "therafy.co",
+      "products": 1
+    },
+    {
+      "domain": "theralife.shop",
+      "products": 1
+    },
+    {
+      "domain": "thetherapywrap.com",
+      "products": 1
+    },
+    {
+      "domain": "thesavary.com",
+      "products": 1
+    },
+    {
+      "domain": "thermafits.com",
+      "products": 1
+    },
+    {
+      "domain": "thesolur.com",
+      "products": 1
+    },
+    {
+      "domain": "thetrendifyshops.com",
+      "products": 1
+    },
+    {
+      "domain": "thorkitchen.com",
+      "products": 1
+    },
+    {
+      "domain": "thezoome.store",
+      "products": 1
+    },
+    {
+      "domain": "thrivin-gymwear.com",
+      "products": 1
+    },
+    {
+      "domain": "titan.fitness",
+      "products": 1
+    },
+    {
+      "domain": "writingworkshops.com",
+      "products": 1
+    },
+    {
+      "domain": "alireva.com",
+      "products": 0
+    },
+    {
+      "domain": "cameliaparis.com",
+      "products": 0
+    },
+    {
+      "domain": "getluvie.com",
+      "products": 0
+    },
+    {
+      "domain": "shophoppi.com",
+      "products": 0
+    }
+  ],
+  "sample_non_shopify": [
+    {
+      "domain": "adesktoy.com",
+      "reason": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of "
+    },
+    {
+      "domain": "advancedspineanddisc.com",
+      "reason": "Remote end closed connection without response"
+    },
+    {
+      "domain": "ads.playlet.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "domain": "3dprintingbuilds.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "domain": "advancedsinusreliefcenters.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "domain": "aaa.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "domain": "allalonga.com",
+      "reason": "<urlopen error [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] ssl/tls alert handshake fail"
+    },
+    {
+      "domain": "allwellnesspros.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "domain": "allcarept.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "domain": "amelienaturals.com",
+      "reason": "Remote end closed connection without response"
+    },
+    {
+      "domain": "appsflyer.com",
+      "reason": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of "
+    },
+    {
+      "domain": "alibaba.com",
+      "reason": "Expecting value: line 4 column 1 (char 6)"
+    },
+    {
+      "domain": "ameriseam.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "domain": "appinnovatel.com",
+      "reason": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of "
+    },
+    {
+      "domain": "anyeuayo.com",
+      "reason": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of "
+    },
+    {
+      "domain": "argbook.com",
+      "reason": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of "
+    },
+    {
+      "domain": "arthritis-uk.org",
+      "reason": "<urlopen error [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] ssl/tls alert handshake fail"
+    },
+    {
+      "domain": "akusoli-shop.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "domain": "alphanutritionboost.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "domain": "activecleaningshop.com",
+      "reason": "Expecting value: line 1 column 1 (char 0)"
+    }
+  ],
+  "sample_errors": [
+    {
+      "domain": "acupeo.us",
+      "reason": "HTTP 429"
+    },
+    {
+      "domain": "10xgc.grantcardone.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "aestheticsbyalinedenvers.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "4ocean.com",
+      "reason": "HTTP 429"
+    },
+    {
+      "domain": "advance-to-wellness.net",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "aeska.co",
+      "reason": "HTTP 429"
+    },
+    {
+      "domain": "abrams-chiropracticcare.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "515chiroandsoftwaveregeneration.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "ad-ez.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "1l.ink",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "adoura.co",
+      "reason": "HTTP 402"
+    },
+    {
+      "domain": "activesolutionshealth.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "417sportsmedicine.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "activedim.com",
+      "reason": "HTTP 429"
+    },
+    {
+      "domain": "advancingday.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "80000hours.org",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "adit.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "adequancanine.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "ahlobear.com",
+      "reason": "HTTP 404"
+    },
+    {
+      "domain": "acura.com",
+      "reason": "HTTP 403"
+    }
+  ]
+}

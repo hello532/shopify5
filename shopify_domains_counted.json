@@ -1,0 +1,201 @@
+{
+  "total": 675,
+  "with_products": 18,
+  "empty": 0,
+  "errors": 657,
+  "elapsed": 26.3,
+  "domains": [
+    {
+      "domain": "frostbuddy.com",
+      "count": 1937,
+      "reason": "ok"
+    },
+    {
+      "domain": "repfitness.com",
+      "count": 696,
+      "reason": "ok"
+    },
+    {
+      "domain": "cozyearth.com",
+      "count": 584,
+      "reason": "ok"
+    },
+    {
+      "domain": "writingworkshops.com",
+      "count": 428,
+      "reason": "ok"
+    },
+    {
+      "domain": "lectricebikes.com",
+      "count": 366,
+      "reason": "ok"
+    },
+    {
+      "domain": "bruntworkwear.com",
+      "count": 217,
+      "reason": "ok"
+    },
+    {
+      "domain": "pulsetto.tech",
+      "count": 190,
+      "reason": "ok"
+    },
+    {
+      "domain": "cleanskinclub.com",
+      "count": 62,
+      "reason": "ok"
+    },
+    {
+      "domain": "ergobaby.com",
+      "count": 59,
+      "reason": "ok"
+    },
+    {
+      "domain": "perelelhealth.com",
+      "count": 58,
+      "reason": "ok"
+    },
+    {
+      "domain": "anovaculinary.com",
+      "count": 54,
+      "reason": "ok"
+    },
+    {
+      "domain": "getbiom.co",
+      "count": 38,
+      "reason": "ok"
+    },
+    {
+      "domain": "kineon.io",
+      "count": 33,
+      "reason": "ok"
+    },
+    {
+      "domain": "blacklyte.com",
+      "count": 24,
+      "reason": "ok"
+    },
+    {
+      "domain": "airofit.com",
+      "count": 12,
+      "reason": "ok"
+    },
+    {
+      "domain": "sedonawellness.com",
+      "count": 10,
+      "reason": "ok"
+    },
+    {
+      "domain": "calmifydrink.com",
+      "count": 7,
+      "reason": "ok"
+    },
+    {
+      "domain": "lignosus.com",
+      "count": 2,
+      "reason": "ok"
+    }
+  ],
+  "error_sample": [
+    {
+      "domain": "alen.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "aouhra.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "airestech.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "anyutacouture.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "ancientremediesrevived.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "acemend.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "amazingyou.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "24builds.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "aceumasters.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "algaecal.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "apexcarbon.ca",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "2pood.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "aidlora.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "advancedtrichology.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "2ndamenedc.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "accusly.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "add-ondesign.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "all4funtoys.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "amoils.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    },
+    {
+      "domain": "alphainfuse.com",
+      "count": -1,
+      "reason": "HTTP Error 429: Too Many Requests"
+    }
+  ]
+}

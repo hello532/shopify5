@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>爆款雷达 · v3</title>
+<style>
+:root{
+  --bg:#0a0e16; --bg2:#0f1420; --bg3:#161c2c;
+  --line:#1f2940;
+  --t1:#e8ecf3; --t2:#9aa4b8; --t3:#5f6b85;
+  --go:#22c55e; --go-bg:rgba(34,197,94,.08); --go-bd:rgba(34,197,94,.35);
+  --watch:#f59e0b; --watch-bg:rgba(245,158,11,.06); --watch-bd:rgba(245,158,11,.30);
+  --kill:#ef4444; --kill-bg:rgba(239,68,68,.05); --kill-bd:rgba(239,68,68,.22);
+  --accent:#60a5fa; --accent-bg:rgba(96,165,250,.10);
+  --good:#10b981; --warn:#f59e0b; --bad:#ef4444;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--t1);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding-bottom:50px;}
+
+/* ─── Header ─── */
+.hdr{padding:18px 28px;background:var(--bg2);border-bottom:1px solid var(--line);
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px}
+.title{font-size:20px;font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:10px}
+.title .icon{font-size:24px}
+.title .sub{font-size:11px;color:var(--t3);font-weight:400;margin-left:6px}
+.toolbar{display:flex;gap:8px;align-items:center}
+.btn{padding:6px 12px;background:var(--bg3);border:1px solid var(--line);border-radius:6px;
+  color:var(--t1);cursor:pointer;font-size:12px;transition:.15s;text-decoration:none;display:inline-flex;align-items:center;gap:4px}
+.btn:hover{border-color:var(--accent);color:var(--accent)}
+.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn.primary:hover{background:#3b82f6;color:#fff}
+input[type=search]{padding:6px 10px;background:var(--bg);border:1px solid var(--line);border-radius:6px;
+  color:var(--t1);font-size:12px;width:220px;outline:none}
+input[type=search]:focus{border-color:var(--accent)}
+
+/* ─── Tabs(三态主切换) ─── */
+.tabs{display:flex;gap:0;padding:0 28px;background:var(--bg);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;background:var(--bg)}
+.tab{padding:14px 22px;background:none;border:none;border-bottom:3px solid transparent;
+  color:var(--t2);cursor:pointer;font-size:14px;font-weight:600;transition:.15s;display:flex;align-items:center;gap:8px}
+.tab:hover{color:var(--t1);background:rgba(96,165,250,.04)}
+.tab.active{color:var(--t1);border-bottom-color:var(--accent)}
+.tab.active[data-tab="GO_TEST"]{border-bottom-color:var(--go)}
+.tab.active[data-tab="WATCH"]{border-bottom-color:var(--watch)}
+.tab.active[data-tab="KILL"]{border-bottom-color:var(--kill)}
+.tab .badge{display:inline-block;background:var(--bg3);color:var(--t2);padding:1px 8px;border-radius:10px;font-size:11px;font-weight:700}
+.tab.active .badge{background:var(--accent);color:#fff}
+.tab.active[data-tab="GO_TEST"] .badge{background:var(--go);color:#03240f}
+.tab.active[data-tab="WATCH"] .badge{background:var(--watch);color:#2a1c00}
+.tab.active[data-tab="KILL"] .badge{background:var(--kill);color:#fff}
+
+/* ─── Cards grid ─── */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));
+  gap:14px;padding:20px 28px 30px}
+.card{background:var(--bg2);border:1px solid var(--line);border-radius:10px;
+  padding:0;overflow:hidden;position:relative;transition:.15s;display:flex;flex-direction:column}
+.card:hover{border-color:var(--accent);box-shadow:0 6px 20px rgba(0,0,0,.4)}
+.card.GO_TEST{border-color:var(--go-bd);background:linear-gradient(180deg,var(--go-bg) 0%,var(--bg2) 50%)}
+.card.WATCH{border-color:var(--watch-bd);background:linear-gradient(180deg,var(--watch-bg) 0%,var(--bg2) 50%)}
+.card.KILL{border-color:var(--kill-bd);opacity:.65}
+.card.KILL:hover{opacity:1}
+
+/* badge */
+.c-badge{position:absolute;top:12px;right:12px;padding:4px 10px;border-radius:6px;
+  font-size:11px;font-weight:700;letter-spacing:.4px}
+.c-badge.GO_TEST{background:var(--go);color:#03240f}
+.c-badge.WATCH{background:var(--watch);color:#2a1c00}
+.c-badge.KILL{background:var(--kill);color:#fff;opacity:.85}
+
+/* dup pill */
+.c-dup-pill{position:absolute;top:12px;left:12px;padding:2px 7px;border-radius:6px;
+  background:rgba(96,165,250,.15);color:#93c5fd;border:1px solid rgba(96,165,250,.35);
+  font-size:10px;font-weight:600;cursor:help;letter-spacing:.3px;z-index:2}
+
+/* clone status pill */
+.c-cloned{position:absolute;top:36px;left:12px;padding:2px 7px;border-radius:6px;
+  background:rgba(34,197,94,.20);color:#86efac;border:1px solid var(--go-bd);
+  font-size:10px;font-weight:700}
+
+/* card top */
+.c-top{padding:18px 16px 12px;display:flex;align-items:flex-start;gap:14px}
+.c-img{width:72px;height:72px;border-radius:8px;object-fit:cover;background:var(--bg3);flex-shrink:0;border:1px solid var(--line)}
+.c-noimg{width:72px;height:72px;border-radius:8px;background:var(--bg3);display:flex;align-items:center;justify-content:center;color:var(--t3);flex-shrink:0;font-size:26px;border:1px solid var(--line)}
+.c-meta{flex:1;min-width:0;padding-top:2px}
+.c-title{font-size:15px;font-weight:600;line-height:1.35;color:var(--t1);
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;text-overflow:ellipsis;margin-bottom:6px;padding-right:80px}
+.c-sub{font-size:11px;color:var(--t3);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.c-sub .price{color:var(--accent);font-weight:700;font-size:14px}
+.c-sub .dot{color:var(--t3);opacity:.5}
+
+/* verdict (one-sentence人话总结) */
+.c-verdict{padding:12px 16px;background:rgba(255,255,255,.02);border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-size:13px;line-height:1.5;color:var(--t1)}
+.c-verdict .score{display:inline-block;padding:1px 7px;background:var(--bg3);border-radius:5px;font-size:10px;color:var(--t2);font-weight:700;margin-right:8px;vertical-align:middle}
+
+/* signals — 4 sigils compact */
+.c-sigs{display:grid;grid-template-columns:repeat(4,1fr);gap:0;padding:0;border-bottom:1px solid var(--line)}
+.c-sig{padding:9px 6px;text-align:center;border-right:1px solid var(--line)}
+.c-sig:last-child{border-right:none}
+.c-sig .k{font-size:9px;color:var(--t3);letter-spacing:.5px;text-transform:uppercase;margin-bottom:3px}
+.c-sig .v{font-size:13px;font-weight:700;color:var(--t1);line-height:1.1;font-variant-numeric:tabular-nums}
+.c-sig.good .v{color:var(--good)}
+.c-sig.warn .v{color:var(--warn)}
+.c-sig.bad  .v{color:var(--bad)}
+.c-sig .e{font-size:9px;color:var(--t3);margin-top:1px;line-height:1.2}
+
+/* watch reason */
+.c-watch{padding:8px 16px;background:rgba(245,158,11,.04);font-size:11px;color:var(--t2);display:flex;justify-content:space-between;align-items:center;gap:10px;border-bottom:1px solid var(--line)}
+.c-watch .tag{padding:2px 7px;background:rgba(245,158,11,.15);color:#fcd34d;border:1px solid var(--watch-bd);border-radius:4px;font-size:10px}
+
+/* kill — compact card body */
+.c-kill{padding:10px 16px 14px;color:var(--t2);font-size:12px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.c-kill .why{display:flex;align-items:center;gap:6px}
+.c-kill .why .tag{padding:2px 7px;background:rgba(239,68,68,.12);color:#fca5a5;border:1px solid var(--kill-bd);border-radius:4px;font-size:10px}
+
+/* ─── Actions (only 2 main buttons + ⋯) ─── */
+.c-acts{padding:12px 14px;display:flex;gap:8px;align-items:stretch;margin-top:auto;position:relative}
+.c-acts .main{flex:1;padding:9px 12px;border-radius:7px;font-size:13px;font-weight:600;
+  cursor:pointer;border:0;display:inline-flex;align-items:center;justify-content:center;gap:5px;transition:.15s;text-decoration:none}
+.c-acts .main.verify{background:var(--bg3);color:var(--t1);border:1px solid var(--line)}
+.c-acts .main.verify:hover{border-color:var(--accent);color:var(--accent)}
+.c-acts .main.launch{background:var(--go);color:#03240f}
+.c-acts .main.launch:hover{background:#16a34a;color:#fff}
+.c-acts .main.launch.done{background:rgba(34,197,94,.2);color:#86efac;border:1px solid var(--go-bd);cursor:default}
+.c-acts .main:disabled{opacity:.55;cursor:wait}
+.c-acts .more{padding:9px 12px;background:var(--bg3);border:1px solid var(--line);border-radius:7px;color:var(--t2);cursor:pointer;font-size:14px}
+.c-acts .more:hover{color:var(--accent);border-color:var(--accent)}
+.c-acts .more-menu{position:absolute;right:14px;bottom:46px;background:var(--bg3);border:1px solid var(--line);
+  border-radius:7px;padding:6px;z-index:5;display:none;min-width:160px;box-shadow:0 4px 14px rgba(0,0,0,.4)}
+.c-acts .more-menu.open{display:block}
+.c-acts .more-menu a,.c-acts .more-menu button{display:flex;align-items:center;gap:8px;
+  padding:7px 10px;background:none;border:0;border-radius:5px;color:var(--t1);
+  font-size:12px;cursor:pointer;width:100%;text-align:left;text-decoration:none;transition:.1s}
+.c-acts .more-menu a:hover,.c-acts .more-menu button:hover{background:var(--accent-bg);color:var(--accent)}
+
+/* watch action button */
+.c-acts .main.snooze{background:var(--bg3);color:var(--watch);border:1px solid var(--watch-bd)}
+.c-acts .main.snooze:hover{background:var(--watch-bg)}
+
+/* empty state */
+.empty{padding:80px 30px;text-align:center;color:var(--t3);grid-column:1/-1}
+.empty .big{font-size:56px;margin-bottom:12px;opacity:.4}
+.empty p{font-size:14px;margin:6px 0}
+.empty .hint{font-size:12px;opacity:.7;margin-top:8px}
+
+/* compact view for KILL */
+.grid.compact{grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:8px}
+.grid.compact .card{padding:0}
+.grid.compact .c-top{padding:10px 12px 6px}
+.grid.compact .c-img,.grid.compact .c-noimg{width:40px;height:40px;font-size:18px}
+.grid.compact .c-title{font-size:12px;-webkit-line-clamp:1;padding-right:60px}
+.grid.compact .c-verdict,.grid.compact .c-sigs,.grid.compact .c-acts{display:none}
+
+/* ─── Modal ─── */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;display:none;align-items:flex-start;justify-content:center;padding:40px 20px;overflow:auto}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg2);border:1px solid var(--line);border-radius:12px;width:100%;max-width:640px;padding:0;animation:slideIn .2s}
+@keyframes slideIn{from{transform:translateY(-20px);opacity:0}to{transform:none;opacity:1}}
+.modal h2{margin:0;padding:16px 22px;border-bottom:1px solid var(--line);font-size:16px;display:flex;justify-content:space-between;align-items:center}
+.modal h2 .close{background:none;border:0;color:var(--t2);font-size:22px;cursor:pointer;padding:0;width:28px;height:28px}
+.modal h2 .close:hover{color:var(--t1)}
+.modal-body{padding:18px 22px;max-height:70vh;overflow:auto}
+.modal-foot{padding:14px 22px;border-top:1px solid var(--line);display:flex;gap:10px;justify-content:flex-end}
+
+/* verify modal */
+.verdict-hdr{padding:14px 16px;border-radius:8px;margin-bottom:14px;font-size:14px;line-height:1.55}
+.verdict-hdr.GO_TEST{background:var(--go-bg);border:1px solid var(--go-bd);color:#86efac}
+.verdict-hdr.WATCH{background:var(--watch-bg);border:1px solid var(--watch-bd);color:#fcd34d}
+.verdict-hdr.KILL{background:var(--kill-bg);border:1px solid var(--kill-bd);color:#fca5a5}
+.proscons{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.proscons section{background:var(--bg3);border-radius:8px;padding:12px 14px;border:1px solid var(--line)}
+.proscons h3{margin:0 0 10px;font-size:12px;letter-spacing:.5px;text-transform:uppercase;color:var(--t3)}
+.proscons .item{padding:8px 0;border-bottom:1px dashed var(--line);font-size:12px;line-height:1.5}
+.proscons .item:last-child{border-bottom:0}
+.proscons .item .ti{font-weight:600;color:var(--t1);display:flex;align-items:flex-start;gap:6px;margin-bottom:3px}
+.proscons .item .wh{color:var(--t2);font-size:11px;margin-left:24px}
+.testplan{background:var(--accent-bg);border:1px solid rgba(96,165,250,.3);border-radius:8px;padding:12px 14px;font-size:12px;line-height:1.7}
+.testplan b{color:var(--accent)}
+
+/* launch progress */
+.lstep{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px dashed var(--line);font-size:13px}
+.lstep:last-child{border-bottom:0}
+.lstep .ico{font-size:18px;width:24px;text-align:center}
+.lstep .meta{flex:1}
+.lstep .meta .ti{font-weight:600}
+.lstep .meta .de{font-size:11px;color:var(--t3);margin-top:1px}
+.lstep.pending{opacity:.5}
+.lstep.failed .ico{color:var(--bad)}
+.lstep.ok .ico{color:var(--good)}
+.launch-result{margin-top:16px;padding:14px;background:var(--go-bg);border:1px solid var(--go-bd);border-radius:8px;font-size:12px}
+.launch-result a{color:#86efac;font-weight:600;text-decoration:none}
+.launch-result a:hover{text-decoration:underline}
+
+/* ─── Status bar (bottom) ─── */
+.statusbar{position:fixed;bottom:0;left:0;right:0;background:var(--bg2);border-top:1px solid var(--line);
+  padding:8px 28px;font-size:11px;color:var(--t3);display:flex;justify-content:space-between;z-index:30}
+.statusbar .right{display:flex;gap:14px}
+.statusbar a{color:var(--t2);text-decoration:none}
+.statusbar a:hover{color:var(--accent)}
+
+/* toast */
+.toast{position:fixed;bottom:60px;left:50%;transform:translateX(-50%);padding:10px 18px;
+  background:var(--go);color:#03240f;border-radius:6px;font-size:13px;font-weight:600;z-index:120;
+  box-shadow:0 4px 16px rgba(0,0,0,.4);animation:fadein .2s,fadeout .3s 1.7s forwards}
+.toast.bad{background:var(--kill);color:#fff}
+.toast.info{background:var(--accent);color:#fff}
+@keyframes fadein{from{opacity:0;transform:translate(-50%,8px)}to{opacity:1;transform:translate(-50%,0)}}
+@keyframes fadeout{to{opacity:0;transform:translate(-50%,8px)}}
+
+@media (max-width:768px){
+  .hdr{padding:14px 16px}
+  .tabs{padding:0 16px;overflow-x:auto}
+  .grid{padding:14px 16px 30px}
+  .proscons{grid-template-columns:1fr}
+}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <div class="title">
+    <span class="icon">🎯</span>
+    <span>爆款雷达</span>
+    <span class="sub">输入关键词 → 看人话理由 → 一键上架</span>
+  </div>
+  <div class="toolbar">
+    <input type="search" id="q" placeholder="搜索…">
+    <a class="btn" href="/v2" title="跟品28决策台(旧版)">📊 V2 决策台</a>
+    <button class="btn primary" onclick="refresh()">⟳ 刷新</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-tab="GO_TEST" onclick="setTab('GO_TEST')">🚀 立即测款 <span class="badge" id="b-go">0</span></button>
+  <button class="tab" data-tab="WATCH" onclick="setTab('WATCH')">👀 再等等 <span class="badge" id="b-watch">0</span></button>
+  <button class="tab" data-tab="KILL" onclick="setTab('KILL')">🗑️ 不碰 <span class="badge" id="b-kill">0</span></button>
+</div>
+
+<div class="grid" id="cards"></div>
+
+<!-- ──── 1分钟验证 modal ──── -->
+<div class="modal-overlay" id="m-verify" onclick="closeModal('m-verify',event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <h2><span>1 分钟验证</span> <button class="close" onclick="closeModal('m-verify')">×</button></h2>
+    <div class="modal-body" id="verify-body">…</div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('m-verify')">取消</button>
+      <button class="btn primary" id="verify-launch-btn">🚀 没问题,一键上架</button>
+    </div>
+  </div>
+</div>
+
+<!-- ──── 一键上架 modal ──── -->
+<div class="modal-overlay" id="m-launch" onclick="closeModal('m-launch',event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <h2><span id="launch-title">一键上架</span> <button class="close" onclick="closeModal('m-launch')">×</button></h2>
+    <div class="modal-body" id="launch-body">…</div>
+    <div class="modal-foot" id="launch-foot">
+      <button class="btn" onclick="closeModal('m-launch')">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ──── 底部状态栏 ──── -->
+<div class="statusbar">
+  <div>v3 · FB Ads × Shopify 自动出单引擎</div>
+  <div class="right">
+    <span id="sb-count">候选 –</span>
+    <a href="/api/v3/clones" target="_blank">已上架</a>
+    <a href="/api/v3/decisions" target="_blank">JSON</a>
+    <a href="javascript:cloneBatch()">🛒 批量上架</a>
+  </div>
+</div>
+
+<script>
+const STATE = {rows: [], tab: 'GO_TEST', q: ''};
+const VERDICT_LABEL = {GO_TEST:'立即测款', WATCH:'再等等', KILL:'不碰'};
+const VERDICT_ICON  = {GO_TEST:'🟢', WATCH:'🟡', KILL:'🔴'};
+
+function refresh(){
+  fetch('/api/v3/decisions?limit=500&dedupe=1').then(r=>r.json()).then(d=>{
+    if(!d.ok){renderEmpty('API error');return}
+    STATE.rows = d.rows || [];
+    const s = d.summary || {};
+    $('b-go').textContent = s.GO_TEST||0;
+    $('b-watch').textContent = s.WATCH||0;
+    $('b-kill').textContent = s.KILL||0;
+    $('sb-count').textContent = '候选 ' + ((s.GO_TEST||0)+(s.WATCH||0)+(s.KILL||0));
+    render();
+  }).catch(e=>renderEmpty('Fetch error: '+e));
+}
+
+function setTab(t){
+  STATE.tab = t;
+  document.querySelectorAll('.tab').forEach(el=>el.classList.toggle('active', el.dataset.tab===t));
+  render();
+}
+
+function render(){
+  const filter = STATE.tab;
+  const q = STATE.q.toLowerCase().trim();
+  let rows = STATE.rows.filter(r=>r.decision===filter);
+  if(q) rows = rows.filter(r=>((r.title||'')+(r.shop_domain||'')+(r.category||'')).toLowerCase().includes(q));
+  rows.sort((a,b)=>(b.composite_score||0)-(a.composite_score||0));
+  const g = $('cards');
+  g.className = 'grid' + (filter==='KILL' ? ' compact' : '');
+  if(rows.length===0){
+    const msg = filter==='GO_TEST' ? '今天还没有立即测款的机会' : filter==='WATCH' ? '观察池暂时空着' : '没有被淘汰的产品';
+    g.innerHTML = `<div class="empty"><div class="big">${filter==='GO_TEST'?'🔍':filter==='WATCH'?'⏳':'✨'}</div><p>${msg}</p><p class="hint">扫更多关键词,或切到其他标签</p></div>`;
+    return;
+  }
+  g.innerHTML = rows.map(card).join('');
+}
+
+function card(r){
+  if(r.decision === 'KILL') return killCard(r);
+  return mainCard(r);
+}
+
+function killCard(r){
+  const dupCount = (r.duplicates || []).length;
+  return `<div class="card KILL">
+    <div class="c-badge KILL">🗑️ 不碰</div>
+    ${dupCount?`<div class="c-dup-pill" title="${esc(dupTooltip(r.duplicates))}">+${dupCount} 同款</div>`:''}
+    <div class="c-top">
+      ${imgTag(r,40)}
+      <div class="c-meta">
+        <div class="c-title">${esc(r.title||'')}</div>
+        <div class="c-sub"><span class="price">$${fmt(r.price_usd)}</span><span class="dot">·</span><span>${esc(r.shop_domain||'')}</span></div>
+      </div>
+    </div>
+    <div class="c-kill">
+      <div class="why"><span class="tag">${esc(killReason(r.kill_reason))}</span></div>
+      <span style="font-size:10px;color:var(--t3)">${fmt(r.composite_score,0)} 分</span>
+    </div>
+  </div>`;
+}
+
+function mainCard(r){
+  const dec = r.decision;
+  const dupCount = (r.duplicates || []).length;
+  const cloned = r._cloned || false;
+  return `<div class="card ${dec}" id="c-${r.id}">
+    <div class="c-badge ${dec}">${VERDICT_ICON[dec]} ${VERDICT_LABEL[dec]}</div>
+    ${dupCount?`<div class="c-dup-pill" title="${esc(dupTooltip(r.duplicates))}">+${dupCount} 同款</div>`:''}
+    ${cloned?`<div class="c-cloned">✓ 已上架</div>`:''}
+    <div class="c-top">
+      ${imgTag(r,72)}
+      <div class="c-meta">
+        <div class="c-title">${esc(r.title||'(无标题)')}</div>
+        <div class="c-sub">
+          <span class="price">$${fmt(r.price_usd)}</span>
+          <span class="dot">·</span>
+          <span>${esc(r.shop_domain||'')}</span>
+          ${r.category?`<span class="dot">·</span><span>${esc(r.category)}</span>`:''}
+        </div>
+      </div>
+    </div>
+
+    <div class="c-verdict">
+      <span class="score">${fmt(r.composite_score,0)}分</span>
+      <span>${oneSentenceVerdict(r)}</span>
+    </div>
+
+    <div class="c-sigs">
+      ${sigBlock('毛利', r.gross_margin_pct!=null?fmt(r.gross_margin_pct,0)+'%':'–', marginColor(r.gross_margin_pct), r.beroas?`BE ${fmt(r.beroas,2)}`:'')}
+      ${sigBlock('广告', r.days_active!=null?r.days_active+'d':'–', daysColor(r.days_active), r.distinct_entity_ids!=null?r.distinct_entity_ids+'个创意':'')}
+      ${sigBlock('趋势', r.score_7d!=null?fmt(r.score_7d,0):'–', trendColor(r.score_7d,r.score_90d), r.yoy_growth!=null?(r.yoy_growth>0?'+':'')+fmt(r.yoy_growth,0)+'% YoY':'')}
+      ${sigBlock('落地页', lpScore(r).text, lpScore(r).cls, esc(r.awareness_match_layer||''))}
+    </div>
+
+    ${dec==='WATCH' && r.watch_reason?`
+      <div class="c-watch">
+        <span><span class="tag">${esc(watchReason(r.watch_reason))}</span></span>
+        <span style="font-size:10px;color:var(--t3)">复查 ${(r.watch_recheck_at||'').slice(0,10)}</span>
+      </div>`:''}
+
+    <div class="c-acts">
+      <button class="main verify" onclick="openVerify(${r.id})">👀 1 分钟验证</button>
+      ${dec==='GO_TEST' ? `<button class="main launch ${cloned?'done':''}" onclick="doLaunch(${r.id}, this)">${cloned?'✓ 已上架':'🚀 一键上架'}</button>` :
+                          `<button class="main snooze" onclick="snooze(${r.id})">⏰ 7 天后再看</button>`}
+      <button class="more" onclick="toggleMore(${r.id})">⋯</button>
+      <div class="more-menu" id="more-${r.id}">
+        <a href="${esc(r.landing_url||r.product_url||'#')}" target="_blank">🚀 打开源页</a>
+        <button onclick="copyResearch('${esc(r.product_url||r.landing_url||'')}')">✨ 复制研究 prompt</button>
+        <a href="/api/v3/explain/${r.id}" target="_blank">🔍 决策回放</a>
+        <a href="/api/v3/why/${r.id}" target="_blank">💬 系统理由 JSON</a>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ─── helpers ─── */
+function $(id){return document.getElementById(id)}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function fmt(v, nd=1){if(v==null||v==='')return '–';const n=parseFloat(v);if(!isFinite(n))return '–';return n.toFixed(nd)}
+function imgTag(r,sz){return r.image_url?`<img class="c-img" src="${esc(r.image_url)}" loading="lazy" style="width:${sz}px;height:${sz}px">`:`<div class="c-noimg" style="width:${sz}px;height:${sz}px">📦</div>`}
+function dupTooltip(dups){if(!dups||!dups.length)return '';return '同款其他 listing('+dups.length+'):\n'+dups.map(d=>'· '+(d.shop_domain||'?')+'/'+(d.handle||'')+' ['+(d.decision||'')+' '+(d.composite_score==null?'-':d.composite_score.toFixed(0))+']').join('\n')}
+function marginColor(m){if(m==null)return '';if(m<15)return 'bad';if(m<40)return 'warn';return 'good'}
+function daysColor(d){if(d==null)return '';if(d>=14)return 'good';if(d>=7)return 'warn';return 'bad'}
+function trendColor(s7,s90){if(s7==null||s90==null)return '';if(s7>s90*1.2)return 'good';if(s7<s90*0.7)return 'bad';return ''}
+function lpScore(r){
+  let cnt=0;if(r.has_shopify)cnt++;if(r.has_klaviyo)cnt++;if(r.has_reviews_app)cnt++;if(r.has_pixel)cnt++;
+  return {text:cnt+'/4 ✓', cls:cnt>=3?'good':cnt>=2?'warn':'bad'};
+}
+function sigBlock(k,v,cls,e){return `<div class="c-sig ${cls}"><div class="k">${k}</div><div class="v">${v}</div>${e?`<div class="e">${e}</div>`:''}</div>`}
+function oneSentenceVerdict(r){
+  const d = r.decision, m = r.gross_margin_pct, days = r.days_active;
+  if(d==='GO_TEST'){
+    const bits=[];
+    if(days>=14) bits.push(`广告 ${days} 天验证赚钱`);
+    if(m>=40) bits.push(`毛利 ${fmt(m,0)}% 健康`);
+    return `✅ 现在测 — ${bits.join(' · ')||'综合分够高'}。`;
+  }
+  if(d==='WATCH'){
+    if(days!=null && days<14) return `⏸ 等 — 别人广告才跑 ${days} 天,过 14 天再看。`;
+    if(m!=null && m<25) return `⏸ 等 — 毛利 ${fmt(m,0)}% 偏紧,等 1688 找更便宜的源头。`;
+    return '⏸ 等 — 几个信号还没到位,7 天后系统会重测。';
+  }
+  return '';
+}
+function killReason(r){return {profit_too_thin:'毛利 <15% · Marcus 规则',ad_not_persistent:'广告 <14 天 · 未验证',no_creative_diversity:'创意 <3 · Andromeda 陷阱',low_traction:'展示 <100K',declining_trend:'趋势下行',lp_unprofessional:'落地页缺关键信号',red_ocean:'红海无差异化',low_overall_score:'综合分不及格'}[r] || r || 'unknown'}
+function watchReason(r){return {awaiting_persistence:'等广告跑满 14 天',awaiting_trend:'等趋势信号',awaiting_creative_proof:'等创意/落地页信号',awaiting_profit_signal:'等利润信号'}[r] || r}
+
+/* ─── modal control ─── */
+function openModal(id){$(id).classList.add('open')}
+function closeModal(id, e){
+  if(e && e.target.id !== id) return;
+  $(id).classList.remove('open');
+}
+
+/* ─── 1 分钟验证 ─── */
+async function openVerify(pid){
+  openModal('m-verify');
+  $('verify-body').innerHTML = '<div style="text-align:center;padding:30px;color:var(--t3)">生成系统理由中…</div>';
+  $('verify-launch-btn').onclick = () => {closeModal('m-verify'); doLaunch(pid);};
+  try{
+    const r = await fetch('/api/v3/why/'+pid).then(r=>r.json());
+    if(!r.ok){$('verify-body').innerHTML='<p style="color:var(--bad)">'+(r.error||'failed')+'</p>';return}
+    $('verify-body').innerHTML = renderVerify(r);
+    $('verify-launch-btn').style.display = r.verdict==='GO_TEST'?'inline-flex':'none';
+  }catch(e){$('verify-body').innerHTML='<p style="color:var(--bad)">'+e+'</p>'}
+}
+
+function renderVerify(r){
+  return `
+    <div class="verdict-hdr ${r.verdict}">
+      <b>${esc(r.title||'')}</b><br>
+      <span style="font-size:13px">${esc(r.verdict_text||'')}</span>
+    </div>
+    <div class="proscons">
+      <section>
+        <h3>👍 系统看到的机会 (${(r.pros||[]).length})</h3>
+        ${(r.pros||[]).map(item=>`
+          <div class="item">
+            <div class="ti">${item.icon||'•'} ${esc(item.title)}</div>
+            <div class="wh">${esc(item.why||'')}</div>
+          </div>`).join('') || '<div class="wh">—</div>'}
+      </section>
+      <section>
+        <h3>⚠️ 系统看到的风险 (${(r.cons||[]).length})</h3>
+        ${(r.cons||[]).map(item=>`
+          <div class="item">
+            <div class="ti">${item.icon||'•'} ${esc(item.title)}</div>
+            <div class="wh">${esc(item.why||'')}</div>
+          </div>`).join('') || '<div class="wh">—</div>'}
+      </section>
+    </div>
+    ${r.test_plan && r.test_plan.test_budget_usd ? `
+      <div class="testplan">
+        💰 <b>系统建议:</b> $${r.test_plan.test_budget_usd}/天 CBO · ${r.test_plan.test_creatives_required||3} 个创意 · 目标 ROAS <b>${r.test_plan.target_roas||'-'}</b>
+        <br>⚠️ Kill: D3 ROAS &lt; ${r.test_plan.kill_rule_day3} 或 D7 &lt; ${r.test_plan.kill_rule_day7}
+        <br>📈 Scale: D7 ROAS ≥ ${r.test_plan.scale_rule} → 预算 +${Math.round((r.test_plan.scale_step_pct||0)*100)}%/天
+      </div>` : ''}`;
+}
+
+/* ─── 一键上架 ─── */
+async function doLaunch(pid, btn){
+  if(btn) btn.disabled = true;
+  openModal('m-launch');
+  $('launch-title').textContent = '🚀 一键上架 #'+pid;
+  $('launch-body').innerHTML = `
+    <div class="lstep pending" id="lstep-1"><span class="ico">⏳</span><div class="meta"><div class="ti">1/3 生成 Andromeda-distinct 创意</div><div class="de">3 个独立 visual signature, 避免 Meta 合并</div></div></div>
+    <div class="lstep pending" id="lstep-2"><span class="ico">⏳</span><div class="meta"><div class="ti">2/3 配套落地页素材包</div><div class="de">hooks + lp_blocks + Klaviyo 三大 flow + Ads paste JSON</div></div></div>
+    <div class="lstep pending" id="lstep-3"><span class="ico">⏳</span><div class="meta"><div class="ti">3/3 推送到 Shopify 店铺 (DRAFT)</div><div class="de">含源图 + 描述 + 变体 + 标签 + 元数据</div></div></div>
+  `;
+  try{
+    const r = await fetch('/api/v3/launch/'+pid, {method:'POST'}).then(r=>r.json());
+    const steps = r.steps || {};
+    markStep(1, steps.creative);
+    markStep(2, steps.landing_kit);
+    markStep(3, steps.shopify);
+    let resultHTML = '';
+    if(r.ok){
+      resultHTML = `<div class="launch-result">
+        ✅ <b>已上架到 Shopify (DRAFT)</b><br>
+        <a href="${esc(r.shopify_admin_url||'#')}" target="_blank">→ 在 Shopify 后台打开</a>
+        ${r.shopify_storefront_url?` · <a href="${esc(r.shopify_storefront_url)}" target="_blank">店面预览</a>`:''}
+      </div>`;
+      if(btn){btn.textContent='✓ 已上架'; btn.classList.add('done')}
+      // mark cloned in state for re-renders
+      const row = STATE.rows.find(x=>x.id===pid); if(row) row._cloned = true;
+    } else if(steps.shopify && steps.shopify.hint){
+      resultHTML = `<div class="launch-result" style="background:var(--watch-bg);border-color:var(--watch-bd);color:#fcd34d">
+        ⚠️ 创意 + 素材包都已就绪,但 Shopify 推送失败:<br><code style="font-size:11px">${esc(steps.shopify.error||'')}</code><br>
+        💡 ${esc(steps.shopify.hint||'')}<br><br>
+        本地素材已生成,可手动上传: <code style="font-size:11px">output/v3/landing_kits/product_${pid}/</code>
+      </div>`;
+      if(btn) btn.disabled = false;
+    } else {
+      resultHTML = `<div class="launch-result" style="background:var(--kill-bg);border-color:var(--kill-bd);color:#fca5a5">
+        ❌ 失败: ${esc((steps.shopify||{}).error || '未知错误')}
+      </div>`;
+      if(btn) btn.disabled = false;
+    }
+    $('launch-body').insertAdjacentHTML('beforeend', resultHTML);
+  }catch(e){
+    $('launch-body').insertAdjacentHTML('beforeend',
+      `<div class="launch-result" style="background:var(--kill-bg);border-color:var(--kill-bd);color:#fca5a5">❌ ${e}</div>`);
+    if(btn) btn.disabled = false;
+  }
+}
+function markStep(n, res){
+  const el = $('lstep-'+n);
+  if(!el || !res) return;
+  el.classList.remove('pending');
+  if(res.ok){ el.classList.add('ok'); el.querySelector('.ico').textContent='✓'; }
+  else { el.classList.add('failed'); el.querySelector('.ico').textContent='✗';
+    el.querySelector('.de').textContent = res.error || '失败'; }
+}
+
+/* ─── 批量上架 / 其他次要 ─── */
+async function cloneBatch(){
+  if(!confirm('把当前所有 🟢 立即测款的产品都推到 Shopify (DRAFT)?')) return;
+  toast('⏳ 批量上架中…','info');
+  try{
+    const r = await fetch('/api/v3/clone-batch?decision=GO_TEST', {method:'POST'}).then(r=>r.json());
+    if(r.error){toast('❌ '+r.error,'bad');return}
+    toast(`✅ 尝试 ${r.attempted} · 新 ${r.cloned} · 跳过 ${r.skipped} · 失败 ${r.failed}`);
+    refresh();
+  }catch(e){toast('❌ '+e,'bad')}
+}
+function snooze(pid){toast('观察池条目会在到期日自动重测','info')}
+async function copyResearch(url){
+  if(!url){toast('无 URL','bad');return}
+  const r = await fetch('/api/v3/generate-research-prompt?product_url='+encodeURIComponent(url),{method:'POST'}).then(r=>r.json());
+  await navigator.clipboard.writeText(r.prompt||'');
+  toast('已复制研究 prompt');
+}
+function toggleMore(pid){
+  document.querySelectorAll('.more-menu.open').forEach(el=>{if(el.id !== 'more-'+pid) el.classList.remove('open')});
+  $('more-'+pid).classList.toggle('open');
+}
+document.addEventListener('click', e=>{
+  if(!e.target.closest('.c-acts')) {
+    document.querySelectorAll('.more-menu.open').forEach(el=>el.classList.remove('open'));
+  }
+});
+
+function toast(msg, kind){
+  const t = document.createElement('div');
+  t.className='toast'+(kind?' '+kind:''); t.textContent=msg;
+  document.body.appendChild(t);
+  setTimeout(()=>t.remove(), 2200);
+}
+
+$('q').addEventListener('input', e=>{STATE.q = e.target.value; render()});
+refresh();
+setInterval(refresh, 60000);
+</script>
+</body>
+</html>

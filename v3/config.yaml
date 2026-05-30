@@ -1,0 +1,77 @@
+scoring:
+  weights: { fb: 0.35, profit: 0.30, trend: 0.20, lp: 0.15 }
+  go_test: { composite_min: 75, fb_min: 60, profit_min: 60 }
+  watch:   { composite_min: 55 }
+
+fb_ads:
+  service_url: "http://127.0.0.1:8000"
+  min_days_active: 14
+  min_impressions: 100000
+  min_distinct_entities_for_scale: 5
+  exclude_advertisers: [Amazon, Temu, Shein, Walmart, AliExpress, Wish, eBay, Target]
+  entity_homogeneity_warn_ratio: 3.0
+  request_timeout_sec: 30
+
+profit:
+  fee_pct: 0.029
+  default_shipping_usd_by_category:
+    home: 4.5
+    beauty: 3.2
+    pet: 5.0
+    fitness: 8.0
+    electronics: 6.5
+    accessories: 3.0
+    apparel: 4.0
+    other: 5.0
+  default_refund_rate_by_category:
+    home: 0.08
+    beauty: 0.12
+    pet: 0.06
+    fitness: 0.09
+    electronics: 0.15
+    accessories: 0.07
+    apparel: 0.15
+    other: 0.10
+  min_gross_margin_for_paid_ads: 0.15   # Marcus's Rule
+  min_gross_margin_for_scale: 0.40
+  min_markup: 3.0
+
+trends:
+  provider: pytrends
+  timeframes: [7d, 30d, 90d, 12m]
+  geo: ""               # empty = worldwide
+  hl: "en-US"
+  decline_kill_slope: 0.0
+  decline_kill_ratio_7d_vs_90d: 0.7
+  request_timeout_sec: 30
+
+landing_page:
+  required: [shopify, pixel]
+  professional_bonus: [klaviyo, reviews_app, video_hero, comparison_chart, ugc_block]
+  payment_methods_full: 3
+  request_timeout_sec: 30
+
+decision:
+  red_ocean_competitor_threshold: 50
+  watch_recheck_days: 7
+
+test_plan:
+  default_budget_usd: 50
+  default_creatives: 3
+  target_roas_multiplier: 1.2
+  kill_day3_roas: 1.5
+  kill_day7_roas: 2.0
+  scale_day7_roas: 3.0
+  scale_step_pct: 0.20
+
+paths:
+  db: "./output/v3/v3.sqlite"
+  reports: "./output/v3/reports"
+  landing_kits: "./output/v3/landing_kits"
+  logs: "./output/v3/logs"
+  shopify_snapshots: "./output/shopify_monitor"
+
+pipeline:
+  parallel_signal_workers: 4
+  per_product_timeout_sec: 60
+  scan_default_top: 30
