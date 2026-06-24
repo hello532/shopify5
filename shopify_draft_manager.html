@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shopify Draft 管理器</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header {
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .stat-value { font-size: 32px; font-weight: 700; }
+        .stat-label { font-size: 12px; opacity: 0.8; margin-top: 5px; }
+        .products-panel {
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .toolbar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            align-items: center;
+        }
+        .btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            border: none;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            color: white;
+        }
+        .btn-primary { background: #10b981; }
+        .btn-secondary { background: rgba(255,255,255,0.2); }
+        .btn-danger { background: #ef4444; }
+        .product-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 15px;
+        }
+        .product-card {
+            background: rgba(255,255,255,0.1);
+            border-radius: 8px;
+            padding: 15px;
+            position: relative;
+        }
+        .product-card img {
+            width: 100%;
+            height: 200px;
+            object-fit: cover;
+            border-radius: 6px;
+            margin-bottom: 10px;
+        }
+        .product-title {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .product-meta {
+            font-size: 12px;
+            opacity: 0.8;
+            margin-bottom: 10px;
+        }
+        .checkbox { position: absolute; top: 10px; right: 10px; }
+        .actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .status-badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .status-draft { background: #f59e0b; }
+        .status-active { background: #10b981; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📦 Shopify Draft 管理器</h1>
+            <button class="btn btn-secondary" onclick="refreshDrafts()">🔄 刷新</button>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-value" id="totalDrafts">0</div>
+                <div class="stat-label">DRAFT 产品</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="needsImages">0</div>
+                <div class="stat-label">缺少变体图</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="needsSEO">0</div>
+                <div class="stat-label">需要SEO优化</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="readyToPublish">0</div>
+                <div class="stat-label">可发布</div>
+            </div>
+        </div>
+
+        <div class="products-panel">
+            <div class="toolbar">
+                <button class="btn btn-secondary" onclick="toggleSelectAll()">
+                    <input type="checkbox" id="selectAll" style="margin-right:4px;">全选
+                </button>
+                <button class="btn btn-primary" onclick="batchBindImages()">🖼️ 批量绑定变体图</button>
+                <button class="btn btn-primary" onclick="batchOptimizeSEO()">🎯 批量SEO优化</button>
+                <button class="btn btn-primary" onclick="batchPublish()">✅ 批量发布Active</button>
+                <button class="btn btn-danger" onclick="clearSelection()">✕ 取消</button>
+            </div>
+
+            <div class="product-grid" id="productsGrid">
+                <div style="text-align:center;padding:40px;opacity:0.6;">加载中...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let allDrafts = [];
+        let selectedProducts = new Set();
+
+        async function loadDrafts() {
+            try {
+                const resp = await fetch('/api/v2/shopify/draft-products');
+                const data = await resp.json();
+                allDrafts = data.products || [];
+                updateStats();
+                renderProducts();
+            } catch (e) {
+                console.error('加载失败:', e);
+            }
+        }
+
+        function updateStats() {
+            document.getElementById('totalDrafts').textContent = allDrafts.length;
+            document.getElementById('needsImages').textContent = allDrafts.filter(p => !p.variants_have_images).length;
+            document.getElementById('needsSEO').textContent = allDrafts.filter(p => !p.seo_optimized).length;
+            document.getElementById('readyToPublish').textContent = allDrafts.filter(p => p.ready_to_publish).length;
+        }
+
+        function renderProducts() {
+            const grid = document.getElementById('productsGrid');
+            if (allDrafts.length === 0) {
+                grid.innerHTML = '<div style="text-align:center;padding:40px;opacity:0.6;">暂无 DRAFT 产品</div>';
+                return;
+            }
+
+            grid.innerHTML = allDrafts.map(p => `
+                <div class="product-card" data-id="${p.id}">
+                    <input type="checkbox" class="checkbox" onchange="toggleProduct('${p.id}', this.checked)">
+                    <img src="${p.image || 'https://via.placeholder.com/300'}" alt="${p.title}">
+                    <div class="product-title">${p.title}</div>
+                    <div class="product-meta">
+                        <span class="status-badge status-${p.status.toLowerCase()}">${p.status}</span>
+                        ${p.variants_count} 变体 · ${p.media_count} 图片
+                    </div>
+                    <div class="product-meta" style="font-size:11px;">
+                        ${p.variants_have_images ? '✅' : '❌'} 变体图
+                        ${p.seo_optimized ? '✅' : '❌'} SEO
+                    </div>
+                    <div class="actions">
+                        <button class="btn btn-secondary" onclick="viewInShopify('${p.admin_url}')">查看</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function toggleProduct(id, checked) {
+            checked ? selectedProducts.add(id) : selectedProducts.delete(id);
+        }
+
+        function toggleSelectAll() {
+            const cb = document.getElementById('selectAll');
+            document.querySelectorAll('.checkbox').forEach(c => {
+                c.checked = cb.checked;
+                toggleProduct(c.closest('.product-card').dataset.id, cb.checked);
+            });
+        }
+
+        function clearSelection() {
+            selectedProducts.clear();
+            document.querySelectorAll('.checkbox').forEach(c => c.checked = false);
+            document.getElementById('selectAll').checked = false;
+        }
+
+        async function batchBindImages() {
+            if (selectedProducts.size === 0) { alert('请先选择产品'); return; }
+            if (!confirm(`绑定 ${selectedProducts.size} 个产品的变体图片？`)) return;
+
+            try {
+                const ids = Array.from(selectedProducts);
+                const resp = await fetch('/api/v2/shopify/batch-bind-images?product_ids=' + ids.join('&product_ids='), {
+                    method: 'POST'
+                });
+                const result = await resp.json();
+                alert(`✅ 批量绑定完成！\n处理: ${result.processed} 个\n${result.message}`);
+                clearSelection();
+                loadDrafts();
+            } catch (e) {
+                alert('❌ 绑定失败: ' + e.message);
+            }
+        }
+
+        async function batchOptimizeSEO() {
+            if (selectedProducts.size === 0) { alert('请先选择产品'); return; }
+            if (!confirm(`优化 ${selectedProducts.size} 个产品的SEO？`)) return;
+
+            try {
+                const ids = Array.from(selectedProducts);
+                const resp = await fetch('/api/v2/shopify/batch-optimize-seo?product_ids=' + ids.join('&product_ids='), {
+                    method: 'POST'
+                });
+                const result = await resp.json();
+                alert(`✅ SEO优化完成！\n处理: ${result.processed} 个\n${result.message}`);
+                clearSelection();
+                loadDrafts();
+            } catch (e) {
+                alert('❌ 优化失败: ' + e.message);
+            }
+        }
+
+        async function batchPublish() {
+            if (selectedProducts.size === 0) { alert('请先选择产品'); return; }
+            if (!confirm(`发布 ${selectedProducts.size} 个产品到 ACTIVE？\n\n⚠️ 发布后产品将在店铺前台可见！`)) return;
+
+            try {
+                const ids = Array.from(selectedProducts);
+                const resp = await fetch('/api/v2/shopify/batch-publish?product_ids=' + ids.join('&product_ids='), {
+                    method: 'POST'
+                });
+                const result = await resp.json();
+                alert(`✅ 批量发布完成！\n成功: ${result.success} 个\n失败: ${result.failed} 个`);
+                clearSelection();
+                loadDrafts();
+            } catch (e) {
+                alert('❌ 发布失败: ' + e.message);
+            }
+        }
+
+        function viewInShopify(url) {
+            window.open(url, '_blank');
+        }
+
+        function refreshDrafts() {
+            loadDrafts();
+        }
+
+        loadDrafts();
+    </script>
+</body>
+</html>

@@ -2,6 +2,7 @@
 import unittest
 
 from monitor_new_products import (
+    action_bucket,
     build_daily_checklist,
     build_task_queues,
     build_trend_queries,
@@ -126,9 +127,14 @@ class MonitorNewProductsTests(unittest.TestCase):
             "trend_momentum_pct": 11.0,
         }
         enriched = enrich_product_actionability(product)
-        self.assertGreaterEqual(enriched["action_score"], 60)
+        self.assertGreaterEqual(enriched["action_score"], 80)
         self.assertIn(enriched["action_bucket"], {"scale_now", "test_now"})
         self.assertTrue(enriched["meta_brand_url"].startswith("https://www.facebook.com/ads/library/"))
+
+    def test_action_bucket_requires_80_before_testing(self):
+        self.assertEqual(action_bucket(79), "watch_close")
+        self.assertEqual(action_bucket(80), "test_now")
+        self.assertEqual(action_bucket(90), "scale_now")
 
     def test_build_opportunity_board_sorts_by_action_score(self):
         products = [

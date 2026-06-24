@@ -1,0 +1,1073 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Operator 作战台 - 一键操作</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container { max-width: 1600px; margin: 0 auto; }
+        
+        /* 顶部告警栏 */
+        .alerts-bar {
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 15px 20px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        .alert-item {
+            background: rgba(255,255,255,0.2);
+            padding: 8px 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .alert-item.high { background: rgba(239, 68, 68, 0.3); }
+        .alert-item.medium { background: rgba(251, 146, 60, 0.3); }
+        
+        /* 主面板 */
+        .main-panel {
+            display: grid;
+            grid-template-columns: 300px 1fr;
+            gap: 20px;
+        }
+        
+        /* 侧边栏 */
+        .sidebar {
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .sidebar h3 {
+            font-size: 18px;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(255,255,255,0.2);
+        }
+        .stat-card {
+            background: rgba(255,255,255,0.1);
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+        }
+        .stat-card h4 {
+            font-size: 14px;
+            opacity: 0.8;
+            margin-bottom: 5px;
+        }
+        .stat-value {
+            font-size: 32px;
+            font-weight: 700;
+        }
+        .stat-label {
+            font-size: 12px;
+            opacity: 0.7;
+            margin-top: 5px;
+        }
+        .grade-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        .grade-A { background: #10b981; }
+        .grade-B { background: #3b82f6; }
+        .grade-C { background: #f59e0b; }
+        .grade-D { background: #ef4444; }
+        
+        /* 批量操作栏 */
+        .bulk-actions-bar {
+            background: rgba(16, 185, 129, 0.2);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 8px;
+            padding: 12px 20px;
+            margin-bottom: 16px;
+            display: none;
+            align-items: center;
+            gap: 15px;
+        }
+        .bulk-actions-bar.active { display: flex; }
+        .bulk-actions-bar .count { font-weight: 600; }
+        .bulk-actions-bar button {
+            padding: 6px 15px;
+            border: none;
+            border-radius: 4px;
+            font-size: 13px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        .bulk-actions-bar .btn-bulk-draft {
+            background: #3b82f6;
+            color: white;
+        }
+        .bulk-actions-bar .btn-bulk-enrich {
+            background: #8b5cf6;
+            color: white;
+        }
+        .bulk-actions-bar .btn-bulk-clear {
+            background: #ef4444;
+            color: white;
+        }
+
+        /* 产品卡片选择框 */
+        .product-card {
+            position: relative;
+        }
+        .product-checkbox {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+            z-index: 10;
+        }
+
+        /* 产品列表 */
+        .products-panel {
+            background: rgba(255,255,255,0.15);
+            backdrop-filter: blur(10px);
+            border-radius: 12px;
+            padding: 20px;
+        }
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid rgba(255,255,255,0.2);
+        }
+        .panel-header h2 { font-size: 24px; }
+        .filter-tabs {
+            display: flex;
+            gap: 10px;
+        }
+        .filter-tab {
+            padding: 8px 16px;
+            border-radius: 6px;
+            background: rgba(255,255,255,0.1);
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        .filter-tab:hover { background: rgba(255,255,255,0.2); }
+        .filter-tab.active { background: #10b981; font-weight: 600; }
+        
+        /* 产品卡片 */
+        .product-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+            gap: 15px;
+        }
+        .product-card {
+            background: rgba(255,255,255,0.1);
+            border-radius: 10px;
+            padding: 15px;
+            transition: all 0.2s;
+        }
+        .product-card:hover {
+            background: rgba(255,255,255,0.15);
+            transform: translateY(-2px);
+        }
+        .product-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 12px;
+        }
+        .product-title {
+            font-size: 16px;
+            font-weight: 600;
+            line-height: 1.3;
+            flex: 1;
+        }
+        .product-score {
+            background: #10b981;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 600;
+            margin-left: 10px;
+        }
+        .product-meta {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 12px;
+            font-size: 13px;
+            opacity: 0.9;
+        }
+        .meta-item { display: flex; align-items: center; gap: 5px; }
+        
+        .evidence-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+        .badge {
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .badge.verified { background: rgba(16, 185, 129, 0.3); }
+        .badge.pending { background: rgba(251, 146, 60, 0.3); }
+        .badge.missing { background: rgba(239, 68, 68, 0.3); }
+        
+        /* 操作按钮 */
+        .actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            border: none;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            flex: 1;
+        }
+        .btn-primary {
+            background: #10b981;
+            color: white;
+        }
+        .btn-primary:hover { background: #059669; }
+        .btn-secondary {
+            background: rgba(255,255,255,0.2);
+            color: white;
+        }
+        .btn-secondary:hover { background: rgba(255,255,255,0.3); }
+        .btn-danger {
+            background: #ef4444;
+            color: white;
+        }
+        .btn-danger:hover { background: #dc2626; }
+        
+        /* 状态标签 */
+        .status-tag {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .status-follow { background: #10b981; }
+        .status-monitor { background: #f59e0b; }
+        .status-skip { background: #6b7280; }
+        
+        /* 加载中 */
+        .loading {
+            text-align: center;
+            padding: 60px 20px;
+            font-size: 18px;
+        }
+        .spinner {
+            border: 4px solid rgba(255,255,255,0.2);
+            border-top-color: white;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* 模态框 */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal.show { display: flex; }
+        .modal-content {
+            background: #1f2937;
+            border-radius: 12px;
+            padding: 30px;
+            max-width: 600px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .modal-header {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 20px;
+        }
+        .modal-close {
+            float: right;
+            font-size: 24px;
+            cursor: pointer;
+            opacity: 0.7;
+        }
+        .modal-close:hover { opacity: 1; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- 告警栏 -->
+        <div class="alerts-bar" id="alertsBar">
+            <div style="font-weight: 600;">🚨 实时告警</div>
+            <div id="alertsList">加载中...</div>
+        </div>
+        
+        <!-- 主面板 -->
+        <div class="main-panel">
+            <!-- 侧边栏 -->
+            <div class="sidebar">
+                <h3>📊 证据质量</h3>
+                <div class="stat-card">
+                    <h4>数据质量</h4>
+                    <div class="stat-value" id="dataQuality">--</div>
+                    <div class="stat-label">
+                        <span class="grade-badge" id="dataGrade">-</span>
+                    </div>
+                </div>
+                
+                <div class="stat-card">
+                    <h4>证据质量</h4>
+                    <div class="stat-value" id="evidenceQuality">--</div>
+                    <div class="stat-label">
+                        <span class="grade-badge" id="evidenceGrade">-</span>
+                    </div>
+                </div>
+                
+                <div class="stat-card">
+                    <h4>判断质量</h4>
+                    <div class="stat-value" id="judgementQuality">--</div>
+                    <div class="stat-label">
+                        <span class="grade-badge" id="judgementGrade">-</span>
+                    </div>
+                </div>
+                
+                <h3 style="margin-top: 30px;">📦 产品统计</h3>
+                <div class="stat-card">
+                    <h4>总产品数</h4>
+                    <div class="stat-value" id="totalProducts">--</div>
+                </div>
+                
+                <div class="stat-card">
+                    <h4>可跟品</h4>
+                    <div class="stat-value" id="followableProducts">--</div>
+                    <div class="stat-label">马上跟 + 轻跟先拆</div>
+                </div>
+            </div>
+            
+            <!-- 产品列表 -->
+            <div class="products-panel">
+                <div class="panel-header">
+                    <h2>🎯 跟品队列</h2>
+                    <div class="filter-tabs">
+                        <div class="filter-tab active" data-filter="all">全部</div>
+                        <div class="filter-tab" data-filter="follow_now">马上跟</div>
+                        <div class="filter-tab" data-filter="follow_light">轻跟先拆</div>
+                        <div class="filter-tab" data-filter="hard_risk">硬风险不碰</div>
+                    </div>
+                </div>
+
+                <!-- 工具栏 -->
+                <div style="display:flex;gap:10px;margin-bottom:12px;align-items:center;">
+                    <button onclick="toggleSelectAll()" class="btn-secondary" style="padding:6px 12px;">
+                        <input type="checkbox" id="selectAllCheckbox" style="margin-right:4px;">全选
+                    </button>
+                    <select id="sortSelect" onchange="sortProducts()" style="padding:6px 12px;border-radius:6px;border:none;background:rgba(255,255,255,0.2);color:white;">
+                        <option value="score_desc">评分从高到低</option>
+                        <option value="score_asc">评分从低到高</option>
+                        <option value="trend_desc">趋势从高到低</option>
+                        <option value="ads_desc">广告数从多到少</option>
+                        <option value="price_asc">价格从低到高</option>
+                    </select>
+                    <button onclick="refreshData()" class="btn-secondary" style="padding:6px 12px;">🔄 刷新</button>
+                    <button onclick="exportData()" class="btn-secondary" style="padding:6px 12px;">📥 导出</button>
+                </div>
+
+                <!-- 批量操作栏 -->
+                <div class="bulk-actions-bar" id="bulkActionsBar">
+                    <span class="count">已选 <strong id="selectedCount">0</strong> 个产品</span>
+                    <button class="btn-bulk-draft" onclick="bulkCreateDraft()">🚀 批量生成Draft</button>
+                    <button class="btn-bulk-enrich" onclick="bulkEnrich()">🔍 批量补证</button>
+                    <button class="btn-bulk-clear" onclick="clearSelection()">✕ 取消</button>
+                </div>
+
+                <div id="productsContainer">
+                    <div class="loading">
+                        <div class="spinner"></div>
+                        加载产品数据...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 模态框 -->
+    <div class="modal" id="reportModal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeModal()">&times;</span>
+            <div class="modal-header" id="modalTitle">竞品拆解报告</div>
+            <div id="modalContent"></div>
+        </div>
+    </div>
+    
+    <script>
+        let currentFilter = 'all';
+        let allProducts = [];
+        let selectedProducts = new Set();
+        let currentSort = 'score_desc';
+
+        // Lane 名称映射
+        const LANE_MAP = {
+            'auto_follow_now': 'follow_now',
+            'auto_teardown_first': 'follow_light',
+            'auto_prove_first': 'follow_light',
+            'auto_do_not_follow': 'hard_risk',
+            'auto_low_priority': 'hard_risk'
+        };
+
+        // 加载数据
+        async function loadData() {
+            try {
+                const statusResp = await fetch('/api/ai-autopilot/status');
+                if (!statusResp.ok) throw new Error(`HTTP ${statusResp.status}`);
+                const status = await statusResp.json();
+
+                // 更新质量指标
+                updateQualityMetrics(status);
+
+                // 从 auto_follow_queue 构建产品列表
+                const queue = status.auto_follow_queue || {};
+                allProducts = [];
+                for (const [laneName, items] of Object.entries(queue)) {
+                    if (!Array.isArray(items)) continue;
+                    const mappedLane = LANE_MAP[laneName] || 'hard_risk';
+                    for (const item of items) {
+                        allProducts.push({ ...item, lane: mappedLane, _raw_lane: laneName });
+                    }
+                }
+
+                // 更新统计
+                const counts = status.auto_selection_summary?.counts || {};
+                const total = allProducts.length;
+                const followable = (counts.follow_now || 0) + (counts.teardown_first || 0) + (counts.prove_first || 0);
+                document.getElementById('totalProducts').textContent = total;
+                document.getElementById('followableProducts').textContent = followable;
+
+                renderProducts();
+                loadAlerts();
+
+            } catch (error) {
+                console.error('加载失败:', error);
+                document.getElementById('productsContainer').innerHTML =
+                    '<div class="loading">❌ 加载失败: ' + error.message + '</div>';
+            }
+        }
+
+        // 更新质量指标
+        function updateQualityMetrics(status) {
+            // 数据质量
+            const dataQ = status.data_quality || {};
+            document.getElementById('dataQuality').textContent = dataQ.score || 0;
+            document.getElementById('dataGrade').textContent = dataQ.grade || '-';
+            document.getElementById('dataGrade').className = 'grade-badge grade-' + (dataQ.grade || 'E');
+
+            // 证据质量
+            const evidenceQ = status.evidence_quality || {};
+            document.getElementById('evidenceQuality').textContent = evidenceQ.score || 0;
+            document.getElementById('evidenceGrade').textContent = evidenceQ.grade || '-';
+            document.getElementById('evidenceGrade').className = 'grade-badge grade-' + (evidenceQ.grade || 'E');
+
+            // 判断质量
+            const judgementQ = status.judgement_quality || {};
+            document.getElementById('judgementQuality').textContent = judgementQ.score || 0;
+            document.getElementById('judgementGrade').textContent = judgementQ.grade || '-';
+            document.getElementById('judgementGrade').className = 'grade-badge grade-' + (judgementQ.grade || 'E');
+        }
+        
+        // 渲染产品列表
+        function renderProducts() {
+            const container = document.getElementById('productsContainer');
+            
+            // 过滤
+            const filtered = currentFilter === 'all' 
+                ? allProducts 
+                : allProducts.filter(p => {
+                    if (currentFilter === 'follow_now') return p.lane === 'follow_now';
+                    if (currentFilter === 'follow_light') return p.lane === 'follow_light';
+                    if (currentFilter === 'hard_risk') return p.lane === 'hard_risk';
+                    return true;
+                });
+            
+            if (filtered.length === 0) {
+                container.innerHTML = '<div class="loading">暂无产品</div>';
+                return;
+            }
+            
+            // 渲染卡片
+            const html = filtered.map(p => renderProductCard(p)).join('');
+            container.innerHTML = `<div class="product-grid">${html}</div>`;
+        }
+        
+        // 渲染单个产品卡片
+        function renderProductCard(product) {
+            const lane = product.lane || 'unknown';
+            const laneLabels = {
+                'follow_now': '马上跟',
+                'follow_light': '轻跟先拆',
+                'hard_risk': '硬风险不碰'
+            };
+
+            const score = product.operator_score || 0;
+            const title = product.title || product.product_title || '未知产品';
+            const domain = product.domain || '';
+            const price = product.price || 0;
+            const adCount = product.ad_count || 0;
+            const trendScore = product.trend_score || 0;
+            const grade = product.operator_grade || '';
+            const why = product.why || '';
+            const doNow = product.do_now || '';
+
+            // 证据状态 - 使用 scorecard gates
+            const scorecard = product.scorecard || [];
+            const evidenceBadges = scorecard.map(gate => {
+                const state = gate.state || 'pending';
+                const badgeClass = state === 'pass' ? 'verified' :
+                                   state === 'warn' ? 'pending' : 'missing';
+                return `<span class="badge ${badgeClass}">${gate.label || ''}</span>`;
+            }).join('');
+
+            // 如果没有 scorecard, 用 strict_validation 显示
+            const fallbackBadge = !scorecard.length && product.strict_validation
+                ? `<span class="badge pending">验证 ${product.strict_validation}</span>`
+                : '';
+
+            const laneLabel = laneLabels[lane] || product.follow_level || lane;
+            const laneClass = lane === 'follow_now' ? 'follow' :
+                             lane === 'follow_light' ? 'monitor' : 'skip';
+
+            const safeProduct = JSON.stringify(product).replace(/'/g, "&#39;").replace(/</g, "\\u003c");
+            const productId = product.product_url || product.domain + '-' + Math.random();
+            const isSelected = selectedProducts.has(productId);
+
+            return `
+                <div class="product-card" data-product='${safeProduct}' data-id="${productId}">
+                    <input type="checkbox" class="product-checkbox" ${isSelected ? 'checked' : ''}
+                           onchange="toggleProduct('${productId}', this.checked)">
+                    <div class="product-header">
+                        <div class="product-title">${escapeHtml(title)}</div>
+                        <div class="product-score">${score}${grade ? ' ' + grade : ''}</div>
+                    </div>
+
+                    <div class="product-meta">
+                        <div class="meta-item">🏪 <a href="${escapeHtml(product.product_url || '')}" target="_blank" style="color:inherit;text-decoration:underline;">${escapeHtml(domain)}</a></div>
+                        <div class="meta-item">💰 $${price}</div>
+                        <div class="meta-item">📊 ${adCount.toLocaleString()} 广告</div>
+                        <div class="meta-item">📈 趋势 ${trendScore}</div>
+                    </div>
+
+                    <div style="margin-bottom: 10px;">
+                        <span class="status-tag status-${laneClass}">${laneLabel}</span>
+                        ${product.trend_status === 'hot' ? '<span class="status-tag status-follow" style="margin-left:6px;">🔥 热门</span>' : ''}
+                    </div>
+
+                    ${why ? `<div style="font-size:12px;opacity:0.85;margin-bottom:8px;">${escapeHtml(why)}</div>` : ''}
+
+                    <div class="evidence-badges">
+                        ${evidenceBadges || fallbackBadge || '<span class="badge pending">待补证</span>'}
+                    </div>
+
+                    ${doNow ? `<div style="font-size:12px;opacity:0.75;margin-top:6px;">⚡ ${escapeHtml(doNow)}</div>` : ''}
+
+                    <div class="actions">
+                        <button class="btn btn-primary" onclick="createShopifyDraft(this)">
+                            🚀 生成 Draft
+                        </button>
+                        <button class="btn btn-secondary" onclick="generateReport(this)">
+                            📄 拆解报告
+                        </button>
+                        <button class="btn btn-secondary" onclick="enrichEvidence(this)">
+                            🔍 补证
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+        }
+        
+        // 切换过滤器
+        document.querySelectorAll('.filter-tab').forEach(tab => {
+            tab.addEventListener('click', (e) => {
+                document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
+                e.target.classList.add('active');
+                currentFilter = e.target.dataset.filter;
+                renderProducts();
+            });
+        });
+        
+        // 一键克隆到 Shopify 店铺
+        async function createShopifyDraft(btn) {
+            const card = btn.closest('.product-card');
+            const product = JSON.parse(card.dataset.product);
+            const productUrl = product.product_url || '';
+
+            if (!productUrl) {
+                alert('❌ 该产品没有竞品 URL，无法克隆');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = '⏳ 抓取竞品...';
+
+            try {
+                const params = new URLSearchParams({ product_url: productUrl });
+                if (product.operator_score) params.set('operator_score', String(product.operator_score));
+                if (product.why) params.set('operator_why', product.why.substring(0, 500));
+
+                btn.textContent = '⏳ 上传到店铺...';
+                const resp = await fetch('/api/v2/shopify/clone-to-store?' + params.toString(), {
+                    method: 'POST',
+                });
+                const result = await resp.json();
+
+                if (result.ok) {
+                    btn.textContent = '✅ 已上架';
+                    btn.className = 'btn btn-primary';
+                    const msg = `✅ Shopify DRAFT 已创建！\n\n标题: ${result.title}\n变体: ${result.variants_created} 个\n图片: ${result.images_uploaded} 张\n\n后台: ${result.admin_url}`;
+                    alert(msg);
+                } else {
+                    throw new Error(result.error || JSON.stringify(result.user_errors || '未知错误'));
+                }
+            } catch (error) {
+                btn.textContent = '❌ 失败';
+                alert('克隆失败: ' + error.message);
+            } finally {
+                setTimeout(() => {
+                    btn.disabled = false;
+                    btn.textContent = '🚀 生成 Draft';
+                }, 3000);
+            }
+        }
+        
+        // 生成竞品拆解报告
+        function generateReport(btn) {
+            const card = btn.closest('.product-card');
+            const product = JSON.parse(card.dataset.product);
+
+            const scorecardHtml = (product.scorecard || []).map(gate => {
+                const icon = gate.state === 'pass' ? '✅' : gate.state === 'warn' ? '⚠️' : '❌';
+                const score = gate.score || 0;
+                const weight = gate.weight || 0;
+                return `
+                    <div style="background:#f8fafc;padding:12px;margin:8px 0;border-left:3px solid ${gate.state === 'pass' ? '#10b981' : gate.state === 'warn' ? '#f59e0b' : '#ef4444'};">
+                        <div style="display:flex;justify-content:space-between;margin-bottom:4px;">
+                            <strong>${icon} ${gate.label}</strong>
+                            <span style="color:#64748b;">${score}/${weight}分</span>
+                        </div>
+                        <div style="font-size:13px;color:#475569;margin:4px 0;">${gate.text || ''}</div>
+                        <div style="font-size:12px;color:#64748b;margin-top:6px;">
+                            <strong>原因:</strong> ${gate.reason || ''}
+                        </div>
+                        <div style="font-size:12px;color:#0ea5e9;margin-top:4px;">
+                            <strong>行动:</strong> ${gate.next_action || ''}
+                        </div>
+                    </div>
+                `;
+            }).join('') || '<p style="color:#94a3b8;">暂无评分卡数据</p>';
+
+            const blockingHtml = product.blocking && product.blocking.length ? `
+                <h3 style="margin-top:24px;color:#ef4444;">🚫 硬阻断项 (${product.blocking.length})</h3>
+                ${product.blocking.map(b => `<div style="background:#fef2f2;border-left:3px solid #ef4444;padding:10px;margin:6px 0;"><strong>❌</strong> ${b}</div>`).join('')}
+            ` : '';
+
+            const evidenceGapsHtml = product.evidence_gaps && product.evidence_gaps.length ? `
+                <h3 style="margin-top:24px;color:#f59e0b;">⚠️ 证据缺口 (${product.evidence_gaps.length})</h3>
+                ${product.evidence_gaps.map(g => `<div style="background:#fffbeb;border-left:3px solid #f59e0b;padding:10px;margin:6px 0;"><strong>⚠️</strong> ${g}</div>`).join('')}
+            ` : '';
+
+            const validationSummary = product.validation_summary || {};
+            const validationHtml = validationSummary.verified_count ? `
+                <div style="background:#f0fdf4;border:1px solid #86efac;padding:12px;border-radius:6px;margin:12px 0;">
+                    <strong style="color:#16a34a;">✓ 验证进度:</strong> ${validationSummary.verified_count}/${validationSummary.required_count} 项已完成
+                    ${validationSummary.blocking_count ? `<span style="color:#dc2626;margin-left:12px;">⚠ ${validationSummary.blocking_count} 项阻断</span>` : ''}
+                </div>
+            ` : '';
+
+            const report = `
+                <div style="font-family:system-ui,-apple-system,sans-serif;line-height:1.6;">
+                    <div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;padding:20px;margin:-20px -20px 20px;border-radius:8px 8px 0 0;">
+                        <h2 style="margin:0;font-size:20px;">${product.title || '未命名产品'}</h2>
+                        <p style="margin:8px 0 0;opacity:0.9;font-size:14px;">
+                            ${product.domain || ''} ·
+                            Operator 评分: <strong>${product.operator_score || 0}/100 ${product.operator_grade || ''}</strong>
+                        </p>
+                    </div>
+
+                    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:16px 0;">
+                        <div style="background:#f1f5f9;padding:12px;border-radius:6px;">
+                            <div style="font-size:12px;color:#64748b;">💰 售价</div>
+                            <div style="font-size:20px;font-weight:bold;color:#0f172a;">$${product.price || 0}</div>
+                        </div>
+                        <div style="background:#f1f5f9;padding:12px;border-radius:6px;">
+                            <div style="font-size:12px;color:#64748b;">📊 广告数</div>
+                            <div style="font-size:20px;font-weight:bold;color:#0f172a;">${(product.ad_count || 0).toLocaleString()}</div>
+                        </div>
+                        <div style="background:#f1f5f9;padding:12px;border-radius:6px;">
+                            <div style="font-size:12px;color:#64748b;">📈 趋势</div>
+                            <div style="font-size:20px;font-weight:bold;color:#0f172a;">${product.trend_score || 0} ${product.trend_status === 'hot' ? '🔥' : ''}</div>
+                        </div>
+                        <div style="background:#f1f5f9;padding:12px;border-radius:6px;">
+                            <div style="font-size:12px;color:#64748b;">✅ 验证</div>
+                            <div style="font-size:20px;font-weight:bold;color:#0f172a;">${product.strict_validation || 'N/A'}</div>
+                        </div>
+                    </div>
+
+                    ${validationHtml}
+
+                    <h3 style="margin-top:24px;color:#1e293b;border-bottom:2px solid #e2e8f0;padding-bottom:8px;">🎯 跟品决策</h3>
+                    <div style="background:#f8fafc;padding:16px;border-radius:8px;margin:12px 0;">
+                        <div style="margin-bottom:12px;">
+                            <strong style="color:#334155;">决策:</strong>
+                            <span style="padding:4px 12px;background:#dbeafe;color:#1e40af;border-radius:4px;margin-left:8px;">
+                                ${product.follow_level || product.lane || '待定'}
+                            </span>
+                        </div>
+                        <div style="margin-bottom:12px;">
+                            <strong style="color:#334155;">原因:</strong>
+                            <div style="margin-top:4px;color:#475569;">${product.why || '待分析'}</div>
+                        </div>
+                        <div style="margin-bottom:12px;">
+                            <strong style="color:#334155;">下一步行动:</strong>
+                            <div style="margin-top:4px;color:#0ea5e9;">⚡ ${product.do_now || '待定'}</div>
+                        </div>
+                        ${product.how_to_follow ? `
+                        <div style="margin-bottom:12px;">
+                            <strong style="color:#334155;">跟法:</strong>
+                            <div style="margin-top:4px;color:#475569;">${product.how_to_follow}</div>
+                        </div>
+                        ` : ''}
+                        ${product.test_plan ? `
+                        <div>
+                            <strong style="color:#334155;">测试计划:</strong>
+                            <div style="margin-top:4px;color:#475569;">${product.test_plan}</div>
+                        </div>
+                        ` : ''}
+                    </div>
+
+                    <h3 style="margin-top:24px;color:#1e293b;border-bottom:2px solid #e2e8f0;padding-bottom:8px;">🔍 Operator 六门评分</h3>
+                    ${scorecardHtml}
+
+                    ${blockingHtml}
+                    ${evidenceGapsHtml}
+
+                    <h3 style="margin-top:24px;color:#1e293b;border-bottom:2px solid #e2e8f0;padding-bottom:8px;">🔗 竞品链接</h3>
+                    <a href="${product.product_url || '#'}" target="_blank"
+                       style="display:inline-block;background:#0ea5e9;color:white;padding:10px 20px;border-radius:6px;text-decoration:none;margin-top:8px;">
+                        🌐 查看原始产品页
+                    </a>
+
+                    <div style="margin-top:24px;padding:12px;background:#f8fafc;border-radius:6px;font-size:12px;color:#64748b;">
+                        <strong>报告生成时间:</strong> ${new Date().toLocaleString('zh-CN')}
+                    </div>
+                </div>
+            `;
+
+            document.getElementById('modalTitle').textContent = '🔍 竞品拆解报告';
+            document.getElementById('modalContent').innerHTML = report;
+            document.getElementById('reportModal').classList.add('show');
+        }
+
+        function renderEvidenceSlots(validation) {
+            if (!validation || !validation.slots) return '<p>无证据数据</p>';
+
+            return validation.slots.map(slot => {
+                const status = slot.status === 'verified' ? '✅' :
+                              slot.status === 'pending' ? '⏳' : '❌';
+                return `<p>${status} <strong>${slot.label}:</strong> ${slot.status}</p>`;
+            }).join('');
+        }
+        
+        // 补证
+        async function enrichEvidence(btn) {
+            const card = btn.closest('.product-card');
+            const product = JSON.parse(card.dataset.product);
+            const keyword = product.title || '';
+            const domain = product.domain || '';
+
+            if (!keyword) {
+                alert('❌ 产品标题缺失，无法补证');
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = '⏳ 补证中...';
+
+            try {
+                const params = new URLSearchParams({
+                    keyword: keyword,
+                    domain: domain,
+                    sources: 'reddit,amazon,supply,fb_ads'
+                });
+
+                const resp = await fetch('/api/evidence/enrich?' + params.toString());
+                const result = await resp.json();
+
+                if (result.ok) {
+                    btn.textContent = '✅ 已补证';
+                    const summary = [
+                        `✅ 证据补全完成！`,
+                        ``,
+                        `产品: ${keyword}`,
+                        `域名: ${domain}`,
+                        ``,
+                        `Reddit: ${result.reddit_count || 0} 条`,
+                        `Amazon: ${result.amazon_found ? '已找到' : '未找到'}`,
+                        `供应链: ${result.supply_count || 0} 个`,
+                        `FB广告: ${result.fb_ads_count || 0} 个`,
+                    ].join('\n');
+                    alert(summary);
+                    setTimeout(() => loadData(), 2000);
+                } else {
+                    throw new Error(result.error || '补证失败');
+                }
+            } catch (error) {
+                btn.textContent = '❌ 失败';
+                alert('补证失败: ' + error.message);
+            } finally {
+                setTimeout(() => {
+                    btn.disabled = false;
+                    btn.textContent = '🔍 补证';
+                }, 3000);
+            }
+        }
+
+        // 批量操作函数
+        function toggleProduct(productId, checked) {
+            if (checked) {
+                selectedProducts.add(productId);
+            } else {
+                selectedProducts.delete(productId);
+            }
+            updateBulkActionsBar();
+        }
+
+        function toggleSelectAll() {
+            const checkbox = document.getElementById('selectAllCheckbox');
+            const checkboxes = document.querySelectorAll('.product-checkbox');
+            checkboxes.forEach(cb => {
+                cb.checked = checkbox.checked;
+                const card = cb.closest('.product-card');
+                const productId = card.dataset.id;
+                if (checkbox.checked) {
+                    selectedProducts.add(productId);
+                } else {
+                    selectedProducts.delete(productId);
+                }
+            });
+            updateBulkActionsBar();
+        }
+
+        function updateBulkActionsBar() {
+            const bar = document.getElementById('bulkActionsBar');
+            const count = selectedProducts.size;
+            document.getElementById('selectedCount').textContent = count;
+            if (count > 0) {
+                bar.classList.add('active');
+            } else {
+                bar.classList.remove('active');
+            }
+        }
+
+        function clearSelection() {
+            selectedProducts.clear();
+            document.querySelectorAll('.product-checkbox').forEach(cb => cb.checked = false);
+            document.getElementById('selectAllCheckbox').checked = false;
+            updateBulkActionsBar();
+        }
+
+        async function bulkCreateDraft() {
+            if (selectedProducts.size === 0) return;
+            if (!confirm(`确认批量生成 ${selectedProducts.size} 个产品的 Shopify Draft？`)) return;
+
+            const products = Array.from(selectedProducts).map(id => {
+                const card = document.querySelector(`[data-id="${id}"]`);
+                return JSON.parse(card.dataset.product);
+            });
+
+            let success = 0, failed = 0;
+            for (const product of products) {
+                try {
+                    const params = new URLSearchParams({ product_url: product.product_url || '' });
+                    if (product.operator_score) params.set('operator_score', product.operator_score);
+                    const resp = await fetch('/api/v2/shopify/clone-to-store?' + params.toString(), { method: 'POST' });
+                    const result = await resp.json();
+                    if (result.ok) success++; else failed++;
+                } catch (e) {
+                    failed++;
+                }
+            }
+            alert(`✅ 批量生成完成！\n成功: ${success} 个\n失败: ${failed} 个`);
+            clearSelection();
+        }
+
+        async function bulkEnrich() {
+            if (selectedProducts.size === 0) return;
+            if (!confirm(`确认批量补证 ${selectedProducts.size} 个产品？`)) return;
+
+            const products = Array.from(selectedProducts).map(id => {
+                const card = document.querySelector(`[data-id="${id}"]`);
+                return JSON.parse(card.dataset.product);
+            });
+
+            let success = 0, failed = 0;
+            for (const product of products) {
+                try {
+                    const params = new URLSearchParams({
+                        keyword: product.title || '',
+                        domain: product.domain || '',
+                        sources: 'reddit,amazon,supply'
+                    });
+                    const resp = await fetch('/api/evidence/enrich?' + params.toString());
+                    const result = await resp.json();
+                    if (result.ok) success++; else failed++;
+                } catch (e) {
+                    failed++;
+                }
+            }
+            alert(`✅ 批量补证完成！\n成功: ${success} 个\n失败: ${failed} 个`);
+            clearSelection();
+            setTimeout(() => loadData(), 2000);
+        }
+
+        // 排序函数
+        function sortProducts() {
+            const sortType = document.getElementById('sortSelect').value;
+            currentSort = sortType;
+
+            allProducts.sort((a, b) => {
+                switch(sortType) {
+                    case 'score_desc': return (b.operator_score || 0) - (a.operator_score || 0);
+                    case 'score_asc': return (a.operator_score || 0) - (b.operator_score || 0);
+                    case 'trend_desc': return (b.trend_score || 0) - (a.trend_score || 0);
+                    case 'ads_desc': return (b.ad_count || 0) - (a.ad_count || 0);
+                    case 'price_asc': return (a.price || 0) - (b.price || 0);
+                    default: return 0;
+                }
+            });
+
+            renderProducts();
+        }
+
+        // 刷新数据
+        async function refreshData() {
+            const btn = event.target;
+            btn.disabled = true;
+            btn.textContent = '⏳ 刷新中...';
+            await loadData();
+            btn.disabled = false;
+            btn.textContent = '🔄 刷新';
+        }
+
+        // 导出数据
+        function exportData() {
+            const filtered = currentFilter === 'all'
+                ? allProducts
+                : allProducts.filter(p => p.lane === currentFilter);
+
+            const csv = [
+                ['标题', '域名', '价格', '广告数', '趋势评分', 'Operator评分', '评级', '决策', '产品URL'].join(','),
+                ...filtered.map(p => [
+                    `"${(p.title || '').replace(/"/g, '""')}"`,
+                    p.domain || '',
+                    p.price || 0,
+                    p.ad_count || 0,
+                    p.trend_score || 0,
+                    p.operator_score || 0,
+                    p.operator_grade || '',
+                    p.lane || '',
+                    p.product_url || ''
+                ].join(','))
+            ].join('\n');
+
+            const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = `operator_workbench_${new Date().toISOString().slice(0,10)}.csv`;
+            link.click();
+        }
+
+        // 关闭模态框
+        function closeModal() {
+            document.getElementById('reportModal').classList.remove('show');
+        }
+        
+        // 加载告警
+        async function loadAlerts() {
+            try {
+                const resp = await fetch('/api/dashboard/alerts?limit=5');
+                const data = await resp.json();
+                
+                if (data.alerts && data.alerts.length > 0) {
+                    const html = data.alerts.map(alert => 
+                        `<div class="alert-item ${alert.severity}">
+                            ${getAlertEmoji(alert.type)} ${alert.type}
+                        </div>`
+                    ).join('');
+                    document.getElementById('alertsList').innerHTML = html;
+                } else {
+                    document.getElementById('alertsList').innerHTML = 
+                        '<div class="alert-item">✅ 暂无告警</div>';
+                }
+            } catch (error) {
+                document.getElementById('alertsList').innerHTML = 
+                    '<div class="alert-item">⚠️ 加载失败</div>';
+            }
+        }
+        
+        function getAlertEmoji(type) {
+            const map = {
+                'new_product': '🆕',
+                'price_drop': '💰',
+                'sold_out': '⚠️',
+                'ad_surge': '📈'
+            };
+            return map[type] || '📢';
+        }
+        
+        // 初始化
+        loadData();
+        
+        // 自动刷新
+        setInterval(loadData, 60000); // 每分钟刷新
+    </script>
+</body>
+</html>

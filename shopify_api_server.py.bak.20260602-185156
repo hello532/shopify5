@@ -2854,78 +2854,32 @@ def _gtrends_run_keywords_now(
             pass
 
 
-def _gtrends_public_rank(public: dict) -> tuple[float, float, int]:
-    status = str((public or {}).get("trend_status") or "unverified").lower()
-    status_weight = {
-        "breakout": 70,
-        "hot": 66,
-        "rising": 62,
-        "stable": 44,
-        "watch": 28,
-        "noise": 4,
-        "unverified": 0,
-    }.get(status, 0)
-    score = float((public or {}).get("trend_score") or 0)
-    data_points = int(float((public or {}).get("data_points") or 0))
-    quality_bonus = 8 if (public or {}).get("data_quality") == "complete" else 0
-    return (status_weight + score + quality_bonus, score, data_points)
-
-
-def _gtrends_compact_public(public: dict) -> dict:
-    return {
-        "keyword": (public or {}).get("keyword") or "",
-        "trend_status": (public or {}).get("trend_status") or "unverified",
-        "trend_score": (public or {}).get("trend_score") or 0,
-        "verified": bool((public or {}).get("verified")),
-        "data_quality": (public or {}).get("data_quality") or "missing",
-        "source": (public or {}).get("source") or "",
-        "cached_at": (public or {}).get("cached_at") or "",
-    }
-
-
 def _attach_gtrends_cache_to_products(products: list[dict], geo: str = "US", timeframe: str = "today 12-m") -> list[dict]:
     if not products:
         return products
-    product_keywords: list[tuple[dict, list[str]]] = []
-    all_keywords: list[str] = []
-    seen_keywords: set[str] = set()
+    keyword_to_products: dict[str, list[dict]] = defaultdict(list)
     for product in products:
         if not isinstance(product, dict):
             continue
-        candidates: list[str] = []
-        for keyword in _gtrends_keywords_from_product(product)[:6]:
-            if not keyword or keyword in candidates:
-                continue
-            candidates.append(keyword)
-            if keyword not in seen_keywords:
-                seen_keywords.add(keyword)
-                all_keywords.append(keyword)
-        product_keywords.append((product, candidates))
+        for keyword in _gtrends_keywords_from_product(product)[:3]:
+            keyword_to_products[keyword].append(product)
+            break
     records = {
         str(r.get("keyword") or ""): r
-        for r in _gtrends_read_records(all_keywords, geo, timeframe)
+        for r in _gtrends_read_records(list(keyword_to_products.keys()), geo, timeframe)
         if isinstance(r, dict)
     }
-    for product, candidates in product_keywords:
-        public_candidates = [
-            _gtrends_public_record(records.get(keyword, {"keyword": keyword, "status": "missing"}), keyword, geo, timeframe)
-            for keyword in candidates
-        ]
-        public_candidates.sort(key=_gtrends_public_rank, reverse=True)
-        public = public_candidates[0] if public_candidates else _gtrends_public_record({}, "", geo, timeframe)
-        product["trend_query"] = public.get("keyword") or (candidates[0] if candidates else "")
-        product["trend_status"] = public.get("trend_status")
-        product["trend_score"] = public.get("trend_score")
-        product["trend_verified"] = public.get("verified")
-        product["trend_data_quality"] = public.get("data_quality")
-        product["trend_source"] = public.get("source")
-        product["trend_cached_at"] = public.get("cached_at")
-        product["trend_yoy_change"] = public.get("yoy_change")
-        product["trend_avg_score"] = public.get("avg_score")
-        product["trend_last_30d"] = public.get("last_30d")
-        product["trend_peak"] = public.get("peak")
-        product["trend_dir"] = public.get("trend_dir")
-        product["trend_candidates"] = [_gtrends_compact_public(item) for item in public_candidates[:5]]
+    for keyword, linked_products in keyword_to_products.items():
+        public = _gtrends_public_record(records.get(keyword, {}), keyword, geo, timeframe)
+        for product in linked_products:
+            product["trend_query"] = keyword
+            product["trend_status"] = public.get("trend_status")
+            product["trend_score"] = public.get("trend_score")
+            product["trend_verified"] = public.get("verified")
+            product["trend_data_quality"] = public.get("data_quality")
+            product["trend_source"] = public.get("source")
+            product["trend_cached_at"] = public.get("cached_at")
+            product["trend_yoy_change"] = public.get("yoy_change")
     return products
 
 
@@ -8093,13 +8047,6 @@ _v2_vertical_sites_cache_signature = ""
 # Multi-range cache: key = (min_skus, max_skus); value = (signature, payload)
 _v2_vertical_sites_range_cache = {}
 _V2_CACHE_TTL = 120  # 2 分钟内存缓存
-_v2_product_image_cache = {}
-_v2_product_image_screenshot_lock = threading.BoundedSemaphore(2)
-_V2_PRODUCT_IMAGE_CACHE_TTL = 6 * 3600
-_V2_PRODUCT_IMAGE_LOOKUP_WORKERS = 8
-_V2_PRODUCT_IMAGE_LOOKUP_TIMEOUT = 4
-_V2_PRODUCT_IMAGE_LOOKUP_LIMIT = 96
-V2_PRODUCT_IMAGE_FALLBACK_DIR = MONITOR_DIR / "product_image_fallbacks"
 
 # Scan presets for the "vertical sites / novelty" classification buttons.
 # Each preset maps to a SKU range and optional filters (novelty/demo/price).
@@ -8151,374 +8098,6 @@ def _v2_product_url(domain: str, handle: str, url: str = "") -> str:
     if domain:
         return f"https://{domain}"
     return "#"
-
-
-def _v2_clean_image_url(value, base_url: str = "") -> str:
-    if isinstance(value, dict):
-        value = value.get("src") or value.get("url") or value.get("contentUrl") or value.get("original_src") or value.get("data-src")
-    src = html.unescape(str(value or "").strip()).replace("\\/", "/")
-    if not src or src.lower().startswith("data:"):
-        return ""
-    src = src.split()[0].strip(",")
-    if src.startswith("/api/v2/product-image-fallback/"):
-        return src
-    if src.startswith("//"):
-        src = "https:" + src
-    elif base_url and not src.startswith(("http://", "https://")):
-        src = urllib.parse.urljoin(base_url, src)
-    if not src.startswith(("http://", "https://")):
-        return ""
-    return src
-
-
-def _v2_image_is_probably_noise(src: str) -> bool:
-    text = urllib.parse.unquote(str(src or "")).lower()
-    return any(
-        marker in text
-        for marker in (
-            "favicon", "apple-touch-icon", "mstile", "logo", "sprite", "spacer", "transparent",
-            "placeholder", "dummy.png", "blank.", "loader", "loading.", "ajax-loader",
-            "payment", "paypal", "visa", "mastercard", "amex", "klarna", "afterpay",
-            "icon_", "/icons/", "social", "facebook", "instagram", "youtube", "twitter",
-        )
-    )
-
-
-def _v2_add_image_candidate(candidates: dict, src, base_url: str = "", score: int = 0, source: str = ""):
-    cleaned = _v2_clean_image_url(src, base_url)
-    if not cleaned:
-        return
-    lower = urllib.parse.unquote(cleaned).lower()
-    if not re.search(r"\.(?:jpe?g|png|webp|gif)(?:[?#].*)?$", lower):
-        return
-    adjusted = int(score or 0)
-    if any(marker in lower for marker in ("/products/", "/product/", "/catalog/product/", "/media/catalog/", "cdn/shop/products", "wp-content/uploads")):
-        adjusted += 220
-    if any(marker in lower for marker in ("hero", "banner", "slide", "collection", "category", "wysiwyg", "revslider")):
-        adjusted += 70
-    if re.search(r"(?:_|-)(?:800|900|1000|1200|1500|1600|1880|2000)x?(?:_|\\.|-|/|$)", lower):
-        adjusted += 45
-    if _v2_image_is_probably_noise(cleaned):
-        adjusted -= 360
-    current = candidates.get(cleaned)
-    if not current or adjusted > current["score"]:
-        candidates[cleaned] = {"score": adjusted, "source": source}
-
-
-def _v2_add_srcset_candidates(candidates: dict, value: str, base_url: str = "", score: int = 0, source: str = ""):
-    for part in str(value or "").split(","):
-        src = part.strip().split(" ")[0].strip()
-        if src:
-            _v2_add_image_candidate(candidates, src, base_url, score, source)
-
-
-def _v2_collect_json_images(value, candidates: dict, base_url: str, score: int = 880):
-    if isinstance(value, dict):
-        for key, item in value.items():
-            key_l = str(key).lower()
-            if key_l in {"image", "thumbnail", "thumbnailurl", "contenturl", "logo"}:
-                _v2_collect_json_images(item, candidates, base_url, score)
-            elif isinstance(item, (dict, list)):
-                _v2_collect_json_images(item, candidates, base_url, score - 30)
-    elif isinstance(value, list):
-        for item in value:
-            _v2_collect_json_images(item, candidates, base_url, score)
-    elif isinstance(value, str):
-        _v2_add_image_candidate(candidates, value, base_url, score, "jsonld")
-
-
-def _v2_extract_image_urls_from_html(html_text: str, base_url: str = "") -> list[str]:
-    """Extract real page/product images from modern ecommerce HTML."""
-
-    candidates = {}
-    if not html_text:
-        return []
-
-    image_meta_names = (
-        "og:image", "og:image:secure_url", "twitter:image", "twitter:image:src",
-        "image", "thumbnail", "thumbnailUrl", "msapplication-TileImage",
-    )
-    for name in image_meta_names:
-        _v2_add_image_candidate(candidates, _v2_meta_content(html_text, name), base_url, 820, "meta")
-
-    try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html_text, "lxml")
-    except Exception:
-        soup = None
-
-    if soup is not None:
-        for script in soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)}):
-            raw = script.string or script.get_text(" ", strip=True)
-            if not raw:
-                continue
-            try:
-                data = json.loads(raw)
-                _v2_collect_json_images(data, candidates, base_url, 930)
-            except Exception:
-                for match in re.findall(r"https?:\\/\\/[^\"'<> ]+\\.(?:jpe?g|png|webp|gif)(?:[^\"'<> ]*)?", raw, re.I):
-                    _v2_add_image_candidate(candidates, match, base_url, 650, "jsonld-text")
-
-        for tag in soup.find_all(["img", "source"]):
-            attrs = tag.attrs or {}
-            attr_score = 520
-            classes = " ".join(attrs.get("class") or []) if isinstance(attrs.get("class"), list) else str(attrs.get("class") or "")
-            blob = " ".join(str(attrs.get(k, "")) for k in ("alt", "title", "class", "id", "data-element"))
-            if re.search(r"product|catalog|pdp|gallery|woocommerce|main|desktop_image", blob, re.I):
-                attr_score += 160
-            if re.search(r"logo|icon|nav|menu|payment|badge", classes, re.I):
-                attr_score -= 220
-            for attr in (
-                "src", "data-src", "data-lazyload", "data-original", "data-lazy-src",
-                "data-large_image", "data-zoom-image", "data-img-url", "data-bg",
-                "data-background", "data-background-image", "data-orig-file",
-            ):
-                _v2_add_image_candidate(candidates, attrs.get(attr), base_url, attr_score, f"img:{attr}")
-            for attr in ("srcset", "data-srcset", "data-bgset", "data-lazy-srcset"):
-                _v2_add_srcset_candidates(candidates, attrs.get(attr), base_url, attr_score + 20, f"srcset:{attr}")
-
-        for tag in soup.find_all(style=True):
-            for match in re.findall(r"url\\(([^)]+)\\)", str(tag.get("style") or ""), re.I):
-                _v2_add_image_candidate(candidates, match.strip("'\" "), base_url, 470, "style")
-
-    for match in re.findall(r"https?:\\/\\/[^\"'<>\\s]+\\.(?:jpe?g|png|webp|gif)(?:[^\"'<>\\s]*)?", html_text, re.I):
-        _v2_add_image_candidate(candidates, match, base_url, 380, "html-url")
-    for match in re.findall(r"(?://|/)[^\"'<>\\s]+\\.(?:jpe?g|png|webp|gif)(?:[^\"'<>\\s]*)?", html_text, re.I):
-        _v2_add_image_candidate(candidates, match, base_url, 330, "html-relative")
-
-    ranked = sorted(candidates.items(), key=lambda item: item[1]["score"], reverse=True)
-    return [src for src, meta in ranked if meta["score"] > 80][:10]
-
-
-def _v2_product_image_fallback_name(domain: str, handle: str, product_url: str, ext: str = ".png") -> str:
-    seed = "|".join([str(domain or ""), str(handle or ""), str(product_url or "")])
-    ext = ext if str(ext or "").startswith(".") else f".{ext}"
-    return hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:24] + ext
-
-
-def _v2_product_image_fallback_url(filename: str) -> str:
-    return f"/api/v2/product-image-fallback/{urllib.parse.quote(filename)}"
-
-
-def _v2_generate_page_screenshot_image(domain: str, handle: str, product_url: str) -> str:
-    product_url = _v2_product_url(domain, handle, product_url)
-    if not product_url.startswith(("http://", "https://")):
-        return ""
-    V2_PRODUCT_IMAGE_FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
-    filename = _v2_product_image_fallback_name(domain, handle, product_url, ".png")
-    out_path = V2_PRODUCT_IMAGE_FALLBACK_DIR / filename
-    if out_path.exists() and out_path.stat().st_size > 1000:
-        return _v2_product_image_fallback_url(filename)
-    if not _v2_product_image_screenshot_lock.acquire(timeout=25):
-        return ""
-    try:
-        try:
-            from playwright.sync_api import sync_playwright
-        except Exception:
-            return ""
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": 1200, "height": 900}, device_scale_factor=1)
-            try:
-                page.goto(product_url, wait_until="domcontentloaded", timeout=15000)
-                page.wait_for_timeout(1200)
-                page.screenshot(path=str(out_path), full_page=False)
-            finally:
-                browser.close()
-        if out_path.exists() and out_path.stat().st_size > 1000:
-            return _v2_product_image_fallback_url(filename)
-    except Exception:
-        try:
-            if out_path.exists() and out_path.stat().st_size <= 1000:
-                out_path.unlink()
-        except Exception:
-            pass
-    finally:
-        _v2_product_image_screenshot_lock.release()
-    return ""
-
-
-def _v2_generate_placeholder_image(domain: str, handle: str, product_url: str) -> str:
-    product_url = _v2_product_url(domain, handle, product_url)
-    V2_PRODUCT_IMAGE_FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
-    filename = _v2_product_image_fallback_name(domain, handle, product_url, ".svg")
-    out_path = V2_PRODUCT_IMAGE_FALLBACK_DIR / filename
-    if not out_path.exists() or out_path.stat().st_size < 100:
-        title = html.escape(str(handle or domain or "Page preview").replace("-", " ").replace("_", " ").strip()[:54] or "Page preview")
-        host = html.escape(str(domain or urllib.parse.urlparse(product_url).netloc or "public page")[:42])
-        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="900" height="900" viewBox="0 0 900 900">
-<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f8faf7"/><stop offset="1" stop-color="#dde9df"/></linearGradient></defs>
-<rect width="900" height="900" fill="url(#g)"/>
-<rect x="94" y="120" width="712" height="560" rx="34" fill="#ffffff" stroke="#cfd8d2" stroke-width="5"/>
-<rect x="140" y="170" width="620" height="250" rx="24" fill="#e8efe9"/>
-<circle cx="220" cy="250" r="54" fill="#12805c" opacity=".20"/>
-<path d="M150 395 310 305 430 365 548 270 750 398v22H150z" fill="#12805c" opacity=".30"/>
-<text x="450" y="505" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Arial,sans-serif" font-size="42" font-weight="800" fill="#18201f">{title}</text>
-<text x="450" y="562" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Arial,sans-serif" font-size="28" fill="#66716f">{host}</text>
-<text x="450" y="742" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Arial,sans-serif" font-size="24" font-weight="700" fill="#12805c">PAGE PREVIEW</text>
-</svg>"""
-        out_path.write_text(svg, encoding="utf-8")
-    return _v2_product_image_fallback_url(filename)
-
-
-def _v2_product_image_urls_from_raw(raw: dict, base_url: str = "") -> list[str]:
-    if not isinstance(raw, dict):
-        return []
-    urls = []
-
-    def add(value):
-        src = _v2_clean_image_url(value, base_url)
-        if src and src not in urls:
-            urls.append(src)
-
-    for key in ("image_url", "main_image", "thumbnail", "featured_image", "product_image", "image"):
-        add(raw.get(key))
-
-    images = raw.get("images")
-    if isinstance(images, list):
-        for item in images:
-            add(item)
-    elif images:
-        add(images)
-
-    variants = raw.get("variants")
-    if isinstance(variants, list):
-        for variant in variants[:4]:
-            if isinstance(variant, dict):
-                add(variant.get("featured_image"))
-
-    return urls
-
-
-def _v2_has_product_image(row: dict) -> bool:
-    if not isinstance(row, dict):
-        return False
-    base_url = _v2_product_url(row.get("domain", ""), row.get("handle", ""), row.get("url") or row.get("product_url") or "")
-    return bool(_v2_product_image_urls_from_raw(row, base_url))
-
-
-def _v2_count_product_images(rows: list[dict], limit: int = 80) -> int:
-    count = 0
-    for row in (rows or [])[: max(0, int(limit or 0))]:
-        if _v2_has_product_image(row):
-            count += 1
-    return count
-
-
-def _v2_meta_content(html_text: str, *names: str) -> str:
-    for name in names:
-        escaped = re.escape(name)
-        patterns = (
-            rf'<meta[^>]+(?:property|name)=["\']{escaped}["\'][^>]+content=["\']([^"\']+)["\']',
-            rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{escaped}["\']',
-        )
-        for pattern in patterns:
-            match = re.search(pattern, html_text or "", flags=re.I)
-            if match:
-                return html.unescape(match.group(1).strip())
-    return ""
-
-
-def _v2_fetch_product_image_urls(domain: str, handle: str, url: str = "", allow_fallback: bool = False) -> list[str]:
-    domain = str(domain or "").replace("www.", "").strip()
-    handle = str(handle or "").strip()
-    product_url = _v2_product_url(domain, handle, url)
-    cache_key = f"{domain}|{handle}|{product_url}"
-    cached = _v2_product_image_cache.get(cache_key)
-    now_ts = time.time()
-    if cached and (now_ts - cached.get("ts", 0)) < _V2_PRODUCT_IMAGE_CACHE_TTL:
-        cached_urls = list(cached.get("urls") or [])
-        if cached_urls or not allow_fallback:
-            return cached_urls
-
-    import ssl as _ssl
-
-    urls = []
-    ctx = _ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = _ssl.CERT_NONE
-    headers = {"User-Agent": su.USER_AGENT, "Accept": "application/json,text/html;q=0.9,*/*;q=0.8"}
-
-    if domain and handle and handle != "main":
-        try:
-            json_handle = urllib.parse.quote(handle.strip("/"), safe="-_")
-            req = urllib.request.Request(f"https://{domain}/products/{json_handle}.json", headers=headers)
-            with urllib.request.urlopen(req, timeout=_V2_PRODUCT_IMAGE_LOOKUP_TIMEOUT, context=ctx) as resp:
-                data = json.loads(resp.read())
-            product = data.get("product") if isinstance(data, dict) else {}
-            urls = _v2_product_image_urls_from_raw(product or {}, product_url)
-        except Exception:
-            urls = []
-
-    if not urls and product_url.startswith(("http://", "https://")):
-        try:
-            req = urllib.request.Request(product_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=_V2_PRODUCT_IMAGE_LOOKUP_TIMEOUT, context=ctx) as resp:
-                html_text = resp.read(1500000).decode("utf-8", errors="ignore")
-            urls = _v2_extract_image_urls_from_html(html_text, product_url)
-        except Exception:
-            urls = []
-
-    if not urls and allow_fallback:
-        urls = [_v2_generate_placeholder_image(domain, handle, product_url)]
-
-    _v2_product_image_cache[cache_key] = {"ts": now_ts, "urls": urls[:8]}
-    return urls[:8]
-
-
-def _v2_attach_product_images(products: list[dict], lookup_limit: int = 0) -> int:
-    rows = [p for p in (products or []) if isinstance(p, dict)]
-    seen_ids = set()
-    unique_rows = []
-    for row in rows:
-        marker = id(row)
-        if marker in seen_ids:
-            continue
-        seen_ids.add(marker)
-        unique_rows.append(row)
-
-    enriched = 0
-    missing = []
-    for row in unique_rows:
-        base_url = _v2_product_url(row.get("domain", ""), row.get("handle", ""), row.get("url") or row.get("product_url") or "")
-        urls = _v2_product_image_urls_from_raw(row, base_url)
-        if urls:
-            row["image_urls"] = urls
-            row["image_url"] = urls[0]
-            row["image_count"] = max(_v2_safe_int(row.get("image_count"), 0), len(urls))
-            enriched += 1
-        elif lookup_limit > 0 and row.get("domain") and (row.get("handle") or row.get("url") or row.get("product_url")):
-            missing.append(row)
-
-    fetch_rows = missing[: max(0, int(lookup_limit or 0))]
-    if not fetch_rows:
-        return enriched
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_V2_PRODUCT_IMAGE_LOOKUP_WORKERS) as executor:
-        futures = {
-            executor.submit(
-                _v2_fetch_product_image_urls,
-                row.get("domain", ""),
-                row.get("handle", ""),
-                row.get("url") or row.get("product_url") or "",
-            ): row
-            for row in fetch_rows
-        }
-        for future in concurrent.futures.as_completed(futures):
-            row = futures[future]
-            try:
-                urls = future.result()
-            except Exception:
-                urls = []
-            if urls:
-                row["image_urls"] = urls
-                row["image_url"] = urls[0]
-                row["image_count"] = max(_v2_safe_int(row.get("image_count"), 0), len(urls))
-                enriched += 1
-            else:
-                row.setdefault("image_urls", [])
-                row.setdefault("image_url", "")
-    return enriched
 
 
 _DEDUPE_VARIANT_WORDS = {
@@ -9148,10 +8727,6 @@ def _v2_score_all_products(products_list):
         result["product_type"] = result.get("specific_category") or p.get("product_type", "未分类")
         result["product_type_raw"] = p.get("product_type_raw", "未分类")
         result["product_url"] = _v2_product_url(domain, p.get("handle", ""), p.get("url") or p.get("product_url", ""))
-        result["image_url"] = p.get("image_url", "")
-        result["image_urls"] = p.get("image_urls", []) if isinstance(p.get("image_urls"), list) else []
-        result["image_count"] = p.get("image_count", 0)
-        result["variant_count"] = p.get("variant_count", 0)
         result["vendor"] = p.get("vendor", "")
         result["ad_grade"] = ad_info.get("grade", "")
         result["ad_appearances"] = ad_info.get("ad_creative_count", 0)
@@ -9647,44 +9222,6 @@ def _v2_trim_today_fast_payload(payload: dict, product_limit: int, score_limit: 
     return out
 
 
-@app.get("/api/v2/product-image")
-def api_v2_product_image(
-    domain: str = Query("", max_length=255),
-    handle: str = Query("", max_length=500),
-    product_url: str = Query("", max_length=1500),
-    fallback_only: bool = Query(False),
-):
-    """Return a cached public product image for one row in the daily-products table."""
-
-    if fallback_only:
-        urls = [_v2_generate_placeholder_image(domain, handle, product_url)]
-    else:
-        urls = _v2_fetch_product_image_urls(domain, handle, product_url, allow_fallback=True)
-    return {
-        "ok": True,
-        "domain": str(domain or "").replace("www.", "").strip(),
-        "handle": str(handle or "").strip(),
-        "product_url": _v2_product_url(domain, handle, product_url),
-        "image_url": urls[0] if urls else "",
-        "image_urls": urls,
-        "image_count": len(urls),
-    }
-
-
-@app.get("/api/v2/product-image-fallback/{filename}")
-def api_v2_product_image_fallback(filename: str):
-    safe = re.sub(r"[^a-zA-Z0-9_.-]", "", str(filename or ""))
-    if not safe or safe != filename:
-        raise HTTPException(status_code=404, detail="Not found")
-    path = V2_PRODUCT_IMAGE_FALLBACK_DIR / safe
-    if not path.exists() or not path.is_file():
-        raise HTTPException(status_code=404, detail="Not found")
-    suffix = path.suffix.lower()
-    media_type = "image/svg+xml" if suffix == ".svg" else "image/png"
-    content = path.read_text(encoding="utf-8") if suffix == ".svg" else path.read_bytes()
-    return Response(content=content, media_type=media_type)
-
-
 @app.get("/api/v2/today-fast")
 def api_v2_today_fast(
     max_snapshot_age_days: int = 3,
@@ -9704,15 +9241,7 @@ def api_v2_today_fast(
     if _v2_cache is not None and (now_ts - _v2_cache_ts) < _V2_CACHE_TTL:
         cached_meta = _v2_cache.get("scan_meta", {})
         cached_products = _v2_cache.get("scored_products") or []
-        cached_plain_products = _v2_cache.get("products") or []
         cache_has_platform_ai = not cached_products or isinstance(cached_products[0].get("platform_ai"), dict)
-        cache_has_product_images = (
-            int(cached_meta.get("product_image_version") or 0) >= 2
-            and (
-                _v2_count_product_images(cached_plain_products, 80) > 0
-                or _v2_count_product_images(cached_products, 80) > 0
-            )
-        )
         cache_has_keyword_fb = bool(cached_meta.get("include_keyword_fb"))
         cached_product_limit = int(cached_meta.get("product_limit") or 0)
         cached_score_limit = int(cached_meta.get("score_limit") or 0)
@@ -9721,7 +9250,6 @@ def api_v2_today_fast(
             and cached_product_limit >= product_limit
             and cached_score_limit >= score_limit
             and cache_has_platform_ai
-            and cache_has_product_images
             and (not include_keyword_fb or cache_has_keyword_fb)
         ):
             return {**_v2_trim_today_fast_payload(_v2_cache, product_limit, score_limit), "cached": True}
@@ -9773,8 +9301,6 @@ def api_v2_today_fast(
                     continue
 
                 price = float(p.get("price", 0) or 0)
-                product_url = p.get("url") or p.get("product_url") or _v2_product_url(domain, p.get("handle", ""), "")
-                image_urls = _v2_product_image_urls_from_raw(p, product_url)
                 entry = {
                     "title": p.get("title", ""),
                     "handle": p.get("handle", ""),
@@ -9790,12 +9316,10 @@ def api_v2_today_fast(
                     "tags": p.get("tags", []) if isinstance(p.get("tags"), list) else [],
                     "description": p.get("description") or p.get("body_html") or p.get("描述摘要") or "",
                     "body_html": p.get("body_html") or p.get("description") or p.get("描述摘要") or "",
-                    "url": product_url,
+                    "url": p.get("url") or p.get("product_url") or "",
                     "source": p.get("source") or "",
                     "platform": p.get("platform") or "",
-                    "image_url": image_urls[0] if image_urls else "",
-                    "image_urls": image_urls,
-                    "image_count": max(_v2_safe_int(p.get("image_count") or p.get("images_count") or p.get("图片数"), 0), len(image_urls)),
+                    "image_count": int(p.get("image_count") or p.get("图片数") or 0),
                     "variant_count": int(p.get("variant_count") or p.get("variants_count") or p.get("变体数") or 0),
                 }
                 if is_today:
@@ -9863,19 +9387,6 @@ def api_v2_today_fast(
     score_products = [enriched_product(p) for p in active_products[:score_limit]]
     for p in enriched_products:
         category_counter[p.get("specific_category") or p.get("product_type", "未分类")] += 1
-    display_priority_products = sorted(
-        [enriched_product(p) for p in active_products[: max(product_limit, score_limit)]],
-        key=lambda p: (
-            str(p.get("published_at") or p.get("created_at") or p.get("updated_at") or ""),
-            float(p.get("price") or 0),
-        ),
-        reverse=True,
-    )
-    image_lookup_limit = min(_V2_PRODUCT_IMAGE_LOOKUP_LIMIT, max(product_limit, score_limit))
-    product_images_found = _v2_attach_product_images(
-        display_priority_products[:image_lookup_limit] + products_out + score_products,
-        lookup_limit=image_lookup_limit,
-    )
 
     def ps(prices):
         if not prices: return {"min": 0, "max": 0, "avg": 0, "median": 0, "q25": 0, "q75": 0}
@@ -9913,7 +9424,6 @@ def api_v2_today_fast(
         if len(high_value) >= 30:
             break
     high_value.sort(key=lambda x: -x["price"])
-    product_images_found = max(product_images_found, _v2_attach_product_images(high_value, lookup_limit=12))
     vertical_source = [
         p for p in products_out
         if 5 <= int(p.get("store_product_count") or 0) <= 15
@@ -9945,25 +9455,18 @@ def api_v2_today_fast(
             "include_keyword_fb": bool(include_keyword_fb),
             "keyword_fb_limit": keyword_fb_limit if include_keyword_fb else 0,
             "deep_classified_products": len(enriched_products),
-            "product_image_lookup_limit": image_lookup_limit,
-            "product_images_found": product_images_found,
-            "product_image_version": 2,
         },
     }
 
     # 评分 + 决策
     if active_products:
         scored = _v2_score_all_products(score_products)
-        product_images_found = max(product_images_found, _v2_attach_product_images(scored, lookup_limit=min(48, image_lookup_limit)))
         scored = _attach_gtrends_cache_to_products(scored, "US", "today 12-m")
         products_out = _attach_gtrends_cache_to_products(products_out, "US", "today 12-m")
         high_value = _attach_gtrends_cache_to_products(high_value, "US", "today 12-m")
         if include_keyword_fb and keyword_fb_limit > 0:
             scored = _attach_fb_keyword_evidence_to_products(scored, limit=keyword_fb_limit)
         tier_counts = Counter(s["tier"] for s in scored)
-        payload["scan_meta"]["product_images_found"] = product_images_found
-        payload["scan_meta"]["returned_product_images"] = _v2_count_product_images(products_out, min(product_limit, 120))
-        payload["scan_meta"]["returned_scored_product_images"] = _v2_count_product_images(scored, min(score_limit, 120))
         payload["scored_products"] = scored
         payload["tier_summary"] = dict(tier_counts)
         payload["top_decisions"] = []
@@ -12624,669 +12127,6 @@ def api_v2_shopify_replica_apply(
     }
 
 
-# ─────────────────── Clone-to-Store: full product upload ───────────────────
-
-_CLONE_SHOP = os.getenv("SHOPIFY_SHOP_DOMAIN", "427b85-2.myshopify.com")
-_CLONE_TOKEN = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
-_CLONE_API_VERSION = "2026-04"
-
-_CLONE_PRODUCT_SET_MUTATION = """
-mutation productSet($synchronous: Boolean!, $productSet: ProductSetInput!) {
-  productSet(synchronous: $synchronous, input: $productSet) {
-    product {
-      id
-      handle
-      status
-      title
-      onlineStoreUrl
-      onlineStorePreviewUrl
-      variants(first: 50) { nodes { id title sku price } }
-      media(first: 20) { nodes { alt status mediaContentType } }
-    }
-    productSetOperation { id status }
-    userErrors { field message }
-  }
-}
-"""
-
-
-def _clone_scrape_source(product_url: str) -> dict:
-    """Scrape competitor product for full detail (Shopify JSON or HTML fallback)."""
-    import requests as _req
-    if not product_url:
-        return {}
-    ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    json_url = product_url.split("?")[0].rstrip("/") + ".json"
-    try:
-        r = _req.get(json_url, timeout=20, headers={"User-Agent": ua})
-        if r.status_code < 400 and "json" in r.headers.get("content-type", ""):
-            p = r.json().get("product") or r.json()
-            images = []
-            for img in (p.get("images") or []):
-                src = img.get("src") if isinstance(img, dict) else img
-                if src and src not in images:
-                    images.append(src)
-            variants = []
-            for v in (p.get("variants") or []):
-                if not isinstance(v, dict):
-                    continue
-                variants.append({
-                    "title": v.get("title") or "Default",
-                    "price": v.get("price"),
-                    "compare_at_price": v.get("compare_at_price"),
-                    "sku": v.get("sku") or "",
-                    "weight": v.get("weight"),
-                    "weight_unit": v.get("weight_unit"),
-                    "inventory_quantity": v.get("inventory_quantity"),
-                    "option1": v.get("option1"),
-                    "option2": v.get("option2"),
-                    "option3": v.get("option3"),
-                    "requires_shipping": v.get("requires_shipping", True),
-                    "taxable": v.get("taxable", True),
-                    "barcode": v.get("barcode") or "",
-                })
-            options = []
-            for o in (p.get("options") or []):
-                if isinstance(o, dict):
-                    options.append({"name": o.get("name") or "Title", "values": o.get("values") or []})
-                elif isinstance(o, str):
-                    options.append({"name": o, "values": []})
-            return {
-                "title": p.get("title") or "",
-                "descriptionHtml": p.get("body_html") or "",
-                "vendor": p.get("vendor") or "",
-                "productType": p.get("product_type") or "",
-                "tags": [t.strip() for t in (p.get("tags") or "").split(",") if t.strip()] if isinstance(p.get("tags"), str) else (p.get("tags") or []),
-                "handle": p.get("handle") or "",
-                "images": images,
-                "variants": variants,
-                "options": options or [{"name": "Title", "values": ["Default"]}],
-                "source": "storefront_json",
-            }
-    except Exception:
-        pass
-    # HTML fallback — enhanced extraction
-    try:
-        r = _req.get(product_url, timeout=20, headers={"User-Agent": ua})
-        if r.status_code < 400:
-            text = r.text
-            # Try to find embedded product JSON in the HTML (Shopify themes embed it)
-            json_ld_match = re.search(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', text, re.S)
-            if json_ld_match:
-                try:
-                    ld = json.loads(json_ld_match.group(1))
-                    if isinstance(ld, list):
-                        ld = next((x for x in ld if x.get("@type") == "Product"), ld[0] if ld else {})
-                    if ld.get("@type") == "Product":
-                        ld_images = []
-                        img_field = ld.get("image")
-                        if isinstance(img_field, str):
-                            ld_images = [img_field]
-                        elif isinstance(img_field, list):
-                            ld_images = [i if isinstance(i, str) else i.get("url", "") for i in img_field]
-                        ld_variants = []
-                        offers = ld.get("offers") or {}
-                        offer_list = offers if isinstance(offers, list) else offers.get("offers", []) if isinstance(offers, dict) else []
-                        if isinstance(offer_list, list):
-                            for off in offer_list:
-                                if isinstance(off, dict):
-                                    ld_variants.append({
-                                        "title": off.get("name") or "Default",
-                                        "price": off.get("price"),
-                                        "sku": off.get("sku") or "",
-                                        "option1": off.get("name") or "Default",
-                                    })
-                        if not ld_variants and isinstance(offers, dict) and offers.get("price"):
-                            ld_variants = [{"title": "Default", "price": offers.get("price"), "sku": offers.get("sku") or "", "option1": "Default"}]
-                        from urllib.parse import urlparse as _up
-                        return {
-                            "title": (ld.get("name") or "").strip()[:255],
-                            "descriptionHtml": f"<p>{ld.get('description', '').strip()}</p>" if ld.get("description") else "",
-                            "vendor": (ld.get("brand", {}).get("name") if isinstance(ld.get("brand"), dict) else "") or _up(product_url).netloc.replace("www.", ""),
-                            "productType": "",
-                            "tags": [],
-                            "handle": product_url.rstrip("/").split("/")[-1],
-                            "images": [u for u in ld_images if u and u.startswith("http")][:10],
-                            "variants": ld_variants or [{"title": "Default", "price": None, "sku": "", "option1": "Default"}],
-                            "options": [{"name": "Title", "values": ["Default"]}],
-                            "source": "json_ld",
-                        }
-                except Exception:
-                    pass
-
-            # Embedded Shopify product JSON (common in themes)
-            shopify_json_match = re.search(r'var\s+meta\s*=\s*\{.*?"product":\s*(\{.*?\})\s*[,;}\n]', text, re.S)
-            if not shopify_json_match:
-                shopify_json_match = re.search(r'"product":\s*(\{"id":\d+.*?\})\s*[,}]', text, re.S)
-
-            og_title = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)', text, re.I)
-            og_desc = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)', text, re.I)
-            og_images = re.findall(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', text, re.I)
-            # Enhanced image extraction: data-src, srcset, product images
-            prod_images = re.findall(r'<img[^>]+src="([^"]+(?:products|cdn\.shopify)[^"]*\.(?:jpg|jpeg|png|webp)[^"]*)"', text, re.I)
-            data_src_images = re.findall(r'data-src="([^"]+(?:products|cdn\.shopify)[^"]*\.(?:jpg|jpeg|png|webp)[^"]*)"', text, re.I)
-            srcset_images = re.findall(r'(https?://[^"\s]+(?:products|cdn\.shopify)[^"\s]*\.(?:jpg|jpeg|png|webp)[^"\s,]*)', text, re.I)
-            all_images = og_images + prod_images + data_src_images + srcset_images
-            # Dedupe while preserving order, strip size suffixes for dedup
-            seen = set()
-            images = []
-            for u in all_images:
-                clean = re.sub(r'_\d+x\d*\.', '.', u.split("?")[0])
-                if clean not in seen:
-                    seen.add(clean)
-                    images.append(u)
-            images = images[:10]
-
-            from urllib.parse import urlparse
-            return {
-                "title": (og_title.group(1) if og_title else "").strip(),
-                "descriptionHtml": f"<p>{og_desc.group(1).strip()}</p>" if og_desc else "",
-                "vendor": urlparse(product_url).netloc.replace("www.", ""),
-                "productType": "",
-                "tags": [],
-                "handle": product_url.rstrip("/").split("/")[-1],
-                "images": images,
-                "variants": [{"title": "Default", "price": None, "sku": "", "option1": "Default"}],
-                "options": [{"name": "Title", "values": ["Default"]}],
-                "source": "html_fallback",
-            }
-    except Exception:
-        pass
-    return {}
-
-
-# ── operator listing standards (mirror of NEW/pipeline/listing_standards.py) ──
-# A clone must land like a human operator filled it in: never price=0, always
-# SKU/barcode/cost/weight/origin/HS/tracked inventory.
-
-_CLONE_CATEGORY_TABLE: list[tuple[str, dict]] = [
-    (r"\b(ipl|laser hair removal)\b", {"price": 89.99, "weight_kg": 0.45, "hs": "854370"}),
-    (r"\b(red light|led (mask|device|therapy)|teeth whitening|lip plumper)\b", {"price": 49.99, "weight_kg": 0.20, "hs": "854370"}),
-    (r"\b(massage gun|massager|shiatsu)\b", {"price": 59.99, "weight_kg": 0.90, "hs": "901910"}),
-    (r"\b(serum|essence|face oil)\b", {"price": 29.99, "weight_kg": 0.12, "hs": "330499"}),
-    (r"\b(face mask|facial mask|sleeping mask|wrapping mask|sheet mask|clay mask|mud mask)\b", {"price": 29.99, "weight_kg": 0.15, "hs": "330499"}),
-    (r"\b(cream|lotion|balm|moisturizer|spf|sunscreen)\b", {"price": 24.99, "weight_kg": 0.15, "hs": "330499"}),
-    (r"\b(creatine|protein|collagen|supplement|vitamin|gummy|gummies)\b", {"price": 34.99, "weight_kg": 0.35, "hs": "210690"}),
-    (r"\b(legging|leggings)\b", {"price": 39.99, "weight_kg": 0.25, "hs": "610463"}),
-    (r"\b(hoodie|sweatshirt)\b", {"price": 49.99, "weight_kg": 0.50, "hs": "611030"}),
-    (r"\b(bra|tank|tee|t-shirt|shirt|top)\b", {"price": 29.99, "weight_kg": 0.20, "hs": "610990"}),
-    (r"\b(pillow|cushion)\b", {"price": 39.99, "weight_kg": 0.80, "hs": "940490"}),
-    (r"\b(brace|sleeve|compression|posture)\b", {"price": 29.99, "weight_kg": 0.20, "hs": "630790"}),
-    (r"\b(dog|cat|pet)\b", {"price": 24.99, "weight_kg": 0.35, "hs": "392490"}),
-    (r"\b(toy|wooden|montessori)\b", {"price": 49.99, "weight_kg": 1.50, "hs": "950300"}),
-    (r"\b(device|machine|gadget|electric|smart)\b", {"price": 49.99, "weight_kg": 0.50, "hs": "854370"}),
-]
-_CLONE_CATEGORY_FALLBACK = {"price": 39.99, "weight_kg": 0.30, "hs": "392690"}
-_CLONE_ORIGIN_COUNTRY = "CN"
-_CLONE_INVENTORY_QTY = 100
-_CLONE_COST_RATE = 0.30
-
-
-def _clone_category_profile(text: str) -> dict:
-    hay = (text or "").lower()
-    for pattern, profile in _CLONE_CATEGORY_TABLE:
-        if re.search(pattern, hay):
-            return dict(profile)
-    return dict(_CLONE_CATEGORY_FALLBACK)
-
-
-def _clone_make_sku(brand: str, product: str, variant: str = "", seq: int = 1) -> str:
-    import hashlib as _hashlib
-
-    def tok(s: str, n: int) -> str:
-        return re.sub(r"[^A-Za-z0-9]+", "", (s or ""))[:n].upper()
-
-    parts = [tok(brand, 8) or "STORE", tok(product, 14) or "PROD"]
-    if variant and variant.lower() not in ("default", "default title", "title"):
-        parts.append(tok(variant, 10))
-    digest = _hashlib.sha1(f"{brand}|{product}|{variant}".encode()).hexdigest()[:4].upper()
-    parts.append(f"{seq:03d}{digest}")
-    return "-".join(parts)[:64]
-
-
-_CLONE_LOCATION_CACHE: dict[str, str | None] = {}
-
-
-def _clone_primary_location_gid() -> str | None:
-    """Primary fulfillment location for inventoryQuantities at clone time. Cached."""
-    if "gid" in _CLONE_LOCATION_CACHE:
-        return _CLONE_LOCATION_CACHE["gid"]
-    gid = None
-    try:
-        import requests as _req
-
-        r = _req.post(
-            f"https://{_CLONE_SHOP}/admin/api/{_CLONE_API_VERSION}/graphql.json",
-            headers={"X-Shopify-Access-Token": _CLONE_TOKEN, "Content-Type": "application/json"},
-            json={"query": "query { locations(first: 10) { nodes { id isActive fulfillsOnlineOrders } } }"},
-            timeout=20,
-        )
-        nodes = (((r.json().get("data") or {}).get("locations") or {}).get("nodes")) or []
-        active = [n for n in nodes if n.get("isActive")]
-        primary = next((n for n in active if n.get("fulfillsOnlineOrders")), active[0] if active else None)
-        gid = (primary or {}).get("id")
-    except Exception:
-        gid = None
-    _CLONE_LOCATION_CACHE["gid"] = gid
-    return gid
-
-
-def _clone_complete_variant(
-    variant: dict,
-    *,
-    product_text: str,
-    brand: str,
-    product_name: str,
-    seq: int,
-    location_gid: str | None,
-) -> tuple[dict, bool]:
-    """Fill operator-grade variant fields. Returns (variant, heuristic_priced)."""
-    profile = _clone_category_profile(product_text)
-    heuristic_priced = False
-    try:
-        price_val = float(variant.get("price") or 0)
-    except (TypeError, ValueError):
-        price_val = 0.0
-    if price_val <= 0:
-        price_val = profile["price"]
-        variant["price"] = f"{price_val:.2f}"
-        heuristic_priced = True
-    if not variant.get("compareAtPrice"):
-        variant["compareAtPrice"] = f"{round(price_val * 1.5, 2):.2f}"
-    if not variant.get("sku"):
-        opt = " ".join(str(ov.get("name") or "") for ov in variant.get("optionValues") or [])
-        variant["sku"] = _clone_make_sku(brand, product_name, opt, seq)
-    if not variant.get("barcode"):
-        variant["barcode"] = variant["sku"]  # internal barcode convention (not a GTIN)
-
-    inv = dict(variant.get("inventoryItem") or {})
-    inv.setdefault("sku", variant["sku"])
-    inv.setdefault("tracked", True)
-    inv.setdefault("cost", f"{max(1.0, price_val * _CLONE_COST_RATE):.2f}")
-    inv.setdefault("countryCodeOfOrigin", _CLONE_ORIGIN_COUNTRY)
-    inv.setdefault("harmonizedSystemCode", profile["hs"])
-    inv.setdefault("requiresShipping", True)
-    inv.setdefault("measurement", {"weight": {"value": profile["weight_kg"], "unit": "KILOGRAMS"}})
-    variant["inventoryItem"] = inv
-    if location_gid and not variant.get("inventoryQuantities"):
-        variant["inventoryQuantities"] = [
-            {"locationId": location_gid, "name": "available", "quantity": _CLONE_INVENTORY_QTY}
-        ]
-    return variant, heuristic_priced
-
-
-def _clone_build_product_set_input(src: dict, product_url: str, operator_data: dict | None = None) -> dict:
-    """Build a complete ProductSetInput payload from scraped source data."""
-    title = (src.get("title") or "Untitled Product")[:255]
-    desc_html = src.get("descriptionHtml") or ""
-    vendor = (src.get("vendor") or "")[:255]
-    product_type = (src.get("productType") or "")[:255]
-
-    # Tags: keep original + add source attribution
-    from urllib.parse import urlparse
-    source_domain = urlparse(product_url).netloc.replace("www.", "") if product_url else ""
-    base_tags = src.get("tags") or []
-    extra_tags = [
-        "auto-clone",
-        f"source:{source_domain}" if source_domain else None,
-    ]
-    if operator_data:
-        extra_tags.append(f"score:{operator_data.get('operator_score', 0)}")
-    tags = sorted(set([t for t in base_tags + extra_tags if t]))
-
-    # Variants
-    src_variants = src.get("variants") or []
-    options = src.get("options") or [{"name": "Title", "values": ["Default"]}]
-
-    # Build option name lookup
-    option_names = [o["name"] for o in options]
-
-    _loc_gid = _clone_primary_location_gid()
-    _brand_token = vendor or source_domain.split(".")[0] or "STORE"
-    _heuristic_priced_count = 0
-    if src_variants and len(src_variants) > 0:
-        variants_input = []
-        for seq, v in enumerate(src_variants[:100], start=1):
-            option_values = []
-            for i, opt_name in enumerate(option_names[:3], start=1):
-                val = v.get(f"option{i}") or v.get("title") or "Default"
-                option_values.append({"optionName": opt_name, "name": str(val)[:255]})
-
-            variant = {
-                "optionValues": option_values if option_values else [{"optionName": "Title", "name": "Default"}],
-                "price": str(v.get("price") or 0),
-            }
-            if v.get("compare_at_price"):
-                variant["compareAtPrice"] = str(v["compare_at_price"])
-            if v.get("sku"):
-                variant["sku"] = str(v["sku"])[:64]
-            if v.get("barcode"):
-                variant["barcode"] = str(v["barcode"])[:255]
-            if v.get("weight") and v.get("weight_unit"):
-                variant["inventoryItem"] = {
-                    "measurement": {
-                        "weight": {"value": float(v["weight"]), "unit": (v["weight_unit"] or "kg").upper()}
-                    },
-                    "requiresShipping": v.get("requires_shipping", True),
-                }
-            if v.get("taxable") is False:
-                variant["taxable"] = False
-
-            variant, was_heuristic = _clone_complete_variant(
-                variant,
-                product_text=f"{title} {product_type}",
-                brand=_brand_token,
-                product_name=title,
-                seq=seq,
-                location_gid=_loc_gid,
-            )
-            if was_heuristic:
-                _heuristic_priced_count += 1
-            variants_input.append(variant)
-    else:
-        fallback_variant, was_heuristic = _clone_complete_variant(
-            {"optionValues": [{"optionName": "Title", "name": "Default"}], "price": "0"},
-            product_text=f"{title} {product_type}",
-            brand=_brand_token,
-            product_name=title,
-            seq=1,
-            location_gid=_loc_gid,
-        )
-        if was_heuristic:
-            _heuristic_priced_count += 1
-        variants_input = [fallback_variant]
-
-    # Product options: derive from variants used values
-    used_values: dict[str, list[str]] = {}
-    for v in variants_input:
-        for ov in v.get("optionValues", []):
-            name = ov["optionName"]
-            val = ov["name"]
-            used_values.setdefault(name, [])
-            if val not in used_values[name]:
-                used_values[name].append(val)
-    product_options = [
-        {"name": name, "values": [{"name": val} for val in vals]}
-        for name, vals in used_values.items()
-    ] or [{"name": "Title", "values": [{"name": "Default"}]}]
-
-    # Images via files field (Shopify pulls from external URLs)
-    images = (src.get("images") or [])[:20]
-    files_input = [
-        {"originalSource": url, "contentType": "IMAGE", "alt": title[:150]}
-        for url in images if url and url.startswith("http")
-    ]
-
-    # SEO
-    seo_desc = re.sub(r"<[^>]+>", "", desc_html)[:320] if desc_html else title
-    seo = {"title": title[:70], "description": seo_desc}
-
-    # Metafields for source attribution
-    metafields = [
-        {"namespace": "custom", "key": "source_url", "type": "url", "value": (product_url or "")[:255]},
-        {"namespace": "custom", "key": "source_domain", "type": "single_line_text_field", "value": source_domain[:255]},
-        {"namespace": "custom", "key": "clone_date", "type": "single_line_text_field", "value": datetime.now().isoformat(timespec="seconds")},
-    ]
-    if operator_data:
-        metafields.append({"namespace": "custom", "key": "operator_score", "type": "number_decimal", "value": str(operator_data.get("operator_score", 0))})
-        if operator_data.get("why"):
-            metafields.append({"namespace": "custom", "key": "operator_notes", "type": "multi_line_text_field", "value": str(operator_data["why"])[:500]})
-
-    payload = {
-        "title": title,
-        "descriptionHtml": desc_html,
-        "status": "DRAFT",
-        "vendor": vendor,
-        "productType": product_type,
-        "tags": tags,
-        "productOptions": product_options,
-        "variants": variants_input,
-        "seo": seo,
-        "metafields": metafields,
-    }
-    if files_input:
-        payload["files"] = files_input
-    # internal marker, popped by the endpoint before sending to Shopify
-    payload["_heuristic_priced_variants"] = _heuristic_priced_count
-
-    return payload
-
-
-@app.post("/api/v2/shopify/clone-to-store")
-def api_v2_shopify_clone_to_store(
-    product_url: str = Query(..., min_length=5, max_length=1200),
-    price_override: Optional[float] = Query(None, ge=0),
-    operator_score: Optional[float] = Query(None),
-    operator_why: Optional[str] = Query(None, max_length=500),
-):
-    """Scrape competitor product and push full-field DRAFT to Shopify store.
-
-    All images, variants, SKUs, descriptions, SEO are cloned.
-    Product lands as DRAFT — requires human review before publishing.
-    """
-    import requests as _req
-
-    shop = _CLONE_SHOP
-    token = _CLONE_TOKEN
-    if not shop or not token:
-        return {"ok": False, "error": "Shopify store credentials not configured"}
-
-    # 1. Scrape competitor product
-    src = _clone_scrape_source(product_url)
-    if not src or not src.get("title"):
-        return {
-            "ok": False,
-            "error": f"无法抓取竞品产品页面: {product_url}",
-            "hint": "确认 URL 是有效的 Shopify 产品页(或其他可抓取的产品页)",
-        }
-
-    # 2. Build ProductSetInput
-    operator_data = None
-    if operator_score is not None or operator_why:
-        operator_data = {"operator_score": operator_score or 0, "why": operator_why or ""}
-
-    payload = _clone_build_product_set_input(src, product_url, operator_data)
-    heuristic_priced_variants = int(payload.pop("_heuristic_priced_variants", 0) or 0)
-
-    # Apply price override if specified
-    if price_override is not None:
-        for v in payload.get("variants", []):
-            v["price"] = str(price_override)
-        heuristic_priced_variants = 0
-
-    # 3. POST to Shopify Admin API
-    endpoint = f"https://{shop}/admin/api/{_CLONE_API_VERSION}/graphql.json"
-    body = {
-        "query": _CLONE_PRODUCT_SET_MUTATION,
-        "variables": {"synchronous": True, "productSet": payload},
-    }
-    try:
-        r = _req.post(
-            endpoint,
-            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
-            json=body,
-            timeout=60,
-        )
-        resp_data = r.json()
-    except Exception as exc:
-        return {"ok": False, "error": f"Shopify API 请求失败: {exc}"}
-
-    # 4. Parse response
-    if r.status_code >= 400:
-        return {"ok": False, "error": f"HTTP {r.status_code}", "response": resp_data}
-
-    ps_data = (resp_data.get("data") or {}).get("productSet") or {}
-    user_errors = ps_data.get("userErrors") or []
-    if user_errors:
-        return {"ok": False, "error": "Shopify userErrors", "user_errors": user_errors, "payload_sent": payload}
-
-    product_result = ps_data.get("product") or {}
-    gid = product_result.get("id") or ""
-    handle = product_result.get("handle") or ""
-    numeric_id = gid.split("/")[-1] if gid else ""
-
-    return {
-        "ok": True,
-        "product_id": gid,
-        "handle": handle,
-        "title": product_result.get("title") or payload["title"],
-        "status": product_result.get("status") or "DRAFT",
-        "admin_url": f"https://{shop}/admin/products/{numeric_id}" if numeric_id else "",
-        "preview_url": product_result.get("onlineStorePreviewUrl") or "",
-        "variants_created": len((product_result.get("variants") or {}).get("nodes") or []),
-        "images_uploaded": len((product_result.get("media") or {}).get("nodes") or []),
-        "source_scraped": src.get("source") or "unknown",
-        "source_images_count": len(src.get("images") or []),
-        "source_variants_count": len(src.get("variants") or []),
-        "heuristic_priced_variants": heuristic_priced_variants,
-        "pricing_warning": (
-            f"{heuristic_priced_variants} variant(s) priced by category heuristic — verify against the source page before publishing."
-            if heuristic_priced_variants else ""
-        ),
-    }
-
-
-@app.get("/api/v2/shopify/draft-products")
-def api_v2_shopify_draft_products():
-    """获取所有 DRAFT 产品列表"""
-    import requests as _req
-
-    shop = os.getenv("SHOPIFY_SHOP_DOMAIN", "427b85-2.myshopify.com")
-    token = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
-
-    if not shop or not token:
-        return {"ok": False, "error": "Missing Shopify credentials"}
-
-    query = """
-    query {
-      products(first: 50, query: "status:draft") {
-        nodes {
-          id
-          title
-          handle
-          status
-          featuredImage { url }
-          onlineStoreUrl
-          variants(first: 10) { nodes { id title sku image { url } } }
-          media(first: 20) { nodes { mediaContentType } }
-          seo { title description }
-        }
-      }
-    }
-    """
-
-    try:
-        endpoint = f"https://{shop}/admin/api/2026-04/graphql.json"
-        resp = _req.post(
-            endpoint,
-            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
-            json={"query": query},
-            timeout=30,
-        )
-        data = resp.json().get("data", {}).get("products", {}).get("nodes", [])
-
-        products = []
-        for p in data:
-            gid = p.get("id", "")
-            numeric_id = gid.split("/")[-1] if gid else ""
-            variants = (p.get("variants") or {}).get("nodes") or []
-            media = (p.get("media") or {}).get("nodes") or []
-            variants_have_images = all(v.get("image") for v in variants) if variants else False
-            seo = p.get("seo") or {}
-            seo_optimized = bool(seo.get("title") and seo.get("description") and len(seo.get("description", "")) > 50)
-
-            products.append({
-                "id": gid,
-                "title": p.get("title") or "Untitled",
-                "handle": p.get("handle") or "",
-                "status": p.get("status") or "DRAFT",
-                "image": (p.get("featuredImage") or {}).get("url"),
-                "variants_count": len(variants),
-                "media_count": len(media),
-                "variants_have_images": variants_have_images,
-                "seo_optimized": seo_optimized,
-                "ready_to_publish": variants_have_images and seo_optimized,
-                "admin_url": f"https://{shop}/admin/products/{numeric_id}" if numeric_id else "",
-                "preview_url": p.get("onlineStoreUrl") or "",
-            })
-
-        return {
-            "ok": True,
-            "products": products,
-            "count": len(products),
-            "shop": shop,
-        }
-
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-@app.post("/api/v2/shopify/batch-bind-images")
-def api_v2_shopify_batch_bind_images(product_ids: list[str] = Query(...)):
-    """批量绑定变体图片"""
-    return {"ok": True, "message": "功能开发中", "processed": len(product_ids)}
-
-
-@app.post("/api/v2/shopify/batch-optimize-seo")
-def api_v2_shopify_batch_optimize_seo(product_ids: list[str] = Query(...)):
-    """批量SEO优化"""
-    return {"ok": True, "message": "功能开发中", "processed": len(product_ids)}
-
-
-@app.post("/api/v2/shopify/batch-publish")
-def api_v2_shopify_batch_publish(product_ids: list[str] = Query(...)):
-    """批量发布到 ACTIVE"""
-    import requests as _req
-
-    shop = os.getenv("SHOPIFY_SHOP_DOMAIN", "427b85-2.myshopify.com")
-    token = os.getenv("SHOPIFY_ADMIN_TOKEN", "")
-
-    if not shop or not token:
-        return {"ok": False, "error": "Missing credentials"}
-
-    mutation = """
-    mutation productUpdate($input: ProductInput!) {
-      productUpdate(input: $input) {
-        product { id status }
-        userErrors { field message }
-      }
-    }
-    """
-
-    success = 0
-    failed = 0
-    endpoint = f"https://{shop}/admin/api/2026-04/graphql.json"
-
-    for product_id in product_ids:
-        try:
-            resp = _req.post(
-                endpoint,
-                headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"},
-                json={"query": mutation, "variables": {"input": {"id": product_id, "status": "ACTIVE"}}},
-                timeout=10,
-            )
-            result = resp.json()
-            if result.get("data", {}).get("productUpdate", {}).get("product"):
-                success += 1
-            else:
-                failed += 1
-        except Exception:
-            failed += 1
-
-    return {
-        "ok": True,
-        "success": success,
-        "failed": failed,
-        "total": len(product_ids),
-    }
-
-
-@app.get("/shopify-draft-manager")
-def shopify_draft_manager_page():
-    """Draft 管理页面"""
-    return HTMLResponse(Path(__file__).parent.joinpath("shopify_draft_manager.html").read_text())
-
-
 @app.get("/api/auto-launch/latest")
 def api_auto_launch_latest():
     """Latest social + Amazon auto-selection report and Shopify DRAFT catalog."""
@@ -14140,18 +12980,18 @@ main{max-width:1500px;margin:0 auto;padding:20px}
 .kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:var(--shadow);padding:13px 14px;min-height:86px}
 .kpi .label{font-size:11px;color:var(--muted);font-weight:900;margin-bottom:6px}
 .kpi .value{font-size:27px;font-weight:900;line-height:1}.kpi .note{font-size:11px;color:var(--muted);margin-top:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.trend-grid{display:grid;grid-template-columns:1.15fr 1fr 1fr;gap:10px;margin-bottom:14px}
+.trend-box{padding:12px 14px}.trend-title{font-size:11px;color:var(--muted);font-weight:900;margin-bottom:9px}
 .chips{display:flex;gap:6px;flex-wrap:wrap}.chip{border:1px solid #cfe3d6;background:#f4fbf6;color:#1f4b37;border-radius:999px;padding:5px 8px;font-size:11px;font-weight:900;max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.chip.info{border-color:#bed2ff;background:#eaf1ff;color:#1d4ed8}.chip.warn{border-color:#efd48d;background:#fff6df;color:#7a4b08}
 .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:12px 15px;border-bottom:1px solid var(--line)}
 .search{min-width:260px;flex:1;border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-size:12px;background:#fff;color:var(--ink)}
-.sort-select{border:1px solid var(--line);border-radius:8px;background:#fff;color:var(--ink);font-size:12px;font-weight:800;min-height:34px;padding:7px 28px 7px 10px}
 .table-wrap{overflow:auto;max-height:720px}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th{position:sticky;top:0;background:#fbfcfa;color:var(--muted);text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);font-size:11px;z-index:1}
 td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}tr:hover td{background:#fbfcfa}
 .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.product{font-weight:900;color:var(--ink);display:block;max-width:360px;white-space:normal;overflow-wrap:anywhere}.meta{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.35}.trend{font-weight:900;color:var(--teal)}.action{font-weight:900;color:var(--ink)}.empty{padding:64px 20px;text-align:center;color:var(--muted)}
-.image-col{width:96px;min-width:96px}.product-thumb{width:76px;height:76px;border:1px solid var(--line);border-radius:8px;background:#eef2ec;display:flex;align-items:center;justify-content:center;overflow:hidden;color:var(--muted);font-size:11px;font-weight:900}.product-thumb img{width:100%;height:100%;object-fit:cover;display:block}.product-thumb.has-img{background:#fff;cursor:zoom-in}.product-thumb.no-img{border-style:dashed}.image-preview{position:fixed;left:0;top:0;width:320px;max-width:calc(100vw - 24px);background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 18px 50px rgba(24,32,31,.22);padding:8px;z-index:1000;display:none;pointer-events:none}.image-preview img{width:100%;max-height:420px;object-fit:contain;display:block;border-radius:6px;background:#f6f7f4}
-@media(max-width:1100px){.hero{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}.topbar{align-items:flex-start;flex-direction:column}}
-@media(max-width:720px){main{padding:14px}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.search{min-width:100%}table{min-width:1100px}.hero-body h2{font-size:20px}}
+@media(max-width:1100px){.hero{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}.trend-grid{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}}
+@media(max-width:720px){main{padding:14px}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.search{min-width:100%}table{min-width:920px}.hero-body h2{font-size:20px}}
 </style>
 </head>
 <body>
@@ -14186,171 +13026,41 @@ td{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}tr:hover 
     <div class="kpi"><div class="label">扫描覆盖</div><div class="value" id="k-scan">--</div><div class="note" id="k-scan-note">snapshot</div></div>
   </section>
 
+  <section class="trend-grid">
+    <div class="panel trend-box"><div class="trend-title">品类趋势</div><div class="chips" id="cat-list"></div></div>
+    <div class="panel trend-box"><div class="trend-title">价格带趋势</div><div class="chips" id="price-list"></div></div>
+    <div class="panel trend-box"><div class="trend-title">平台信号</div><div class="chips" id="signal-list"></div></div>
+  </section>
+
   <section class="panel">
     <div class="toolbar">
       <input class="search" id="filter" placeholder="筛产品、店铺、品类" oninput="renderProducts()">
-      <select class="sort-select" id="sort-mode" onchange="setSortMode(this.value)" aria-label="产品排序">
-        <option value="default">默认推荐</option>
-        <option value="price-desc">价格高到低</option>
-        <option value="price-asc">价格低到高</option>
-      </select>
       <button id="btn-all" onclick="toggleShowAll()" style="font-size:11px">显示全部新品</button>
       <span class="badge" id="count">--</span>
       <span class="badge" id="gtrends-mini-status">GT空闲</span>
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th style="width:42px">#</th><th class="image-col">产品图</th><th>产品</th><th>平台趋势</th><th class="num">价格</th><th>店铺</th><th>更新</th><th>机会动作</th></tr></thead>
-        <tbody id="tbody"><tr><td colspan="8"><div class="empty">加载中</div></td></tr></tbody>
+        <thead><tr><th style="width:42px">#</th><th>产品</th><th>平台趋势</th><th class="num">价格</th><th>店铺</th><th>更新</th><th>机会动作</th></tr></thead>
+        <tbody id="tbody"><tr><td colspan="7"><div class="empty">加载中</div></td></tr></tbody>
       </table>
     </div>
   </section>
 </main>
-<div class="image-preview" id="image-preview"><img id="image-preview-img" alt=""></div>
 <script>
-const state={data:null,products:[],allProducts:[],rawProductCount:0,duplicateRemoved:0,showAll:false,sortMode:'default'};
-const imageLookupCache=new Map();
+const state={data:null,products:[],allProducts:[],rawProductCount:0,duplicateRemoved:0,showAll:false};
 const HIGH_AOV_MIN=100;
-const DAILY_MIN_DISPLAY_PRICE=50;
 const RAPID_FOLLOW_MAX=800;
 const MIN_FB_ADS_FOR_FOLLOW=1;
 const GT_VALIDATE_TOP_N=20;
 let dailyGtrendsTimer=null;
-let dailyGtrendsObservedRunning=false;
 function $(id){return document.getElementById(id)}
 function h(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function n(v){return Number(v||0).toLocaleString()}
 function money(v){const x=Number(v||0);return x?'$'+x.toLocaleString(undefined,{maximumFractionDigits:2}):'--'}
 function shortTime(v){if(!v)return '--';const d=new Date(v);return Number.isNaN(d.getTime())?String(v).slice(0,19).replace('T',' '):d.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})}
 function productUrl(p){const raw=p.url||p.product_url||p.online_store_url||'';if(raw)return raw;const d=String(p.domain||'').replace(/^https?:\/\//,'').replace(/\/.*$/,'');const handle=String(p.handle||'').replace(/^\/+|\/+$/g,'');if(d&&handle)return 'https://'+d+'/products/'+encodeURIComponent(handle);if(d)return 'https://'+d;return '#'}
-function productImageUrl(p){
-  const candidates=[];
-  function add(v){
-    if(!v)return;
-    if(Array.isArray(v)){v.forEach(add);return}
-    if(typeof v==='object'){add(v.src||v.url||v.contentUrl||v.original_src);return}
-    candidates.push(String(v));
-  }
-  add(p.image_url);add(p.product_image);add(p.main_image);add(p.thumbnail);add(p.featured_image);add(p.image_urls);add(p.images);
-  for(let src of candidates){
-    src=String(src||'').trim();
-    if(!src || src.startsWith('data:'))continue;
-    if(src.startsWith('//'))src='https:'+src;
-    if(src.startsWith('/api/v2/product-image-fallback/') || /^https?:\/\//i.test(src))return src;
-  }
-  return '';
-}
-function productImageLookupFields(p){
-  const domain=String(p.domain||'').replace(/^https?:\/\//,'').replace(/^www\./,'').replace(/\/.*$/,'');
-  const handle=String(p.handle||p.product_handle||'').replace(/^\/+|\/+$/g,'');
-  const url=productUrl(p);
-  return {domain,handle,url:url==='#'?'':url};
-}
-function localPreviewImage(domain,handle,title){
-  const main=String(handle||title||domain||'Page preview').replace(/[-_]+/g,' ').trim().slice(0,46)||'Page preview';
-  const sub=String(domain||'public page').slice(0,42);
-  const svg='<svg xmlns="http://www.w3.org/2000/svg" width="900" height="900" viewBox="0 0 900 900"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#f8faf7"/><stop offset="1" stop-color="#dfe9e1"/></linearGradient></defs><rect width="900" height="900" fill="url(#g)"/><rect x="92" y="118" width="716" height="560" rx="34" fill="#fff" stroke="#cfdbd2" stroke-width="5"/><rect x="140" y="170" width="620" height="250" rx="24" fill="#e8efe9"/><circle cx="220" cy="250" r="54" fill="#12805c" opacity=".2"/><path d="M150 395 310 305 430 365 548 270 750 398v22H150z" fill="#12805c" opacity=".3"/><text x="450" y="505" text-anchor="middle" font-family="Arial,sans-serif" font-size="42" font-weight="800" fill="#18201f">'+h(main)+'</text><text x="450" y="562" text-anchor="middle" font-family="Arial,sans-serif" font-size="28" fill="#66716f">'+h(sub)+'</text><text x="450" y="742" text-anchor="middle" font-family="Arial,sans-serif" font-size="24" font-weight="700" fill="#12805c">PAGE PREVIEW</text></svg>';
-  return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
-}
-function productImageMarkup(src,title,fields={}){
-  const attrs=' data-domain="'+h(fields.domain||'')+'" data-handle="'+h(fields.handle||'')+'" data-url="'+h(fields.url||'')+'"';
-  const extra=fields.extraClass?(' '+h(fields.extraClass)):'';
-  return '<div class="product-thumb has-img'+extra+'" data-src="'+h(src)+'"'+attrs+' onmouseenter="showImagePreview(event)" onmousemove="moveImagePreview(event)" onmouseleave="hideImagePreview()"><img src="'+h(src)+'" alt="'+h(title||'产品图')+'" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="handleProductImageError(this)"></div>';
-}
-async function handleProductImageError(img){
-  const box=img&&img.parentNode;
-  if(!box || box.dataset.fallbackLoading==='1')return;
-  box.dataset.fallbackLoading='1';
-  const domain=box.dataset.domain||'', handle=box.dataset.handle||'', url=box.dataset.url||'';
-  const fallback=localPreviewImage(domain,handle||url,img.alt||'产品图');
-  img.onerror=null;
-  img.src=fallback;
-  box.dataset.src=fallback;
-  box.className='product-thumb has-img';
-  delete box.dataset.fallbackLoading;
-}
-function repairBrokenProductImages(){
-  const vh=window.innerHeight||720, vw=window.innerWidth||1280, now=Date.now();
-  document.querySelectorAll('.product-thumb img').forEach(img=>{
-    const box=img.parentNode;
-    if(!box || box.dataset.fallbackLoading==='1')return;
-    const rect=img.getBoundingClientRect();
-    const nearViewport=rect.bottom>-260 && rect.top<vh+360 && rect.right>0 && rect.left<vw;
-    if(!nearViewport){
-      delete box.dataset.visibleSince;
-      return;
-    }
-    if(!box.dataset.visibleSince)box.dataset.visibleSince=String(now);
-    const visibleFor=now-Number(box.dataset.visibleSince||now);
-    if((img.complete && (!img.naturalWidth || !img.naturalHeight)) || (!img.complete && visibleFor>1300)){
-      handleProductImageError(img);
-    }
-  });
-}
-function productImageCell(p){
-  const src=productImageUrl(p);
-  const f=productImageLookupFields(p);
-  if(src)return productImageMarkup(src,p.title,f);
-  if(!f.domain && !f.url)return productImageMarkup(localPreviewImage('', '', p.title||'产品图'), p.title, f);
-  return productImageMarkup(localPreviewImage(f.domain,f.handle,p.title||'产品图'), p.title, {...f, extraClass:'js-image-missing'});
-}
-function moveImagePreview(ev){
-  const box=$('image-preview');
-  if(!box || box.style.display!=='block')return;
-  const margin=14, width=box.offsetWidth||320, height=box.offsetHeight||320;
-  let left=ev.clientX+margin, top=ev.clientY+margin;
-  if(left+width>window.innerWidth-margin)left=ev.clientX-width-margin;
-  if(top+height>window.innerHeight-margin)top=window.innerHeight-height-margin;
-  box.style.left=Math.max(margin,left)+'px';
-  box.style.top=Math.max(margin,top)+'px';
-}
-function showImagePreview(ev){
-  const src=ev.currentTarget?.dataset?.src||'';
-  if(!src)return;
-  const box=$('image-preview'), img=$('image-preview-img');
-  if(!box||!img)return;
-  img.src=src;
-  box.style.display='block';
-  moveImagePreview(ev);
-}
-function hideImagePreview(){
-  const box=$('image-preview'), img=$('image-preview-img');
-  if(box)box.style.display='none';
-  if(img)img.removeAttribute('src');
-}
 async function api(path,opts={}){const r=await fetch(path,opts);if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}
-async function hydrateMissingProductImages(){
-  const cells=[...document.querySelectorAll('.js-image-missing')].slice(0,900);
-  let active=0, index=0;
-  async function next(){
-    if(index>=cells.length)return;
-    const cell=cells[index++];
-    if(!cell || !cell.isConnected || !cell.classList.contains('js-image-missing'))return next();
-    const domain=cell.dataset.domain||'', handle=cell.dataset.handle||'', url=cell.dataset.url||'';
-    const key=[domain,handle,url].join('|');
-    try{
-      let image=imageLookupCache.get(key);
-      if(image===undefined){
-        const r=await api('/api/v2/product-image?domain='+encodeURIComponent(domain)+'&handle='+encodeURIComponent(handle)+'&product_url='+encodeURIComponent(url));
-        image=r.image_url||'';
-        imageLookupCache.set(key,image);
-      }
-      if(image && cell.isConnected){
-        cell.outerHTML=productImageMarkup(image,'产品图',{domain,handle,url});
-      }else if(cell.isConnected){
-        cell.outerHTML=productImageMarkup(localPreviewImage(domain,handle,'产品图'),'产品图',{domain,handle,url});
-      }
-    }catch(e){
-      if(cell.isConnected){
-        cell.outerHTML=productImageMarkup(localPreviewImage(domain,handle,'产品图'),'产品图',{domain,handle,url});
-      }
-    }finally{
-      active--;
-      while(active<6 && index<cells.length){active++;next();}
-    }
-  }
-  while(active<6 && index<cells.length){active++;next();}
-}
 function topEntries(obj,limit=6){return Object.entries(obj||{}).sort((a,b)=>Number(b[1]||0)-Number(a[1]||0)).slice(0,limit)}
 function priceBand(v){const x=Number(v||0);if(!x)return '价格待补';if(x<=25)return '$0-25';if(x<=50)return '$25-50';if(x<=100)return '$50-100';if(x<=200)return '$100-200';if(x<=500)return '$200-500';return '$500+'}
 function chip(label,value,cls=''){return '<span class="chip '+h(cls)+'" title="'+h(label)+'">'+h(label)+(value!=null?' '+n(value):'')+'</span>'}
@@ -14360,8 +13070,6 @@ function titleText(p){return String(p.title||p.product_title||'')}
 function textBlob(p){const tags=fieldText(p.tags);return [p.title,p.product_title,p.handle,p.url,p.product_url,p.domain,p.product_type,p.product_type_raw,p.specific_category,p.category_group,p.product_shape,p.core_mechanism,p.use_case,p.pain_point,p.demo_scene,p.target_audience,p.novelty_signal,p.creative_angle,p.follow_playbook,p.how_to_follow,fieldText(p.conversion_angles),fieldText(p.reasons),fieldText(p.risk_flags),tags].join(' ').toLowerCase()}
 function hasAny(text,words){return words.some(w=>text.includes(w))}
 function numValue(v){const n=Number(v||0);return Number.isFinite(n)?n:0}
-function isDailyDisplayProduct(p){return numValue(p&&p.price)>=DAILY_MIN_DISPLAY_PRICE}
-function filterDailyDisplayProducts(products){return (products||[]).filter(isDailyDisplayProduct)}
 function dailyOpportunity(p){
   const price=Number(p.price||0), text=textBlob(p), group=String(p.category_group||''), reasons=[];
   let small=0, novelty=0, profit=0, risk=0;
@@ -14457,8 +13165,6 @@ function mergeProductSignals(products, scoredProducts){
         product_url: existing.product_url || normalized.product_url,
         description: existing.description || normalized.description,
         body_html: existing.body_html || normalized.body_html,
-        image_url: existing.image_url || normalized.image_url,
-        image_urls: (existing.image_urls&&existing.image_urls.length)?existing.image_urls:(normalized.image_urls||[]),
         image_count: Math.max(numValue(existing.image_count), numValue(normalized.image_count)),
         variant_count: Math.max(numValue(existing.variant_count), numValue(normalized.variant_count)),
       });
@@ -14812,21 +13518,7 @@ function diversifyDailyProducts(products){
   return first.concat(rest);
 }
 function actionFor(p){
-  const query=p.trend_query||p.keyword||((p.trend_candidates||[])[0]||{}).keyword||'';
-  const status=String(p.trend_status||'unverified').toLowerCase();
-  const score=numValue(p.trends_score||p.trend_score);
-  const prefix=query?('GT查询词「'+query+'」'):'GT关键词待生成';
-  if(['breakout','hot','rising'].includes(status)){
-    return prefix+'：趋势上升，分 '+n(score)+'，优先拆竞品PDP/素材并核供应链';
-  }
-  if(['stable','watch'].includes(status)){
-    return prefix+'：有搜索需求，分 '+n(score)+'，先看FB广告证据和页面承接';
-  }
-  if(status==='noise'){
-    return prefix+'：趋势低噪声，暂不直接跟，先换关键词或补社区/广告证据';
-  }
-  if(p.verified_opportunity) return prefix+'：真实趋势待补，先找可上架货源/竞品PDP，再做48h小预算测试';
-  if(query) return prefix+'：待跑真实Google Trends，点击“验证Top20趋势”补时间序列';
+  if(p.verified_opportunity) return '验证机会：先找可上架货源/竞品PDP，再做48h小预算测试';
   const price=Number(p.price||0), missing=(p.missing_fields||[]).length, images=Number(p.image_count||0);
   if(p.follow_decision==='最适合跟') return '最适合跟：FB已验证、低CPM钩子强、痛点场景清楚';
   if(p.follow_decision==='优先验证') return '优先验证：拆竞品素材，48h看CTR/ATC/CPA';
@@ -14836,22 +13528,6 @@ function actionFor(p){
   if(missing>=3 || !images) return '数据不足：先补抓图片、描述、变体';
   if(String(p.category_group||'').includes('Pain') || String(categoryOf(p)).includes('按摩')) return '问题解决型：优先看演示素材';
   return '入池观察：等广告、趋势或社区信号升级';
-}
-function actionMetaFor(p){
-  const status=String(p.trend_status||'unverified');
-  const score=numValue(p.trends_score||p.trend_score);
-  const parts=['GTrends '+status+' '+n(score)];
-  if(p.trend_data_quality)parts.push('质量 '+p.trend_data_quality);
-  if(p.trend_dir)parts.push('方向 '+p.trend_dir);
-  if(p.trend_last_30d!=null)parts.push('近30天 '+n(p.trend_last_30d));
-  if(p.trend_avg_score!=null)parts.push('均值 '+n(p.trend_avg_score));
-  if(p.trend_peak!=null)parts.push('峰值 '+n(p.trend_peak));
-  if(p.trend_yoy_change!=null)parts.push('YoY '+n(p.trend_yoy_change)+'%');
-  if(p.trend_cached_at)parts.push('缓存 '+shortTime(p.trend_cached_at));
-  const alts=(p.trend_candidates||[]).slice(1,4).map(x=>x.keyword).filter(Boolean);
-  if(alts.length)parts.push('备选词 '+alts.join(' / '));
-  const fallback=([Number(p.duplicate_count||1)>1?('同款合并 '+n(p.duplicate_count)+' 条'):''].concat(p.follow_reasons||[], p.missing_evidence||[], p.follow_blockers||[]).filter(Boolean).join(' · ') || p.creative_angle || p.novelty_signal || '').slice(0,180);
-  return parts.filter(Boolean).join(' · ')+(fallback?(' · '+fallback):'');
 }
 function trendFor(p){
   if(p.verified_opportunity){
@@ -14870,7 +13546,7 @@ function trendFor(p){
   return pieces.filter(Boolean).join(' · ');
 }
 function renderSummary(d){
-  const cats=topEntries(d.category_breakdown,6);
+  const cats=topEntries(d.category_breakdown,6), bands=topEntries(d.price_bands,6), signals=(d.trend_signals||[]).slice(0,5);
   const high=state.products.length, ps=d.price_stats||{}, meta=d.scan_meta||{}, topCat=cats[0]||['--',0];
   const activeDate=meta.active_product_date||d.active_product_date||d.scan_date;
   const isFallback=activeDate && d.scan_date && activeDate!==d.scan_date;
@@ -14880,7 +13556,7 @@ function renderSummary(d){
   $('headline').textContent=high>0?(opportunityMode?'Shopify + FB Ads 已验证机会 '+n(high)+' 个':'Shopify + FB Ads 最适合跟品 '+n(high)+' 个'):'Shopify + FB Ads 跟品池待刷新';
   $('subline').textContent=opportunityMode
     ? '今日严格SKU没有过线，改显示真实验证机会池：只使用Google Trends缓存和本地FB广告库，不填假数据；下一步是找货源和竞品PDP · '+shortTime(d.scan_time)
-    : fallbackPrefix+'列表只显示$50以上新品；精选池保留$100-$800且有FB广告证据的实物SKU；已合并FB信号，同款/同机会家族去重 '+n(state.duplicateRemoved)+' 个；严格按跟品分、美国痛点场景、低CPM素材潜力、FB未过热验证和快速利润排序 · '+shortTime(d.scan_time);
+    : fallbackPrefix+'只保留$100-$800且有FB广告证据的实物SKU；已合并FB信号，同款/同机会家族去重 '+n(state.duplicateRemoved)+' 个；严格按跟品分、美国痛点场景、低CPM素材潜力、FB未过热验证和快速利润排序 · '+shortTime(d.scan_time);
   $('k-new-label').textContent=isFallback?'展示样本':'今日新品';
   $('k-new').textContent=isFallback?n(activeCount):n(d.total_new_today||0);
   $('k-yesterday').textContent=isFallback?('今日 0 · 来源 '+activeDate):('昨日 '+n(d.total_new_yesterday||0));
@@ -14892,46 +13568,26 @@ function renderSummary(d){
   $('k-high').textContent=n(high);
   $('k-scan').textContent=n(meta.snapshot_files_scanned||d.scanned_domains||0);
   $('k-scan-note').textContent=meta.max_snapshot_age_days?'近 '+n(meta.max_snapshot_age_days)+' 天快照':'扫描覆盖';
+  $('cat-list').innerHTML=cats.map(([k,v])=>chip(k,v)).join('')||chip('暂无品类',null,'warn');
+  $('price-list').innerHTML=bands.map(([k,v])=>chip(k,v,'info')).join('')||chip('暂无价格带',null,'warn');
+  $('signal-list').innerHTML=(signals.length?signals:['等待快照刷新']).map(x=>chip(x,null,'warn')).join('');
 }
 function renderProducts(){
   const q=($('filter').value||'').toLowerCase();
-  const source=filterDailyDisplayProducts(state.showAll?state.allProducts:state.products);
-  const products=sortProducts(source.filter(p=>!q || [p.title,p.domain,categoryOf(p)].join(' ').toLowerCase().includes(q)));
-  $('count').textContent=n(products.length)+' 条'+(state.showAll?' (全部)':' (精选)')+(state.sortMode==='default'?'':' · '+sortLabel());
+  const source=state.showAll?state.allProducts:state.products;
+  const products=source.filter(p=>!q || [p.title,p.domain,categoryOf(p)].join(' ').toLowerCase().includes(q));
+  $('count').textContent=n(products.length)+' 条'+(state.showAll?' (全部)':' (精选)');
   $('btn-all').textContent=state.showAll?'只看精选':'显示全部新品';
-  if(!products.length){$('tbody').innerHTML='<tr><td colspan="8"><div class="empty">当前没有匹配产品</div></td></tr>';return}
+  if(!products.length){$('tbody').innerHTML='<tr><td colspan="7"><div class="empty">当前没有匹配产品</div></td></tr>';return}
   $('tbody').innerHTML=products.map((p,i)=>'<tr>'+
     '<td class="num">'+(i+1)+'</td>'+
-    '<td class="image-col">'+productImageCell(p)+'</td>'+
     '<td><a class="product" href="'+h(productUrl(p))+'" target="_blank" rel="noopener noreferrer">'+h(p.title||'')+'</a><div class="meta">'+h(p.verified_opportunity?('验证入口 · 关键词 '+(p.keyword||p.trend_query||'')+' · '+categoryOf(p)):categoryOf(p))+(productUrl(p)!=='#'?'':' · <span style="color:var(--red)">链接缺失</span>')+'</div></td>'+
     '<td><div class="trend">'+h(trendFor(p))+'</div><div class="meta">图片 '+n(p.image_count||0)+' · 变体 '+n(p.variant_count||0)+'</div></td>'+
     '<td class="num">'+money(p.price)+'</td>'+
     '<td>'+h(p.verified_opportunity?'真实机会池':(p.domain||''))+'<div class="meta">'+h(p.verified_opportunity?'非今日SKU':('SKU '+n(p.store_product_count||0)))+'</div></td>'+
     '<td>'+h(p.verified_opportunity?'已验证':((p.updated_at||p.created_at||p.published_at||'').slice(0,10)||'--'))+'<div class="meta">'+h(p.verified_opportunity?'GT/FB缓存':('发布 '+((p.published_at||'').slice(0,10)||'--')))+'</div></td>'+
-    '<td><div class="action">'+h(actionFor(p))+'</div><div class="meta">'+h(actionMetaFor(p))+'</div></td>'+
+    '<td><div class="action">'+h(actionFor(p))+'</div><div class="meta">'+h(([Number(p.duplicate_count||1)>1?('同款合并 '+n(p.duplicate_count)+' 条'):''].concat(p.follow_reasons||[], p.missing_evidence||[], p.follow_blockers||[]).filter(Boolean).join(' · ') || p.creative_angle || p.novelty_signal || '').slice(0,180))+'</div></td>'+
   '</tr>').join('');
-  setTimeout(hydrateMissingProductImages,0);
-  setTimeout(repairBrokenProductImages,900);
-}
-function sortLabel(){
-  if(state.sortMode==='price-desc')return '价格高到低';
-  if(state.sortMode==='price-asc')return '价格低到高';
-  return '默认推荐';
-}
-function productPrice(p){const x=Number(p&&p.price||0);return Number.isFinite(x)&&x>0?x:null}
-function sortProducts(products){
-  const rows=[...(products||[])];
-  if(state.sortMode==='price-desc'){
-    return rows.sort((a,b)=>(productPrice(b)??-1)-(productPrice(a)??-1));
-  }
-  if(state.sortMode==='price-asc'){
-    return rows.sort((a,b)=>(productPrice(a)??Number.MAX_SAFE_INTEGER)-(productPrice(b)??Number.MAX_SAFE_INTEGER));
-  }
-  return rows;
-}
-function setSortMode(mode){
-  state.sortMode=mode||'default';
-  renderProducts();
 }
 function toggleShowAll(){state.showAll=!state.showAll;renderProducts()}
 async function loadVerifiedOpportunities(baseData){
@@ -14954,30 +13610,26 @@ async function loadVerifiedOpportunities(baseData){
     trend_validation_score:p.trend_verified?30:0,
     trends_score:p.trend_score||0,
   }));
-  const displayOpportunities=filterDailyDisplayProducts(opportunities);
-  state.products=dedupeOpportunityFamilies(displayOpportunities);
-  state.rawProductCount=displayOpportunities.length;
+  state.products=dedupeOpportunityFamilies(opportunities);
+  state.rawProductCount=opportunities.length;
   state.duplicateRemoved=Math.max(0, opportunities.length-state.products.length);
   return {...(baseData||{}), verified_opportunity_mode:true, scan_time:new Date().toISOString(), high_value_products:state.products, trend_signals:[pool.truth_policy||'真实验证机会池'], category_breakdown:Object.fromEntries(topEntries(state.products.reduce((acc,p)=>{const c=categoryOf(p);acc[c]=(acc[c]||0)+1;return acc},{}),8))};
 }
 async function loadDailyProducts(){
   $('btn-load').disabled=true;
-  $('tbody').innerHTML='<tr><td colspan="8"><div class="empty">正在读取今日新品快照</div></td></tr>';
+  $('tbody').innerHTML='<tr><td colspan="7"><div class="empty">正在读取今日新品快照</div></td></tr>';
   try{
     const d=await api('/api/v2/today-fast?product_limit=700&score_limit=700');
     state.data=d;
     const merged=mergeProductSignals(d.products||[], d.scored_products||[]);
-    const displayMerged=filterDailyDisplayProducts(merged);
-    const allDeduped=dedupeDailyProducts(displayMerged).sort((a,b)=>new Date(b.published_at||b.created_at||0)-new Date(a.published_at||a.created_at||0)||Number(b.price||0)-Number(a.price||0));
+    const allDeduped=dedupeDailyProducts(merged).sort((a,b)=>new Date(b.published_at||b.created_at||0)-new Date(a.published_at||a.created_at||0)||Number(b.price||0)-Number(a.price||0));
     state.allProducts=allDeduped;
-    state.products=filterDailyDisplayProducts(prioritizeDailyProducts(displayMerged));
+    state.products=prioritizeDailyProducts(merged);
     state.showAll=true;
     if(!state.allProducts.length && !state.products.length){
       const fallback=await loadVerifiedOpportunities(d);
       state.data=fallback;
-      state.products=filterDailyDisplayProducts(state.products);
-      state.allProducts=filterDailyDisplayProducts(state.products);
-      fallback.high_value_products=state.products.slice(0,30);
+      state.allProducts=state.products;
       renderSummary(fallback);
       renderProducts();
       return;
@@ -14988,7 +13640,7 @@ async function loadDailyProducts(){
   }catch(e){
     $('headline').textContent='读取失败';
     $('subline').textContent=e.message;
-    $('tbody').innerHTML='<tr><td colspan="8"><div class="empty">读取失败：'+h(e.message)+'</div></td></tr>';
+    $('tbody').innerHTML='<tr><td colspan="7"><div class="empty">读取失败：'+h(e.message)+'</div></td></tr>';
   }finally{$('btn-load').disabled=false}
 }
 async function startDailyGtrendsValidation(){
@@ -15011,15 +13663,11 @@ async function pollDailyGtrendsStatus(){
   try{
     const r=await api('/api/gtrends/background/status');
     renderDailyGtrendsStatus(r);
-    if(r.running){
-      dailyGtrendsObservedRunning=true;
-      dailyGtrendsTimer=setTimeout(pollDailyGtrendsStatus,3000);
-    }
+    if(r.running){dailyGtrendsTimer=setTimeout(pollDailyGtrendsStatus,3000);}
     else{
       $('btn-gtrends').disabled=false;
       $('btn-gtrends').textContent='验证Top20趋势';
-      if(dailyGtrendsObservedRunning)setTimeout(loadDailyProducts,1200);
-      dailyGtrendsObservedRunning=false;
+      setTimeout(loadDailyProducts,1200);
     }
   }catch(e){
     $('gtrends-mini-status').textContent='GT状态失败';
@@ -15068,11 +13716,7 @@ async function runDailyUpdate(){
     setTimeout(()=>{$('btn-run').disabled=false;$('btn-run').textContent='立即更新'},2500);
   }
 }
-window.addEventListener('scroll',()=>{setTimeout(repairBrokenProductImages,150);setTimeout(repairBrokenProductImages,1700);},{passive:true});
-window.addEventListener('resize',()=>{setTimeout(repairBrokenProductImages,150);setTimeout(repairBrokenProductImages,1700);},{passive:true});
-setInterval(repairBrokenProductImages,900);
 loadDailyProducts();
-pollDailyGtrendsStatus();
 pollDailyStatus();
 </script>
 </body>
@@ -17330,81 +15974,81 @@ tr:hover td{background:#f8fafc}
   </div>
   <div class="actions">
     <span class="sys-dot" style="margin-right:4px"><span class="dot idle" id="sys-server-dot"></span><span id="sys-uptime">--</span></span>
-    <button class="primary" id="btn-run" onclick="runDecision()">扫描判断</button>
-    <button class="warning" id="btn-refresh" onclick="startMonitorRefresh()">刷新快照</button>
-    <a class="linkbtn" href="/v2">工作台</a>
-    <a class="linkbtn" href="/daily-products">每日新品</a>
+    <button class="primary" id="btn-run" onclick="runDecision()">Scan & Judge</button>
+    <button class="warning" id="btn-refresh" onclick="startMonitorRefresh()">Refresh Snapshots</button>
+    <a class="linkbtn" href="/v2">Workbench</a>
+    <a class="linkbtn" href="/daily-products">Daily Feed</a>
   </div>
 </div>
 
 <div class="money-strip" id="money-strip">
   <div class="ms-block">
-    <div class="ms-label">管线</div>
-    <div class="ms-row"><span class="ms-num green" id="mp-follow">--</span><span class="ms-tag">可测试</span></div>
-    <div class="ms-row"><span class="ms-num amber" id="mp-prepare">--</span><span class="ms-tag">待建页</span></div>
+    <div class="ms-label">PIPELINE</div>
+    <div class="ms-row"><span class="ms-num green" id="mp-follow">--</span><span class="ms-tag">Test Now</span></div>
+    <div class="ms-row"><span class="ms-num amber" id="mp-prepare">--</span><span class="ms-tag">Draft PDP</span></div>
   </div>
   <div class="ms-divider"></div>
   <div class="ms-block">
-    <div class="ms-label">机会</div>
-    <div class="ms-row"><span class="ms-num" id="mp-avg-price">--</span><span class="ms-tag">均价</span></div>
-    <div class="ms-row"><span class="ms-num" id="mp-total">--</span><span class="ms-tag">已追踪</span></div>
+    <div class="ms-label">OPPORTUNITY</div>
+    <div class="ms-row"><span class="ms-num" id="mp-avg-price">--</span><span class="ms-tag">Avg Price</span></div>
+    <div class="ms-row"><span class="ms-num" id="mp-total">--</span><span class="ms-tag">Products Tracked</span></div>
   </div>
   <div class="ms-divider"></div>
   <div class="ms-block">
-    <div class="ms-label">速度</div>
-    <div class="ms-row"><span class="ms-num blue" id="mp-velocity">--</span><span class="ms-tag" id="mp-velocity-label">市场速度</span></div>
-    <div class="ms-row"><span class="ms-num" id="mp-new7d">--</span><span class="ms-tag">近7天新增</span></div>
+    <div class="ms-label">VELOCITY</div>
+    <div class="ms-row"><span class="ms-num blue" id="mp-velocity">--</span><span class="ms-tag" id="mp-velocity-label">Market Speed</span></div>
+    <div class="ms-row"><span class="ms-num" id="mp-new7d">--</span><span class="ms-tag">New 7d</span></div>
   </div>
   <div class="ms-divider"></div>
   <div class="ms-block">
-    <div class="ms-label">系统</div>
-    <div class="ms-row"><span class="sys-dot" style="padding:0;border:0;background:none"><span class="dot idle" id="sys-data-dot"></span><span id="sys-data" style="font-size:11px">数据 --</span></span></div>
-    <div class="ms-row"><span class="sys-dot" style="padding:0;border:0;background:none"><span class="dot idle" id="sys-refresh-dot"></span><span id="sys-refresh" style="font-size:11px">刷新空闲</span></span></div>
+    <div class="ms-label">SYSTEM</div>
+    <div class="ms-row"><span class="sys-dot" style="padding:0;border:0;background:none"><span class="dot idle" id="sys-data-dot"></span><span id="sys-data" style="font-size:11px">Data --</span></span></div>
+    <div class="ms-row"><span class="sys-dot" style="padding:0;border:0;background:none"><span class="dot idle" id="sys-refresh-dot"></span><span id="sys-refresh" style="font-size:11px">Refresh idle</span></span></div>
   </div>
 </div>
 
 <main>
   <section class="headline">
     <div>
-      <h2 id="money-call">正在扫描利润机会…</h2>
-      <p id="money-sub">系统过滤：广告信号 + 趋势验证 + 单位经济 + 信任缺口 + 供应链风险 = 每个产品一个结论。</p>
+      <h2 id="money-call">Scanning for profit opportunities...</h2>
+      <p id="money-sub">System filters: ad signals + trend validation + unit economics + trust gaps + supply chain risk = one verdict per product.</p>
     </div>
-    <div class="status" id="status-box">加载中</div>
+    <div class="status" id="status-box">Loading</div>
   </section>
 
-  <section class="panel insights" id="operator-doctrine">
-    <div class="panel-head" style="cursor:pointer" onclick="var b=document.getElementById('doctrine-body');b.style.display=b.style.display==='none'?'grid':'none';this.querySelector('.toggle-arrow').textContent=b.style.display==='none'?'展开':'收起'">
-      <h3>情报 &amp; 打法手册 <span style="font-weight:500;color:var(--muted);font-size:12px">— Reddit 驱动的运营系统</span></h3>
-      <div style="display:flex;gap:8px;align-items:center"><span class="badge" style="background:#eff6ff;color:#1d4ed8;border-color:#bfdbfe">19 条规则</span><span class="badge toggle-arrow" style="cursor:pointer">收起</span></div>
+  <section class=”panel insights” id=”operator-doctrine”>
+    <div class=”panel-head” style=”cursor:pointer” onclick=”document.getElementById('doctrine-body').style.display=document.getElementById('doctrine-body').style.display==='none'?'grid':'none';this.querySelector('.toggle-arrow').textContent=document.getElementById('doctrine-body').style.display==='none'?'Show':'Hide'”>
+      <h3>Intel & Playbook <span style=”font-weight:500;color:var(--muted);font-size:12px”>— Reddit-powered operating system</span></h3>
+      <div style=”display:flex;gap:8px;align-items:center”><span class=”badge” style=”background:#eff6ff;color:#1d4ed8;border-color:#bfdbfe”>19 Rules</span><span class=”badge toggle-arrow” style=”cursor:pointer”>Hide</span></div>
     </div>
-    <div class="insight-body" id="doctrine-body">
-      <div class="doctrine-hero">
-        <div class="doctrine-card dark">
-          <div class="kicker">核心竞争力</div>
+    <div class=”insight-body” id=”doctrine-body”>
+      <div class=”doctrine-hero”>
+        <div class=”doctrine-card dark”>
+          <div class=”kicker”>核心竞争力</div>
           <h3>不是会扒品，而是知道什么值得跟、怎么跟、什么时候停。</h3>
-          <p>FB Ads + Shopify 已经把“会搭建”商品化；真正差距在判断力：产品能不能被 3 秒看懂，广告能不能给 Meta 明确信号，PDP 能不能延续同一段话，供应链和毛利能不能承接第一次放量。</p>
-          <div class="doctrine-list">
+          <p>FB Ads + Shopify 已经把”会搭建”商品化；真正差距在判断力：产品能不能被 3 秒看懂，广告能不能给 Meta 明确信号，PDP 能不能延续同一段话，供应链和毛利能不能承接第一次放量。</p>
+          <div class=”doctrine-list”>
             <div>马上看到钱的系统，不是承诺每个品赚钱，而是把不能快速接近现金回流的品挡在广告费之外。</div>
             <div>跟品不是复制产品，是复制已被验证的需求，再用更好的角度、页面、信任和成本结构切进去。</div>
             <div>Reddit 痛点信号领先 Google Trends 4-8 周 —— 越早发现越有测试窗口。</div>
           </div>
         </div>
-        <div class="doctrine-card">
-          <div class="kicker">跟品判断公式</div>
-          <h3>跟品评分 = 痛点 + 广告信号 + 信任接力 + 利润空间 + 供应链确定性 - 风险</h3>
-          <p>2026 不再押“爆品玄学”。强跟产品必须同时满足：有人已经为这个问题花钱，评论里有购买意图，创意能产生 5 个以上明确角度，PDP 不像模板站，落地成本仍留出广告和退货空间。</p>
-          <div class="doctrine-list" style="margin-top:10px">
-            <div style="border-left-color:var(--blue)">Reddit DPA 2026：CPM 比 Meta 低 50-70%，4:5 竖版视频 CPA 低 54%</div>
-            <div style="border-left-color:var(--blue)">话术挖掘：100+ 原话 → 5 类分桶 → 频次最高痛点 = 广告主钩子</div>
+        <div class=”doctrine-card”>
+          <div class=”kicker”>跟品判断公式</div>
+          <h3>Follow Score = 痛点 + 广告信号 + 信任接力 + 利润空间 + 供应链确定性 - 风险</h3>
+          <p>2026 不再押”爆品玄学”。强跟产品必须同时满足：有人已经为这个问题花钱，评论里有购买意图，创意能产生 5 个以上明确角度，PDP 不像模板站，落地成本仍留出广告和退货空间。</p>
+          <div class=”doctrine-list” style=”margin-top:10px”>
+            <div style=”border-left-color:var(--blue)”>Reddit DPA 2026：CPM 比 Meta 低 50-70%，4:5 竖版视频 CPA 低 54%</div>
+            <div style=”border-left-color:var(--blue)”>Message Mining：100+ 原话 → 5 类分桶 → 频次最高痛点 = 广告主 hook</div>
           </div>
         </div>
       </div>
 
-      <div class="insight-grid">
-        <div class="insight"><div class="name">受众先于产品</div><div class="watch">Reddit 共识：失败常见原因是没人信任店铺、创意像广告、品牌没有身份。73% 用户购买前在 Reddit 研究。</div><div class="money">判断：先问谁已经反复看到你、信你、或在社区里讨论这个问题。</div><div class="action">没有受众语境，就不要把冷流量当提款机。</div></div>
-        <div class="insight"><div class="name">问题比爆品值钱</div><div class="watch">好品来自反复抱怨、3 星评论、“any alternatives to” “I wish someone would” 等高意图搜索。</div><div class="money">判断：30 天内同一痛点 ≥3 帖 + 平均评论 ≥15 = 强需求信号。</div><div class="action">只跟痛点清楚、价值可演示的品。</div></div>
-        <div class="insight"><div class="name">创意就是定向</div><div class="watch">Meta 会读素材、文案、像素事件和互动人群；Reddit 话术挖掘提取的用户原话 CTR 高 4 倍。</div><div class="money">判断：至少准备 demo、UGC、问题/方案、生活方式、offer 五类角度。</div><div class="action">用社区原话做 hook，不用营销人话术。</div></div>
-        <div class="insight"><div class="name">PDP 延续广告语境</div><div class="watch">广告越具体，落地页越不能泛泛写“适合所有人”；Reddit 用户到达后期望真实、可验证的信息。</div><div class="money">判断：首屏、证据、FAQ、评价和价格锚点是否接住同一个人群。</div><div class="action">广告说给谁，页面就继续跟谁说。</div></div>
+      <div class=”insight-grid”>
+        <div class=”insight”><div class=”name”>受众先于产品</div><div class=”watch”>Reddit 共识：失败常见原因是没人信任店铺、创意像广告、品牌没有身份。73% 用户购买前在 Reddit 研究。</div><div class=”money”>判断：先问谁已经反复看到你、信你、或在社区里讨论这个问题。</div><div class=”action”>没有受众语境，就不要把冷流量当提款机。</div></div>
+        <div class=”insight”><div class=”name”>问题比爆品值钱</div><div class=”watch”>好品来自反复抱怨、3 星评论、”any alternatives to” “I wish someone would” 等高意图搜索。</div><div class=”money”>判断：30 天内同一痛点 ≥3 帖 + 平均评论 ≥15 = 强需求信号。</div><div class=”action”>只跟痛点清楚、价值可演示的品。</div></div>
+        <div class=”insight”><div class=”name”>创意就是定向</div><div class=”watch”>Meta 会读素材、文案、像素事件和互动人群；Reddit Message Mining 提取的用户原话 CTR 高 4 倍。</div><div class=”money”>判断：至少准备 demo、UGC、问题/方案、生活方式、offer 五类角度。</div><div class=”action”>用社区原话做 hook，不用营销人话术。</div></div>
+        <div class=”insight”><div class=”name”>PDP 延续广告语境</div><div class=”watch”>广告越具体，落地页越不能泛泛写”适合所有人”；Reddit 用户到达后期望真实、可验证的信息。</div><div class=”money”>判断：首屏、证据、FAQ、评价和价格锚点是否接住同一个人群。</div><div class=”action”>广告说给谁，页面就继续跟谁说。</div></div>
       </div>
 
       <div class="check-matrix">
@@ -17456,103 +16100,103 @@ tr:hover td{background:#f8fafc}
   </section>
 
   <section class="progress panel" id="refresh-panel">
-    <div class="panel-head"><h3>后台刷新</h3><span class="badge" id="refresh-badge">空闲</span></div>
+    <div class="panel-head"><h3>Background Refresh</h3><span class="badge" id="refresh-badge">idle</span></div>
     <div style="padding:12px 15px">
-      <div style="display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--muted);margin-bottom:8px"><span id="refresh-message">等待中</span><span id="refresh-count">0/0</span></div>
+      <div style="display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--muted);margin-bottom:8px"><span id="refresh-message">Waiting</span><span id="refresh-count">0/0</span></div>
       <div class="progressbar"><div id="refresh-fill"></div></div>
     </div>
   </section>
 
   <section class="panel autopilot" id="ai-panel">
-    <div class="panel-head"><h3>AI 判断引擎</h3><span class="badge" id="ai-badge">加载中</span></div>
+    <div class="panel-head"><h3>AI Judgment Engine</h3><span class="badge" id="ai-badge">Loading</span></div>
     <div class="autopilot-body">
       <div>
         <div class="auto-score"><span class="big" id="ai-score">--</span><span class="grade" id="ai-grade">--</span></div>
-        <div class="auto-muted" id="ai-label">自动核查广告信号、趋势证据、利润空间、信任缺口、供应链风险。</div>
+        <div class="auto-muted" id="ai-label">Auto-checks ad signals, trend evidence, profit margins, trust gaps, supply chain risk.</div>
       </div>
       <div>
         <div class="auto-quality">
-          <div class="auto-q"><div class="label">数据精度</div><div class="value" id="ai-data-score">--</div><div class="note" id="ai-data-note">--</div></div>
-          <div class="auto-q"><div class="label">证据</div><div class="value" id="ai-evidence-score">--</div><div class="note" id="ai-evidence-note">--</div></div>
-          <div class="auto-q"><div class="label">置信度</div><div class="value" id="ai-judge-score">--</div><div class="note" id="ai-judge-note">--</div></div>
+          <div class="auto-q"><div class="label">DATA PRECISION</div><div class="value" id="ai-data-score">--</div><div class="note" id="ai-data-note">--</div></div>
+          <div class="auto-q"><div class="label">EVIDENCE</div><div class="value" id="ai-evidence-score">--</div><div class="note" id="ai-evidence-note">--</div></div>
+          <div class="auto-q"><div class="label">CONFIDENCE</div><div class="value" id="ai-judge-score">--</div><div class="note" id="ai-judge-note">--</div></div>
         </div>
         <div class="auto-next" id="ai-next-actions"></div>
       </div>
       <div class="auto-actions">
-        <button id="btn-ai-toggle" onclick="toggleAutoPilot()">自动驾驶 --</button>
-        <button class="primary" id="btn-ai-run" onclick="runAutoPilotNow()">立即运行 AI</button>
+        <button id="btn-ai-toggle" onclick="toggleAutoPilot()">Autopilot --</button>
+        <button class="primary" id="btn-ai-run" onclick="runAutoPilotNow()">Run AI Now</button>
       </div>
     </div>
   </section>
 
   <section class="panel platform-trends">
-    <div class="panel-head"><h3>市场雷达</h3><span class="badge" id="platform-trend-badge">加载中</span></div>
+    <div class="panel-head"><h3>Market Radar</h3><span class="badge" id="platform-trend-badge">Loading</span></div>
     <div class="trend-body">
       <div class="trend-call">
-        <div><strong id="platform-trend-headline">正在扫描市场趋势…</strong><span id="platform-trend-sub">从本地快照汇总品类、价格带、活跃店铺与高客单价机会。</span></div>
-        <a class="linkbtn" href="/daily-products">每日新品</a>
+        <div><strong id="platform-trend-headline">Scanning market trends...</strong><span id="platform-trend-sub">Aggregating categories, price bands, active stores, high-AOV opportunities from local snapshots.</span></div>
+        <a class="linkbtn" href="/daily-products">Daily Feed</a>
       </div>
       <div class="trend-stats">
-        <div class="trend-stat"><div class="label">今日新增</div><div class="value" id="pt-new">--</div><div class="note" id="pt-new-note">已上架产品</div></div>
-        <div class="trend-stat"><div class="label">活跃店铺</div><div class="value" id="pt-domains">--</div><div class="note">有新品</div></div>
-        <div class="trend-stat"><div class="label">头部品类</div><div class="value" id="pt-cats">--</div><div class="note" id="pt-top-cat">--</div></div>
-        <div class="trend-stat"><div class="label">价格中位数</div><div class="value" id="pt-median">--</div><div class="note" id="pt-avg">--</div></div>
-        <div class="trend-stat"><div class="label">高客单价</div><div class="value" id="pt-high">--</div><div class="note">≥ $100</div></div>
-        <div class="trend-stat"><div class="label">覆盖</div><div class="value" id="pt-scan">--</div><div class="note" id="pt-scan-note">快照</div></div>
+        <div class="trend-stat"><div class="label">NEW TODAY</div><div class="value" id="pt-new">--</div><div class="note" id="pt-new-note">Products listed</div></div>
+        <div class="trend-stat"><div class="label">ACTIVE STORES</div><div class="value" id="pt-domains">--</div><div class="note">With new products</div></div>
+        <div class="trend-stat"><div class="label">TOP CATEGORY</div><div class="value" id="pt-cats">--</div><div class="note" id="pt-top-cat">--</div></div>
+        <div class="trend-stat"><div class="label">MEDIAN PRICE</div><div class="value" id="pt-median">--</div><div class="note" id="pt-avg">--</div></div>
+        <div class="trend-stat"><div class="label">HIGH AOV</div><div class="value" id="pt-high">--</div><div class="note">>= $100</div></div>
+        <div class="trend-stat"><div class="label">COVERAGE</div><div class="value" id="pt-scan">--</div><div class="note" id="pt-scan-note">snapshot</div></div>
       </div>
       <div class="trend-lists">
-        <div class="trend-box"><div class="trend-title">品类趋势</div><div class="trend-chipline" id="pt-cat-list"></div></div>
-        <div class="trend-box"><div class="trend-title">价格带趋势</div><div class="trend-chipline" id="pt-price-list"></div></div>
-        <div class="trend-box"><div class="trend-title">市场信号</div><div class="trend-chipline" id="pt-signal-list"></div></div>
+        <div class="trend-box"><div class="trend-title">Category Trends</div><div class="trend-chipline" id="pt-cat-list"></div></div>
+        <div class="trend-box"><div class="trend-title">Price Band Trends</div><div class="trend-chipline" id="pt-price-list"></div></div>
+        <div class="trend-box"><div class="trend-title">Market Signals</div><div class="trend-chipline" id="pt-signal-list"></div></div>
       </div>
     </div>
   </section>
 
   <section class="kpis">
-    <div class="kpi good"><div class="label">可测试</div><div class="value" id="k-follow">--</div><div class="note">可做 $50 测试</div></div>
-    <div class="kpi warn"><div class="label">待建页</div><div class="value" id="k-prepare">--</div><div class="note">先拆解</div></div>
-    <div class="kpi info"><div class="label">补证据</div><div class="value" id="k-products">--</div><div class="note">需要证据</div></div>
-    <div class="kpi bad"><div class="label">已拦截</div><div class="value" id="k-avoid">--</div><div class="note">硬风险 / IP</div></div>
-    <div class="kpi"><div class="label">店铺</div><div class="value" id="k-stores">--</div><div class="note" id="k-store-note">注册库</div></div>
-    <div class="kpi"><div class="label">快照</div><div class="value" id="k-snapshots">--</div><div class="note" id="k-snapshot-note">已抓产品</div></div>
-    <div class="kpi"><div class="label">扫描队列</div><div class="value" id="k-queue">--</div><div class="note" id="k-queue-note">优先批次</div></div>
-    <div class="kpi"><div class="label">目标</div><div class="value" id="k-target">--</div><div class="note" id="k-target-note">容量</div></div>
+    <div class="kpi good"><div class="label">TEST NOW</div><div class="value" id="k-follow">--</div><div class="note">Ready for $50 test</div></div>
+    <div class="kpi warn"><div class="label">DRAFT PDP</div><div class="value" id="k-prepare">--</div><div class="note">Teardown first</div></div>
+    <div class="kpi info"><div class="label">GATHER PROOF</div><div class="value" id="k-products">--</div><div class="note">Need evidence</div></div>
+    <div class="kpi bad"><div class="label">BLOCKED</div><div class="value" id="k-avoid">--</div><div class="note">Hard risk / IP</div></div>
+    <div class="kpi"><div class="label">STORES</div><div class="value" id="k-stores">--</div><div class="note" id="k-store-note">Registry</div></div>
+    <div class="kpi"><div class="label">SNAPSHOTS</div><div class="value" id="k-snapshots">--</div><div class="note" id="k-snapshot-note">Products scraped</div></div>
+    <div class="kpi"><div class="label">SCAN QUEUE</div><div class="value" id="k-queue">--</div><div class="note" id="k-queue-note">Priority batch</div></div>
+    <div class="kpi"><div class="label">TARGET</div><div class="value" id="k-target">--</div><div class="note" id="k-target-note">Capacity</div></div>
   </section>
 
   <section class="panel brief">
-    <div class="panel-head"><h3>今日打法 — 现在能赚钱的动作</h3><span class="badge" id="brief-mode">--</span></div>
+    <div class="panel-head"><h3>Today's Play — What Makes Money Now</h3><span class="badge" id="brief-mode">--</span></div>
     <div class="brief-body">
       <div class="brief-call">
-        <div><h3 id="brief-headline">正在生成行动简报…</h3><p id="brief-lane">只输出推动现金流的动作 — 不看虚荣指标。</p></div>
+        <div><h3 id="brief-headline">Generating action brief...</h3><p id="brief-lane">Only outputs actions that move toward cash flow — no vanity metrics.</p></div>
         <span class="badge" id="brief-count">--</span>
       </div>
       <div class="brief-grid">
-        <div class="brief-block"><div class="brief-title">测什么</div><div id="brief-follow"></div></div>
-        <div class="brief-block warn"><div class="brief-title">今天做</div><div id="brief-do"></div></div>
-        <div class="brief-block info"><div class="brief-title">为什么有效</div><div id="brief-how"></div></div>
+        <div class="brief-block"><div class="brief-title">WHAT TO TEST</div><div id="brief-follow"></div></div>
+        <div class="brief-block warn"><div class="brief-title">DO TODAY</div><div id="brief-do"></div></div>
+        <div class="brief-block info"><div class="brief-title">WHY IT WORKS</div><div id="brief-how"></div></div>
       </div>
     </div>
   </section>
 
   <section class="grid">
     <aside class="panel">
-      <div class="panel-head"><h3>决策队列</h3><span class="badge" id="lane-total">--</span></div>
+      <div class="panel-head"><h3>Decision Queue</h3><span class="badge" id="lane-total">--</span></div>
       <div class="lane-list">
-        <button class="lane good active" data-lane="can_follow_now" onclick="setLane('can_follow_now')"><span><span class="name">可测试</span><span class="hint">需求+广告+页面+毛利 = 可做 $50 测试</span></span><span class="count" id="c-follow">0</span></button>
-        <button class="lane warn" data-lane="can_prepare" onclick="setLane('can_prepare')"><span><span class="name">先建页</span><span class="hint">拆解创意、定价、供应链</span></span><span class="count" id="c-prepare">0</span></button>
-        <button class="lane info" data-lane="need_proof" onclick="setLane('need_proof')"><span><span class="name">补证据</span><span class="hint">需要趋势/广告/社区/样品证据</span></span><span class="count" id="c-proof">0</span></button>
-        <button class="lane bad" data-lane="cannot_follow" onclick="setLane('cannot_follow')"><span><span class="name">不要碰</span><span class="hint">IP/合规/履约/信任/毛利风险</span></span><span class="count" id="c-avoid">0</span></button>
-        <button class="lane" data-lane="low_priority" onclick="setLane('low_priority')"><span><span class="name">观察名单</span><span class="hint">等待广告/社区/趋势信号</span></span><span class="count" id="c-low">0</span></button>
+        <button class="lane good active" data-lane="can_follow_now" onclick="setLane('can_follow_now')"><span><span class="name">Test Now</span><span class="hint">Demand + ads + page + margin = ready for $50 test</span></span><span class="count" id="c-follow">0</span></button>
+        <button class="lane warn" data-lane="can_prepare" onclick="setLane('can_prepare')"><span><span class="name">Draft PDP First</span><span class="hint">Teardown creative, pricing, supply chain</span></span><span class="count" id="c-prepare">0</span></button>
+        <button class="lane info" data-lane="need_proof" onclick="setLane('need_proof')"><span><span class="name">Gather Proof</span><span class="hint">Need trend/ad/community/sample evidence</span></span><span class="count" id="c-proof">0</span></button>
+        <button class="lane bad" data-lane="cannot_follow" onclick="setLane('cannot_follow')"><span><span class="name">Do Not Touch</span><span class="hint">IP/compliance/fulfillment/trust/margin risk</span></span><span class="count" id="c-avoid">0</span></button>
+        <button class="lane" data-lane="low_priority" onclick="setLane('low_priority')"><span><span class="name">Watch List</span><span class="hint">Waiting for ad/community/trend signals</span></span><span class="count" id="c-low">0</span></button>
       </div>
-      <div class="panel-head"><h3>三轮过滤</h3><span class="badge">80/20 循环</span></div>
+      <div class="panel-head"><h3>3-Round Filter</h3><span class="badge">80/20 Loop</span></div>
       <div class="rounds" id="rounds"></div>
     </aside>
 
     <section class="panel">
       <div class="panel-head">
-        <h3 id="table-title">可测试</h3>
+        <h3 id="table-title">Ready to Test</h3>
         <div class="toolbar">
-          <input class="search" id="filter" placeholder="搜索产品或域名…" oninput="renderTable()">
+          <input class="search" id="filter" placeholder="Search products or domains..." oninput="renderTable()">
           <span class="badge" id="table-count">--</span>
         </div>
       </div>
@@ -17560,24 +16204,24 @@ tr:hover td{background:#f8fafc}
         <table>
           <thead><tr>
             <th style="width:42px">#</th>
-            <th>产品 / 竞品</th>
-            <th>结论</th>
-            <th class="num">价格</th>
-            <th class="num">评分</th>
-            <th class="num">广告信号</th>
-            <th>证据</th>
-            <th class="num">测试 CPA</th>
-            <th class="num">保本</th>
-            <th>依据</th>
+            <th>Product / Competitor</th>
+            <th>Verdict</th>
+            <th class="num">Price</th>
+            <th class="num">Score</th>
+            <th class="num">Ad Signal</th>
+            <th>Evidence</th>
+            <th class="num">Test CPA</th>
+            <th class="num">Break-even</th>
+            <th>Rationale</th>
           </tr></thead>
-          <tbody id="tbody"><tr><td colspan="10"><div class="empty">加载中…</div></td></tr></tbody>
+          <tbody id="tbody"><tr><td colspan="10"><div class="empty">Loading...</div></td></tr></tbody>
         </table>
       </div>
     </section>
   </section>
   <div class="foot">
     <span id="source-time">--</span>
-    <span>规则：未通过利润/广告/证据/供应链/信任门槛的产品不会自动上架到 Shopify。</span>
+    <span>Rule: Products that fail profit/ad/evidence/supply-chain/trust gates do NOT auto-list to Shopify.</span>
   </div>
 </main>
 <script>
@@ -17593,10 +16237,10 @@ async function pollSystemHealth(){
     if(s.ok&&srvDot){srvDot.className='dot on';if(upTxt)upTxt.textContent=s.uptime_display}
     const df=s.data_freshness;
     if(datDot)datDot.className='dot '+(df==='fresh'?'on':df==='ok'?'warn':'off');
-    if(datTxt)datTxt.textContent='数据 '+(df==='fresh'?'实时':df==='ok'?'正常':'过期')+(s.disk_cache_age_hours!=null?' '+s.disk_cache_age_hours+'h':'');
+    if(datTxt)datTxt.textContent='Data '+(df==='fresh'?'Live':df==='ok'?'OK':'Stale')+(s.disk_cache_age_hours!=null?' '+s.disk_cache_age_hours+'h':'');
     const br=s.background_refresh||{};
     if(refDot)refDot.className='dot '+(br.running?'on':'idle');
-    if(refTxt)refTxt.textContent='刷新 '+(br.running?br.completed+'/'+br.total:br.state);
+    if(refTxt)refTxt.textContent='Refresh '+(br.running?br.completed+'/'+br.total:br.state);
   }catch(e){
     const d=$('sys-server-dot');if(d)d.className='dot off';
   }
@@ -17618,7 +16262,7 @@ async function pollMoneyPulse(){
     if(el('mp-total'))el('mp-total').textContent=totalP?totalP.toLocaleString():'--';
     const v=m.velocity||{};
     if(el('mp-velocity'))el('mp-velocity').textContent=v.score||0;
-    if(el('mp-velocity-label'))el('mp-velocity-label').textContent=(v.label||'速度')+(v.active_domains_7d?' · '+v.active_domains_7d+' 活跃·7天':'');
+    if(el('mp-velocity-label'))el('mp-velocity-label').textContent=(v.label||'Speed')+(v.active_domains_7d?' · '+v.active_domains_7d+' active 7d':'');
     if(el('mp-new7d'))el('mp-new7d').textContent=v.new_products_7d||0;
   }catch(e){}
   _mpTimer=setTimeout(pollMoneyPulse,30000);
@@ -17627,11 +16271,11 @@ pollSystemHealth();
 pollMoneyPulse();
 const state = {data:null,lane:'can_follow_now'};
 const laneMeta = {
-  can_follow_now:['可测试','good'],
-  can_prepare:['待建页','warn'],
-  need_proof:['补证据','info'],
-  cannot_follow:['已拦截','bad'],
-  low_priority:['观察名单','']
+  can_follow_now:['Test Now','good'],
+  can_prepare:['Draft PDP','warn'],
+  need_proof:['Gather Proof','info'],
+  cannot_follow:['Blocked','bad'],
+  low_priority:['Watch List','']
 };
 function $(id){return document.getElementById(id)}
 function h(v){return String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -19505,216 +18149,6 @@ setInterval(loadAll, 60000);
 @app.get("/health")
 def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
-# ═══════════════════════════════════════════════════════════
-#  新升级模块 API — Phase 2 核心战力
-# ═══════════════════════════════════════════════════════════
-
-@app.get("/operator-workbench", response_class=HTMLResponse)
-def operator_workbench():
-    """一键操作工作台 HTML 页面"""
-    html_path = Path(__file__).parent / "operator_workbench.html"
-    if html_path.exists():
-        return HTMLResponse(html_path.read_text(encoding="utf-8"))
-    return HTMLResponse("<h1>工作台页面未找到</h1>", status_code=404)
-
-
-@app.get("/api/evidence/enrich")
-def api_evidence_enrich(
-    keyword: str = Query(...),
-    domain: str = Query(""),
-    sources: str = Query("reddit,amazon,supply,fb_ads")
-):
-    """多源证据自动补全 API
-    
-    Args:
-        keyword: 产品关键词
-        domain: 竞品域名（用于 FB 广告历史）
-        sources: 数据源（逗号分隔）
-    """
-    try:
-        from evidence_enrichment_engine import enrich_product_evidence
-        
-        source_list = [s.strip() for s in sources.split(",") if s.strip()]
-        result = enrich_product_evidence(keyword, domain, source_list)
-        
-        return result
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-@app.post("/api/evidence/batch-enrich")
-def api_evidence_batch_enrich(limit: int = Query(50, le=100)):
-    """批量补全当前队列的证据
-    
-    读取 AI 自动驾驶队列，批量补全证据质量 < 70 的产品
-    """
-    try:
-        from evidence_enrichment_engine import batch_enrich_products
-        
-        # 读取当前队列
-        status = _ai_autopilot_status_copy()
-        queue = status.get("queue", {})
-        items = queue.get("items", []) if isinstance(queue, dict) else []
-        
-        # 过滤需要补证的产品
-        need_enrich = [
-            {
-                "keyword": item.get("title") or item.get("product_title") or "",
-                "domain": item.get("domain") or "",
-                **item
-            }
-            for item in items[:limit]
-            if item.get("evidence_quality", 0) < 70
-        ]
-        
-        if not need_enrich:
-            return {"ok": True, "message": "所有产品证据质量已达标", "enriched": []}
-        
-        enriched = batch_enrich_products(need_enrich, workers=8)
-        
-        return {
-            "ok": True,
-            "enriched_count": len(enriched),
-            "products": enriched
-        }
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-@app.get("/api/timeline/price")
-def api_timeline_price(
-    domain: str = Query(...),
-    handle: str = Query(...),
-    days: int = Query(30, ge=1, le=90)
-):
-    """查询产品价格时间线
-    
-    Args:
-        domain: 域名
-        handle: 产品 handle
-        days: 查询天数
-    """
-    try:
-        from price_inventory_timeline import get_price_timeline
-        return get_price_timeline(domain, handle, days)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-@app.get("/api/timeline/events")
-def api_timeline_events(
-    domain: str = Query(...),
-    days: int = Query(7, ge=1, le=30),
-    severity: str = Query(None)
-):
-    """查询时间线事件（价格变动、断货、补货）
-    
-    Args:
-        domain: 域名
-        days: 查询天数
-        severity: 严重程度过滤 (low, medium, high)
-    """
-    try:
-        from price_inventory_timeline import get_events
-        return get_events(domain, days, severity)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-@app.post("/api/timeline/snapshot")
-def api_timeline_snapshot(domain: str = Query(...)):
-    """对一个域名做价格+库存快照"""
-    try:
-        from price_inventory_timeline import batch_snapshot_domain
-        return batch_snapshot_domain(domain)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-@app.get("/api/dashboard/products")
-def api_dashboard_products(limit: int = Query(50, le=200)):
-    """工作台产品列表 - 使用盈利分析增强版"""
-    json_path = Path("/tmp/today-fast-8011-enriched.json")
-    if not json_path.exists():
-        # 降级到原始数据
-        json_path = Path("/tmp/today-fast-8011.json")
-        if not json_path.exists():
-            return {"ok": False, "products": [], "total": 0}
-    
-    data = json.loads(json_path.read_text())
-    products = data.get("scored_products", [])
-    
-    # 返回所有有盈利数据的产品（不再严格过滤tier）
-    filtered = []
-    for p in products:
-        # 只要有盈利分析就显示
-        profit_analysis = p.get("profit_analysis", {})
-        if not profit_analysis:
-            continue
-        
-        # 跳过明确不赚钱的产品
-        verdict = profit_analysis.get("verdict", {})
-        if verdict.get("level") == "🔴 不赚钱":
-            continue
-        
-        filtered.append(p)
-    
-    filtered.sort(key=lambda x: x.get("profit_analysis", {}).get("profit_score", x.get("score", 0)), reverse=True)
-    
-    return {"ok": True, "products": filtered[:limit], "total": len(filtered)}
-@app.get("/api/dashboard/quality-metrics")
-def api_dashboard_quality_metrics():
-    """工作台质量指标"""
-    json_path = Path("/tmp/today-fast-8011.json")
-    if not json_path.exists():
-        return {"ok": False, "metrics": {}}
-    
-    data = json.loads(json_path.read_text())
-    products = data.get("scored_products", [])
-    if not products:
-        return {"ok": False, "metrics": {}}
-    
-    total = len(products)
-    tier1 = sum(1 for p in products if p.get("tier") == "tier1")
-    tier2 = sum(1 for p in products if p.get("tier") == "tier2")
-    avg_score = sum(p.get("score", 0) for p in products) / total
-    
-    return {"ok": True, "metrics": {
-        "avg_data": round(avg_score, 1),
-        "avg_evidence": round(avg_score, 1),
-        "avg_judgment": round(avg_score, 1),
-        "total_products": total,
-        "verified_count": tier1 + tier2
-    }}
-
-@app.get("/api/alerts/stats")
-def api_alerts_stats(days: int = Query(7, ge=1, le=30)):
-    """告警统计"""
-    try:
-        from realtime_alerts import get_alert_stats
-        return get_alert_stats(days)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-@app.post("/api/alerts/mark-read/{alert_id}")
-def api_alerts_mark_read(alert_id: int):
-    """标记告警为已读"""
-    try:
-        from realtime_alerts import mark_alert_read
-        return mark_alert_read(alert_id)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
-
-@app.get("/api/dashboard/alerts")
-def api_dashboard_alerts(limit: int = Query(10, ge=1, le=50)):
-    """仪表盘告警（用于工作台顶部告警栏）"""
-    try:
-        from realtime_alerts import get_alerts
-        return get_alerts(unread_only=True, limit=limit)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
-
 
 
 # ═══════════════════════════════════════════════════════════

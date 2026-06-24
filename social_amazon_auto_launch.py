@@ -954,7 +954,7 @@ def build_opportunities(
     social_records: list[SignalRecord],
     *,
     limit: int = 20,
-    min_score: float = 62,
+    min_score: float = 80,
     min_match_score: float = 0.18,
 ) -> list[Opportunity]:
     opportunities: list[Opportunity] = []
@@ -1145,7 +1145,7 @@ def write_artifacts(
 def run_auto_launch(
     *,
     limit: int = 20,
-    min_score: float = 62,
+    min_score: float = 80,
     min_match_score: float = 0.18,
     refresh_sources: bool = False,
 ) -> dict[str, Any]:
@@ -1182,7 +1182,7 @@ def latest_auto_launch() -> dict[str, Any]:
 if __name__ == "__main__":
     result = run_auto_launch(
         limit=int(os.getenv("AUTO_LAUNCH_LIMIT", "20")),
-        min_score=float(os.getenv("AUTO_LAUNCH_MIN_SCORE", "62")),
+        min_score=float(os.getenv("AUTO_LAUNCH_MIN_SCORE", "80")),
         refresh_sources=os.getenv("AUTO_LAUNCH_REFRESH", "").lower() in {"1", "true", "yes", "on"},
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

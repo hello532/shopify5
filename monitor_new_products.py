@@ -564,11 +564,11 @@ def compute_action_score(product: dict) -> tuple[int, list[str]]:
 
 
 def action_bucket(score: int) -> str:
-    if score >= 78:
+    if score >= 90:
         return "scale_now"
-    if score >= 62:
+    if score >= 80:
         return "test_now"
-    if score >= 45:
+    if score >= 65:
         return "watch_close"
     return "low_priority"
 
@@ -616,7 +616,7 @@ def enrich_product_actionability(product: dict) -> dict:
     enriched["next_step"] = (
         "立刻查广告 -> 拆页面 -> 做 offer -> 开 3 组创意测试"
         if bucket in {"scale_now", "test_now"}
-        else "进入观察，等待更多趋势或价格变化确认"
+        else "未达到 80 分测品门槛，进入观察，等待更多趋势或价格变化确认"
     )
     enriched.update(make_meta_urls(enriched))
     return enriched
